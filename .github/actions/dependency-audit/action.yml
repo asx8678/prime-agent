@@ -3,7 +3,7 @@ description: Run the pinned cargo-deny release without a Docker Hub dependency.
 runs:
   using: composite
   steps:
-    - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1, matching workspace CI
+    - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0, matching workspace CI
     - name: Download and verify cargo-deny
       shell: bash
       run: |

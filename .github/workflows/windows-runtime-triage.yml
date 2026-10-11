@@ -100,9 +100,9 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.ref || github.ref }}
       # The pinned SHA is the toolchain pin: this action version has no
-      # `toolchain` input, and its parse step hard-codes 1.98.1. Change
-      # the compiler by changing the SHA; a `toolchain:` input is ignored.
-      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1 action pin; the SHA selects the toolchain
+      # `toolchain` input, and its parse step hard-codes 1.99.0. Change
+      # the compiler by changing the SHA (and rust-toolchain.toml with it); a `toolchain:` input is ignored.
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0 action pin; the SHA selects the toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: windows-tui-battery
@@ -152,7 +152,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.ref || github.ref }}
-      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1 action pin; the SHA selects the toolchain
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0 action pin; the SHA selects the toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: windows-triage
