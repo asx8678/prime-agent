@@ -585,7 +585,6 @@ impl AgentSession {
 }
 
 /// The default model seam over pa-ai completion.
-#[must_use]
 pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::executor::RefinerFn {
     Box::new(move |model, system_prompt, prompt| {
         let api_key = api_key;

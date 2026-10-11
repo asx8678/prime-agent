@@ -1,0 +1,10 @@
+# The workspace compiler, the same release CI builds with: every
+# dtolnay/rust-toolchain pin in .github/ installs exactly this toolchain
+# (the pinned SHA hard-codes it), and rustup resolves this file ahead of the
+# default toolchain both locally and on the runners. Move the two together:
+# a bump changes `channel` here and every action SHA in the same change.
+# Channel only: each CI job installs just the components it uses (clippy,
+# rustfmt, a cross target), and listing them here would pull them into
+# every job; rustup's default profile already ships them locally.
+[toolchain]
+channel = "1.99.0"

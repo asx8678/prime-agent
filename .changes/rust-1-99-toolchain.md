@@ -1,0 +1,1 @@
+- Internal: the workspace builds with Rust 1.99.0, pinned in `rust-toolchain.toml` and in every CI toolchain action; the new clippy 1.99 findings are fixed, and its `assert_is_empty` lint stays allowed until its rewrite compiles.
