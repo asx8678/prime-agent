@@ -1,5 +1,5 @@
 //! Structural compaction: a compaction summary built from typed facts of the
-//! session log, without a model call.
+//! session log, without a model call (the `deterministic` compaction engine).
 //!
 //! Entries become typed events ([`events::normalize`]); events fold into a
 //! bounded [`state::State`] that is saved on each compaction row; the state
@@ -8,10 +8,9 @@
 //! fact is never re-summarized and nothing drifts between compactions.
 //! Model-written text (branch summaries, an earlier engine's summary) is
 //! carried verbatim within bounds, and recent user directions are quoted.
-#![allow(
-    dead_code,
-    reason = "wired into compaction by the compaction engine setting in the follow-up change"
-)]
+
+use pa_types::session::FileEntry;
+use serde_json::Value;
 
 mod bounds;
 mod events;
@@ -19,3 +18,50 @@ mod render;
 mod state;
 #[cfg(test)]
 mod tests;
+
+/// One deterministic compaction's input: the state the previous compaction
+/// saved and the events since that compaction's kept boundary.
+pub(crate) struct Fold {
+    state: state::State,
+    events: Vec<events::Event>,
+}
+
+impl Fold {
+    /// `previous_state` and `previous_summary` come from the previous
+    /// compaction; `entries` are the active-branch rows from its kept boundary
+    /// up to the new cut. A state this version saved is folded further;
+    /// otherwise a summary another engine wrote is carried once as a labeled
+    /// excerpt.
+    pub(crate) fn new<'a>(
+        previous_state: Option<&Value>,
+        previous_summary: Option<&str>,
+        entries: impl IntoIterator<Item = &'a FileEntry>,
+    ) -> Fold {
+        // No earlier summary starts from an empty one: a fresh state.
+        let state = previous_state
+            .and_then(state::State::from_value)
+            .unwrap_or_else(|| state::State::from_summary(previous_summary.unwrap_or_default()));
+        Fold {
+            state,
+            events: events::normalize(entries),
+        }
+    }
+
+    /// The summary, quoting `request` (the `/compact` instructions), and the
+    /// state to save on the new compaction row. The summary takes at most
+    /// 32 KiB and at most half the model's context window in bytes, about an
+    /// eighth of it in tokens, so a small window keeps room for the kept
+    /// messages.
+    pub(crate) fn summarize(&self, request: Option<&str>, context_window: u64) -> (String, Value) {
+        let mut state = self.state.clone();
+        state.fold(&self.events);
+        // An unknown window (zero) leaves the default.
+        let max_bytes = usize::try_from(context_window / 2)
+            .ok()
+            .filter(|half_window| *half_window > 0)
+            .map_or(render::DEFAULT_MAX_BYTES, |half_window| {
+                half_window.min(render::DEFAULT_MAX_BYTES)
+            });
+        (render::render(&state, request, max_bytes), state.to_value())
+    }
+}

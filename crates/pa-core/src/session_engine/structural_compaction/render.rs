@@ -9,7 +9,7 @@ use super::state::{BlockOrigin, Exchange, State, EXCHANGE_TEXT_BYTES};
 /// The default summary budget in UTF-8 bytes.
 pub(crate) const DEFAULT_MAX_BYTES: usize = 32 * 1024;
 
-const HEADER: &str = "[Structural summary] Built from the session log without a model: older facts are sampled, not interpreted. uN is the Nth user message and uN.cM the Mth Python cell after it.";
+const HEADER: &str = "[Deterministic summary] Built from the session log without a model: older facts are sampled, not interpreted. uN is the Nth user message and uN.cM the Mth Python cell after it.";
 const DIALOGUE_HEADER: &str = "[Recent user directions and discussion]";
 const DIALOGUE_MAX_BYTES: usize = 12_288;
 const REQUEST_HEADER: &str = "[Compaction Request]";
@@ -262,7 +262,7 @@ fn footer_line(state: &State) -> String {
         format!("u1\u{2013}u{}", state.users)
     };
     format!(
-        "[Structural summary of {range}: events folded: {}; thinking blocks not carried: {}; the full history stays in the session log.]",
+        "[Deterministic summary of {range}: events folded: {}; thinking blocks not carried: {}; the full history stays in the session log.]",
         state.events, state.thinking
     )
 }

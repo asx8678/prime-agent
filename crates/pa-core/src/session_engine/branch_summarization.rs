@@ -552,6 +552,7 @@ mod tests {
                 usage: None,
                 harness_digest: None,
                 harness_state_fingerprint: None,
+                structural_state: None,
             },
             base: EntryBase {
                 id: Some("c0".to_string()),

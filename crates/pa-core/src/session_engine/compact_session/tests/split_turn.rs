@@ -6,8 +6,7 @@ use super::*;
 use std::sync::Arc;
 
 use crate::session_engine::semantic_edges::{
-    CompactionStatus, SemanticEdgeIdentity, SemanticEdgeLedgerEvent as LedgerEvent,
-    SemanticEdgeRecorder, SEMANTIC_EDGES_LEDGER_FILENAME,
+    CompactionStatus, SemanticEdgeLedgerEvent as LedgerEvent,
 };
 
 /// A turn-spanning cut is a split turn: the compaction runs TWO
@@ -481,37 +480,6 @@ async fn split_turn_without_history_makes_only_the_prefix_call() {
         })
     );
     registration.unregister();
-}
-
-/// One recorder over a ledger in `dir` (the semantic-edge tests' fixture).
-fn semantic_fixture(dir: &std::path::Path) -> (SemanticEdgeIdentity, Arc<SemanticEdgeRecorder>) {
-    let identity = SemanticEdgeIdentity {
-        session_id: "compact-session".to_string(),
-        ledger_path: Some(dir.join(SEMANTIC_EDGES_LEDGER_FILENAME)),
-        parent_session_id: None,
-        spawned_by_request_id: None,
-    };
-    let recorder = Arc::new(SemanticEdgeRecorder::open(identity.clone()));
-    (identity, recorder)
-}
-
-fn ledger_events(identity: &SemanticEdgeIdentity) -> Vec<LedgerEvent> {
-    let contents = std::fs::read_to_string(identity.ledger_path.as_ref().unwrap()).unwrap();
-    contents
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
-}
-
-fn begun_compaction_id(events: &[LedgerEvent]) -> String {
-    events
-        .iter()
-        .find_map(|event| match event {
-            LedgerEvent::CompactionBegun { compaction_id, .. } => Some(compaction_id.clone()),
-            _ => None,
-        })
-        .expect("the compaction began")
 }
 
 /// The split-turn compaction's two summary slices each carry their own

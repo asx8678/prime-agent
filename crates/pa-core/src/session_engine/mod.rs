@@ -150,9 +150,10 @@ pub struct AgentSession {
     pending_next_turn_rows: std::sync::Arc<std::sync::Mutex<Vec<pa_types::session::CustomMessage>>>,
     /// The skill inventory `/skill:<name>` submissions expand against.
     skills: Vec<crate::skills::Skill>,
-    /// The telemetry handle for the `skill_use_count` counter the prompt
-    /// path owns (`None` in sessions without telemetry).
-    skill_telemetry: Option<std::sync::Arc<telemetry::SessionTelemetry>>,
+    /// The telemetry handle the session's own counters count through
+    /// (`skill_use_count` at admission, `compaction_deterministic_count` at
+    /// compaction); `None` in sessions without telemetry.
+    telemetry: Option<std::sync::Arc<telemetry::SessionTelemetry>>,
     /// The image-model routing host seam; `None` keeps the session
     /// model on image turns.
     image_model_router: Option<image_model_routing::ImageModelRouter>,
@@ -244,7 +245,7 @@ impl AgentSession {
             kernel_state: None,
             pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             skills: Vec::new(),
-            skill_telemetry: None,
+            telemetry: None,
             image_model_router: None,
             compaction_summary_sink: std::sync::Mutex::new(None),
             semantic_edges: std::sync::Mutex::new(None),

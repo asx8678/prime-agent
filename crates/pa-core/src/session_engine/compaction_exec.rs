@@ -358,6 +358,7 @@ pub fn compaction_entry_for(
         usage: result.usage,
         harness_digest,
         harness_state_fingerprint,
+        structural_state: None,
     }
 }
 
@@ -470,6 +471,7 @@ mod tests {
                 usage: Some(usage),
                 harness_digest: None,
                 harness_state_fingerprint: None,
+                structural_state: None,
             }
         );
     }

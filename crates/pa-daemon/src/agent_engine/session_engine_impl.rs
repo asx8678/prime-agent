@@ -577,6 +577,15 @@ impl SessionEngine for AgentSessionEngine {
         }
     }
 
+    fn compaction_keep_recent_tokens(&self) -> Option<u64> {
+        // The consult mirror, readable while a turn holds the session.
+        self.autonomous_boundary
+            .lock()
+            .expect("autonomous boundary lock")
+            .as_ref()
+            .map(|mirror| mirror.compaction.keep_recent_tokens)
+    }
+
     fn run_compaction(
         &self,
         request: CompactionRequest,

@@ -797,6 +797,65 @@ async fn requested_compaction_counts_into_the_run_telemetry() {
     assert_eq!(ended[0]["compaction_count"], json!(1));
 }
 
+/// The deterministic engine compacts without a summarizer call (the script
+/// holds no summary response) and counts its adoption into `agent session
+/// ended`.
+#[tokio::test]
+async fn deterministic_compaction_makes_no_model_call_and_counts_into_the_session_telemetry() {
+    let _faux = FAUX_TEST_LOCK.lock().await;
+    let mut settings = compactable_settings();
+    settings["compaction"]["engine"] = json!("deterministic");
+    let (engine, _dir, model, mock) = faux_engine_with_mock_telemetry(
+        json!({ "responses": [{"text": "seed reply"}, {"text": "second reply"}] }),
+        settings,
+    )
+    .await;
+    let mut boundary = TurnBoundary::new(false);
+    admit(
+        &mut boundary,
+        &engine,
+        &model,
+        format!("seed turn {}", "x".repeat(48_000)),
+    )
+    .await
+    .unwrap();
+    engine.turn_boundary.schedule_compaction(None).await;
+    admit_turn_with_scheduled_request(
+        &mut boundary,
+        &engine,
+        &model,
+        format!("second turn {}", "x".repeat(2_000)),
+    )
+    .await
+    .unwrap();
+    let summaries: Vec<String> = engine
+        .session
+        .entries()
+        .await
+        .iter()
+        .filter_map(|entry| match entry {
+            FileEntry::Compaction { payload, .. } => Some(payload.summary.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries.len(), 1, "the compaction ran: {summaries:?}");
+    assert!(
+        summaries[0].starts_with("[Deterministic summary]"),
+        "{}",
+        summaries[0]
+    );
+    end_telemetry(&engine).await;
+    let ended = mock_properties(&mock, "agent session ended");
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        (
+            &ended[0]["compaction_count"],
+            &ended[0]["compaction_deterministic_count"]
+        ),
+        (&json!(1), &json!(1))
+    );
+}
+
 #[tokio::test]
 async fn threshold_compaction_counts_into_the_run_telemetry() {
     let _faux = FAUX_TEST_LOCK.lock().await;

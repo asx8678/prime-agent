@@ -95,11 +95,11 @@ impl AgentSession {
         self.skills = skills;
     }
 
-    /// Bind the telemetry handle the `skill_use_count` counter counts
-    /// through (the engine wiring owns the telemetry lifetime and
-    /// installs it once the session telemetry is assembled).
-    pub fn set_skill_telemetry(&mut self, telemetry: std::sync::Arc<telemetry::SessionTelemetry>) {
-        self.skill_telemetry = Some(telemetry);
+    /// Bind the telemetry handle the session's counters count through (the
+    /// engine wiring owns the telemetry lifetime and installs it once the
+    /// session telemetry is assembled).
+    pub fn set_telemetry(&mut self, telemetry: std::sync::Arc<telemetry::SessionTelemetry>) {
+        self.telemetry = Some(telemetry);
     }
 
     /// Bind the auto-refine surface for this session: whether the session may

@@ -149,6 +149,31 @@ mod tests {
         );
     }
 
+    /// An unrecognized `compaction.engine` loads as unset; the compaction
+    /// settings beside it still load.
+    #[test]
+    fn an_unrecognized_compaction_engine_keeps_the_other_compaction_settings() {
+        let settings = from_value_lenient(&serde_json::json!({
+            "compaction": { "enabled": false, "keepRecentTokens": 50, "engine": "Deterministic" }
+        }));
+        let compaction = settings.compaction.expect("the compaction settings load");
+        assert_eq!(
+            (
+                compaction.enabled,
+                compaction.keep_recent_tokens,
+                compaction.engine
+            ),
+            (Some(false), Some(50), None)
+        );
+        let settings = from_value_lenient(&serde_json::json!({
+            "compaction": { "engine": "deterministic" }
+        }));
+        assert_eq!(
+            settings.compaction.and_then(|compaction| compaction.engine),
+            Some(super::super::types::CompactionEngine::Deterministic)
+        );
+    }
+
     /// A wrong-typed `requestTiming` behaves as unset (the known-field
     /// registry entry), never a surviving raw value.
     #[test]

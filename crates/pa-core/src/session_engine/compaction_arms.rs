@@ -203,6 +203,13 @@ impl AgentSession {
             compaction_trace::trace("compact.skipped", &serde_json::Value::Null);
             return Ok(outcome);
         }
+        // Every compaction path runs through here: the opt-in engine's
+        // adoption counts once per committed compaction.
+        if options.settings.engine == crate::settings::CompactionEngine::Deterministic {
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.note_deterministic_compaction();
+            }
+        }
         let rebuilt = {
             let session = self.session.lock().await;
             crate::session_engine::compact_session::rebuilt_context_after_compaction(&session)

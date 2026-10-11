@@ -231,13 +231,20 @@ impl CompactionManager {
                 .map(|entry| entry.id.clone())
                 .unwrap_or_default()
         } else {
-            let keep_recent = pa_core::settings::SettingsManager::create(&cwd, &self.agent_dir)
-                .settings()
-                .compaction
-                .clone()
-                .unwrap_or_default()
-                .keep_recent_tokens
-                .unwrap_or(pa_core::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS);
+            // The engine's own keep window, so the durable cut is the one it
+            // summarized; the settings only stand in before a build.
+            let keep_recent = self
+                .engine
+                .compaction_keep_recent_tokens()
+                .unwrap_or_else(|| {
+                    pa_core::settings::SettingsManager::create(&cwd, &self.agent_dir)
+                        .settings()
+                        .compaction
+                        .clone()
+                        .unwrap_or_default()
+                        .keep_recent_tokens
+                        .unwrap_or(pa_core::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS)
+                });
             store
                 .durable_first_kept_entry_id(keep_recent)
                 .unwrap_or(first_kept_entry_id)
@@ -466,6 +473,7 @@ mod tests {
             usage: result.usage,
             harness_digest: None,
             harness_state_fingerprint: None,
+            structural_state: None,
         };
         // The TS `compact` response dataKeys (the live golden,
         // `tests/goldens/compaction-live-ts.json`): summary,

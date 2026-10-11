@@ -154,7 +154,8 @@ impl SessionManager {
                 .any(|entry| matches!(entry, FileEntry::ServiceTierChange { .. }))
     }
 
-    fn active_branch_entries(&self) -> Vec<&FileEntry> {
+    /// The retained rows on the path from the root to the leaf, in order.
+    pub(crate) fn active_branch_entries(&self) -> Vec<&FileEntry> {
         let mut branch = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut id = self.leaf_id.as_deref();

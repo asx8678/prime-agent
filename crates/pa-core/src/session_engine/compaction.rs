@@ -24,6 +24,7 @@ pub struct CompactionSettings {
     /// `input + requested output > contextWindow`.
     pub reserve_tokens: u64,
     pub keep_recent_tokens: u64,
+    pub engine: crate::settings::CompactionEngine,
 }
 
 impl Default for CompactionSettings {
@@ -32,6 +33,7 @@ impl Default for CompactionSettings {
             enabled: true,
             reserve_tokens: DEFAULT_RESERVE_TOKENS,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
+            engine: crate::settings::CompactionEngine::default(),
         }
     }
 }
@@ -601,6 +603,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 127_500,
             keep_recent_tokens: 10,
+            ..CompactionSettings::default()
         };
         let messages = vec![
             user_message("f14 auto seed turn", 1),
@@ -618,6 +621,7 @@ mod tests {
             enabled: false,
             reserve_tokens: 127_500,
             keep_recent_tokens: 10,
+            ..CompactionSettings::default()
         };
         assert!(!threshold_compaction_due(&messages, 128_000, 0, &disabled));
         assert!(!threshold_compaction_due(&messages, 0, 0, &settings));
@@ -685,6 +689,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 1,
             keep_recent_tokens: 10,
+            ..CompactionSettings::default()
         };
         assert_eq!(compaction_threshold(131_072, 32_768, &settings), 94_208);
         // An output budget that cannot fit any context disables the
@@ -707,6 +712,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 127_500,
             keep_recent_tokens: 10,
+            ..CompactionSettings::default()
         };
         let messages = vec![
             compaction_summary(10),

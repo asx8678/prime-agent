@@ -684,6 +684,7 @@ const AGENT_SESSION_ENDED: EventRule = EventRule {
         ("model_error_count", optional(count())),
         ("skill_use_count", optional(count())),
         ("mcp_connector_use_count", optional(count())),
+        ("compaction_deterministic_count", optional(count())),
         ("kernel_bootstrap_count", optional(count())),
         ("kernel_bootstrap_cold_count", optional(count())),
         ("kernel_bootstrap_failed_count", optional(count())),

@@ -543,11 +543,16 @@ impl TurnRunner {
                             .as_ref()
                             .and_then(|store| store.branch().len().checked_sub(1))
                             .unwrap_or(0);
-                        if let Some(id) = core.store.as_ref().and_then(|store| {
-                            store.durable_first_kept_entry_id(keep_recent_tokens(
-                                &core.cwd, &agent_dir,
-                            ))
-                        }) {
+                        // The engine's own keep window: the durable cut
+                        // is the one it summarized.
+                        let keep_recent = engine
+                            .compaction_keep_recent_tokens()
+                            .unwrap_or_else(|| keep_recent_tokens(&core.cwd, &agent_dir));
+                        if let Some(id) = core
+                            .store
+                            .as_ref()
+                            .and_then(|store| store.durable_first_kept_entry_id(keep_recent))
+                        {
                             entry["firstKeptEntryId"] = json!(id);
                             if let Some(result) =
                                 payload.get_mut("result").and_then(Value::as_object_mut)
@@ -1225,8 +1230,8 @@ impl TurnRunner {
     }
 }
 
-/// The compaction cut budget the engine ran with: the durable boundary
-/// re-cut in the turn callback must pin the same cut.
+/// The compaction keep window in the settings: the durable boundary re-cut
+/// when the engine has no built session to name its own.
 fn keep_recent_tokens(cwd: &str, agent_dir: &std::path::Path) -> u64 {
     pa_core::settings::SettingsManager::create(cwd, agent_dir)
         .settings()

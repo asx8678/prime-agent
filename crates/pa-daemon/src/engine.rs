@@ -158,6 +158,16 @@ pub trait SessionEngine: Send + Sync {
     /// also aborts the auto controller, not just the manual run.
     fn abort_auto_compaction(&self) {}
 
+    /// The keep window (`keepRecentTokens`) the built session compacts with.
+    /// The worker re-cuts the durable boundary with the same window, so the
+    /// saved boundary is the cut the engine summarized even after a
+    /// settings.json edit the running session never read. `None` before a
+    /// session is built, and for engines without one; the worker then reads
+    /// the settings.
+    fn compaction_keep_recent_tokens(&self) -> Option<u64> {
+        None
+    }
+
     /// Consume a pending compact-trigger auto-refine review: the engine
     /// resolves the model and runs the gated round. `Ok(None)` is every
     /// silent outcome — no trigger armed, a gate drop, cooldown, or decline.

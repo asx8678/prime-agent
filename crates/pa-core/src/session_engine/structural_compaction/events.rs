@@ -135,7 +135,7 @@ pub(crate) struct SentMessage {
 /// (state rows, bookkeeping custom rows) produce none, and prior compactions
 /// are never source: a new summary folds typed state, not earlier prose.
 #[must_use]
-pub(crate) fn normalize(entries: &[FileEntry]) -> Vec<Event> {
+pub(crate) fn normalize<'a>(entries: impl IntoIterator<Item = &'a FileEntry>) -> Vec<Event> {
     let mut events = Vec::new();
     for entry in entries {
         match entry {

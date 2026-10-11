@@ -46,6 +46,9 @@ pub struct CompactionPreparation {
     /// The prior compaction's summary, so the history call updates it instead
     /// of re-summarizing; a file-blocks-only summary strips to no `previous_summary`.
     pub previous_summary: Option<String>,
+    /// The state a deterministic prior compaction saved: the next
+    /// deterministic compaction folds it further from `boundary_start`.
+    pub previous_state: Option<serde_json::Value>,
     /// The newest kept-tail assistant text (tail-truncated), so the update
     /// summary cannot lag behind the retained tail.
     pub recent_state_anchor: Option<String>,
@@ -72,7 +75,7 @@ pub fn prepare_compaction(
     let prev_compaction_index = entries
         .iter()
         .rposition(|entry| matches!(entry, FileEntry::Compaction { .. }));
-    let (boundary_start, previous_summary) = match prev_compaction_index {
+    let (boundary_start, previous_summary, previous_state) = match prev_compaction_index {
         Some(index) => {
             let FileEntry::Compaction { payload, .. } = &entries[index] else {
                 unreachable!("rposition matched a compaction entry")
@@ -83,9 +86,13 @@ pub fn prepare_compaction(
             let boundary_start = first_kept_index.unwrap_or(index + 1);
             let stripped = super::compaction_utils::strip_file_list_blocks(&payload.summary);
             let previous_summary = (!stripped.is_empty()).then_some(stripped);
-            (boundary_start, previous_summary)
+            (
+                boundary_start,
+                previous_summary,
+                payload.structural_state.clone(),
+            )
         }
-        None => (start, None),
+        None => (start, None, None),
     };
     let cut = find_cut_point(entries, boundary_start, entries.len(), keep_recent_tokens);
     let history_end = if cut.is_split_turn {
@@ -115,6 +122,7 @@ pub fn prepare_compaction(
         cut,
         boundary_start,
         previous_summary,
+        previous_state,
         recent_state_anchor,
     })
 }

@@ -696,6 +696,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         keep_recent_tokens: compaction_settings
             .keep_recent_tokens
             .unwrap_or(crate::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS),
+        engine: compaction_settings.engine.unwrap_or_default(),
     });
     // Summarizer passes resolve their model through the `auxiliaryModel` setting
     // with the session model as fallback, so one-off prompts stay off the prompt-cache prefix.
@@ -780,11 +781,12 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         _ => None,
     };
 
-    // The `skill_use_count` session counter counts through the session's
-    // telemetry handle (installed once the telemetry composition decided
-    // whether this session reports at all).
+    // The session's own counters (`skill_use_count`,
+    // `compaction_deterministic_count`) count through its telemetry handle
+    // (installed once the telemetry composition decided whether this
+    // session reports at all).
     if let Some(telemetry) = telemetry.as_ref() {
-        session.set_skill_telemetry(telemetry.clone());
+        session.set_telemetry(telemetry.clone());
         // Same lifetime for the `rlm_child_*` session counters: the
         // producer's flush counts through this handle.
         wiring.rlm_usage.set_telemetry(telemetry.clone());

@@ -134,6 +134,8 @@ pub(crate) struct CompactionAttempt {
     details: CompactionDetails,
     first_kept_entry: String,
     semantic_compaction: Option<super::semantic_edges::SemanticCompaction>,
+    /// The deterministic engine's input; `None` runs the model summarizer.
+    structural: Option<super::structural_compaction::Fold>,
 }
 
 pub(crate) struct PreparedCompaction {
@@ -151,6 +153,23 @@ pub(crate) fn prepare_attempt(
     let entries = session.retained_entries().to_vec();
     let prefix_leaf = session.get_leaf_id().map(str::to_string);
     let preparation = prepare_compaction(&entries, options.settings.keep_recent_tokens)?;
+    // The deterministic engine folds the active branch only: a resumed
+    // window also retains the rows of abandoned branches.
+    let structural = (options.settings.engine == crate::settings::CompactionEngine::Deterministic)
+        .then(|| {
+            let on_path: std::collections::HashSet<&str> = session
+                .active_branch_entries()
+                .into_iter()
+                .filter_map(FileEntry::id)
+                .collect();
+            super::structural_compaction::Fold::new(
+                preparation.previous_state.as_ref(),
+                preparation.previous_summary.as_deref(),
+                entries[preparation.boundary_start..preparation.cut.first_kept_entry_index]
+                    .iter()
+                    .filter(|entry| entry.id().is_some_and(|id| on_path.contains(id))),
+            )
+        });
     // TS `beginCompaction` after the preparation resolved: a skipped
     // compaction makes no events (the begin comes after the skip throw).
     let semantic_compaction = options
@@ -216,6 +235,7 @@ pub(crate) fn prepare_attempt(
         details,
         first_kept_entry,
         semantic_compaction,
+        structural,
     })
 }
 
@@ -226,6 +246,37 @@ pub(crate) async fn summarize_attempt(
 ) -> anyhow::Result<PreparedCompaction> {
     // A run aborted before the summarizer request never starts one.
     pa_agent::abort::throw_if_aborted_signal(options.abort)?;
+
+    // The deterministic engine makes no model call: the summary is folded
+    // from the log, and the live block receives it whole, exactly as it
+    // commits.
+    if let Some(fold) = attempt.structural.as_ref() {
+        let (mut summary, state) =
+            fold.summarize(options.custom_instructions, options.model.context_window);
+        summary.push_str(&file_ops_block(
+            &attempt.details.read_files,
+            &attempt.details.modified_files,
+        ));
+        if let Some(sink) = options.summary_delta.as_ref() {
+            sink(&summary);
+        }
+        super::compaction_trace::trace(
+            "compact.structural_summary",
+            &serde_json::json!({ "summaryBytes": summary.len() }),
+        );
+        let mut prepared = prepared_compaction(
+            attempt,
+            options,
+            CompactionResult {
+                summary,
+                first_kept_entry_id: attempt.first_kept_entry.clone(),
+                tokens_before: attempt.tokens_before,
+                usage: None,
+            },
+        );
+        prepared.entry.structural_state = Some(state);
+        return Ok(prepared);
+    }
 
     // A split-turn cut runs TWO summarizer calls concurrently — the history
     // summary and the turn-prefix summary; a non-split cut makes the single
@@ -409,14 +460,26 @@ pub(crate) async fn summarize_attempt(
     if let Some(prefix) = turn_prefix_slice {
         slices.push(prefix);
     }
-    let result = CompactionResult {
-        summary,
-        first_kept_entry_id: attempt.first_kept_entry.clone(),
-        tokens_before: attempt.tokens_before,
-        usage: summed_usage(&slices),
-    };
-    // The digest snapshot and its fingerprint attach at the commit and never flow
-    // through the summarizer; the read happens after the summarizer resolved.
+    Ok(prepared_compaction(
+        attempt,
+        options,
+        CompactionResult {
+            summary,
+            first_kept_entry_id: attempt.first_kept_entry.clone(),
+            tokens_before: attempt.tokens_before,
+            usage: summed_usage(&slices),
+        },
+    ))
+}
+
+/// The compaction to commit: `result` and its durable entry. The digest
+/// snapshot and its fingerprint attach at the commit and never flow through
+/// the summarizer; the read happens after the summary resolved.
+fn prepared_compaction(
+    attempt: &CompactionAttempt,
+    options: &CompactOptions<'_>,
+    result: CompactionResult,
+) -> PreparedCompaction {
     let (harness_digest, harness_state_fingerprint) = options
         .harness_digest
         .as_ref()
@@ -437,7 +500,7 @@ pub(crate) async fn summarize_attempt(
         harness_digest,
         harness_state_fingerprint,
     );
-    Ok(PreparedCompaction { result, entry })
+    PreparedCompaction { result, entry }
 }
 
 /// COMMIT under the session lock: an aborted run never commits; the

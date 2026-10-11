@@ -89,6 +89,17 @@ pub enum AutonomousLimitSetting {
     Unlimited(String),
 }
 
+/// Which summarizer a compaction runs (`compaction.engine`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactionEngine {
+    /// A model writes the summary.
+    #[default]
+    Llm,
+    /// The summary is built from the session log without a model call.
+    Deterministic,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
@@ -96,6 +107,21 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
     pub agent_callable: Option<bool>,
+    /// An unrecognized engine loads as unset instead of failing the whole
+    /// `compaction` object, which would also drop the settings beside it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "engine_or_unset"
+    )]
+    pub engine: Option<CompactionEngine>,
+}
+
+fn engine_or_unset<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<CompactionEngine>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(CompactionEngine::deserialize(value).ok())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

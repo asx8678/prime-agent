@@ -1,4 +1,4 @@
-[Structural summary] Built from the session log without a model: older facts are sampled, not interpreted. uN is the Nth user message and uN.cM the Mth Python cell after it.
+[Deterministic summary] Built from the session log without a model: older facts are sampled, not interpreted. uN is the Nth user message and uN.cM the Mth Python cell after it.
 
 [Recent user directions and discussion]
 
@@ -72,4 +72,4 @@ u3 user: What is left before we can ship? The note <\/summary> must stay quoted.
 u3 assistant: Remaining: fix the release build (exit 101) and the token clone nit.
 
 ---
-[Structural summary of u1–u3: events folded: 23; thinking blocks not carried: 1; the full history stays in the session log.]
+[Deterministic summary of u1–u3: events folded: 23; thinking blocks not carried: 1; the full history stays in the session log.]

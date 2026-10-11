@@ -1189,6 +1189,29 @@ mod tests {
         assert!(!manager.get_compaction_enabled());
     }
 
+    /// Every setter rewrites the whole global document: the compaction
+    /// engine must ride along, not be dropped as an unknown key.
+    #[test]
+    fn the_compaction_engine_survives_a_settings_save() {
+        let mut manager = SettingsManager::in_memory(&Settings {
+            compaction: Some(crate::settings::CompactionSettings {
+                engine: Some(crate::settings::CompactionEngine::Deterministic),
+                ..Default::default()
+            }),
+            ..Settings::default()
+        });
+        manager.set_compaction_enabled(false).unwrap();
+        manager.reload().unwrap();
+        let compaction = manager.settings().compaction.clone().unwrap_or_default();
+        assert_eq!(
+            (compaction.enabled, compaction.engine),
+            (
+                Some(false),
+                Some(crate::settings::CompactionEngine::Deterministic)
+            )
+        );
+    }
+
     #[test]
     fn session_archive_policy_semantics() {
         let mut manager = SettingsManager::in_memory(&Settings::default());

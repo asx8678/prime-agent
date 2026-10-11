@@ -47,6 +47,7 @@ fn append_compaction_serializes_the_full_ts_record() {
             }),
             harness_digest: None,
             harness_state_fingerprint: None,
+            structural_state: None,
         })
         .unwrap();
     let line = serialize_entry(

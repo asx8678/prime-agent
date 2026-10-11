@@ -184,11 +184,6 @@ impl<T: Addressed> Sample<T> {
         }
     }
 
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.earliest.is_empty() && self.latest.is_empty()
-    }
-
     /// The `… omitted N <noun>` marker between the earliest and latest items.
     #[must_use]
     pub(crate) fn omission(&self, noun: &str) -> Option<String> {

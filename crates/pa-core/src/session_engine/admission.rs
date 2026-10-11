@@ -107,7 +107,7 @@ impl AgentSession {
             || pa_types::skill_blocks::parse_skill_block(&normalized)
                 .is_some_and(|block| self.skills.iter().any(|skill| skill.name == block.name));
         if skill_used {
-            if let Some(telemetry) = &self.skill_telemetry {
+            if let Some(telemetry) = &self.telemetry {
                 telemetry.note_skill_used();
             }
         }

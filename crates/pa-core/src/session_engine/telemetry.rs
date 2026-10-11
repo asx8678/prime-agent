@@ -319,6 +319,7 @@ pub struct SessionCounters {
 struct CounterValues {
     skill_use_count: u64,
     mcp_connector_use_count: u64,
+    compaction_deterministic_count: u64,
     kernel_bootstrap_count: u64,
     kernel_bootstrap_cold_count: u64,
     kernel_bootstrap_failed_count: u64,
@@ -380,6 +381,10 @@ impl SessionCounters {
             for (key, value) in [
                 ("skill_use_count", values.skill_use_count),
                 ("mcp_connector_use_count", values.mcp_connector_use_count),
+                (
+                    "compaction_deterministic_count",
+                    values.compaction_deterministic_count,
+                ),
                 ("kernel_bootstrap_count", values.kernel_bootstrap_count),
                 (
                     "kernel_bootstrap_cold_count",
@@ -662,6 +667,14 @@ impl SessionTelemetry {
     /// uploads.
     pub fn note_skill_used(&self) {
         self.counters.with(|values| values.skill_use_count += 1);
+    }
+
+    /// A compaction the deterministic engine committed (the
+    /// `AgentSession::compact` seam), counted as
+    /// `compaction_deterministic_count` on `agent session ended`.
+    pub fn note_deterministic_compaction(&self) {
+        self.counters
+            .with(|values| values.compaction_deterministic_count += 1);
     }
 
     /// One durable child-usage attribution row landed in the parent

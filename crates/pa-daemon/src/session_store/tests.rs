@@ -1143,6 +1143,7 @@ fn durable_compaction_row_serializes_in_the_ts_key_order() {
         }),
         harness_digest: Some("# Continual Harness State".to_string()),
         harness_state_fingerprint: None,
+        structural_state: None,
     };
     let fields = serde_json::to_value(&entry).unwrap();
     let mut session = SessionFile::create("/tmp", None, 0);

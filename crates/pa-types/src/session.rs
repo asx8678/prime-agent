@@ -206,6 +206,11 @@ pub struct CompactionEntry {
     /// boundaries skip re-delivery (TS #2400).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_state_fingerprint: Option<String>,
+    /// The state a deterministic compaction folded the history into: the next
+    /// deterministic compaction continues from it instead of re-reading the
+    /// summary. Opaque here; the session engine versions and validates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_state: Option<Value>,
 }
 
 /// `type: "branch_summary"`.
