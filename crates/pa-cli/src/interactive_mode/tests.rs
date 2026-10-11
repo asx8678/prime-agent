@@ -744,15 +744,23 @@ fn fork_startup_selection_expands_a_tilde_selector() {
     let home_file = home_sessions.join(format!("{id}.jsonl"));
     std::fs::rename(&source, &home_file).expect("move the source under home");
     let _env = crate::config::env_lock();
-    let previous_home = std::env::var("HOME").ok();
+    let ambient_home = std::env::var_os("HOME");
     std::env::set_var("HOME", &home);
     let selector = format!("~/sessions/{id}.jsonl");
-    let selection = fork_startup_selection(&selector, &project, Some(&session_dir));
-    match previous_home {
+    // Restore the env FIRST, then resume any panic: a failed selection
+    // must fail the test — and must never leak the rewritten HOME into
+    // the rest of the test process (the env_lock convention).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fork_startup_selection(&selector, &project, Some(&session_dir))
+    }));
+    match ambient_home {
         Some(value) => std::env::set_var("HOME", value),
         None => std::env::remove_var("HOME"),
     }
-    let selection = selection.expect("the tilde selector forks");
+    let selection = match outcome {
+        Ok(selection) => selection.expect("the tilde selector forks"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     let SessionSelection::Resume(fork) = &selection else {
         panic!("the fork opens as a resume of the forked file, got {selection:?}");
     };

@@ -247,6 +247,21 @@ mod tests {
         std::env::join_paths(entries).expect("plain entries join")
     }
 
+    /// The env map shape `protect_kernel_env` works on, built from pairs.
+    fn env_map(
+        entries: &[(&str, &str)],
+    ) -> std::collections::HashMap<std::ffi::OsString, std::ffi::OsString> {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    std::ffi::OsString::from(*key),
+                    std::ffi::OsString::from(*value),
+                )
+            })
+            .collect()
+    }
+
     /// The stripped PYTHONPATH for these entries, as text (the inputs are
     /// built from str, so no lossy conversion ever fires).
     fn stripped(entries: &[&str], cwd: &std::path::Path) -> Option<String> {
@@ -300,6 +315,49 @@ mod tests {
         assert_eq!(
             stripped(&["sub", "/x"], cwd),
             Some(pythonpath(&["sub", "/x"]).to_string_lossy().into_owned())
+        );
+    }
+
+    /// A stale inherited record never survives into a fresh kernel: with
+    /// no PYTHONPATH to record, the protection overwrites the stale value
+    /// with the unset sentinel. Hermetic twin of the end-to-end
+    /// `kernel_lifecycle` test, which can only run its unset case when the
+    /// developer has not exported PYTHONPATH. The whole map is compared,
+    /// so the injected protection pair is pinned too.
+    #[test]
+    fn a_stale_record_is_overwritten_with_the_unset_sentinel() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let mut env = env_map(&[(HOST_PYTHONPATH_ENV, "/stale")]);
+        protect_kernel_env(&mut env, Some(project.path()));
+        assert_eq!(
+            env,
+            env_map(&[
+                ("PYTHONSAFEPATH", "1"),
+                (HOST_SAFEPATH_MARKER_ENV, "1"),
+                (HOST_PYTHONPATH_ENV, HOST_PYTHONPATH_UNSET),
+            ]),
+            "the protection records the unset sentinel over the stale value"
+        );
+    }
+
+    /// A user-set PYTHONSAFEPATH (non-empty) is the user's own choice: it
+    /// stays, and a stale inherited marker next to it is dropped — the
+    /// runtime would otherwise pop the pair and remove the user's setting
+    /// from every `bash()` child. Whole-map comparison: the marker is gone,
+    /// PYTHONSAFEPATH stays, and the record gets the unset sentinel (there
+    /// is no PYTHONPATH here).
+    #[test]
+    fn an_inherited_marker_never_pops_a_user_set_safepath() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let mut env = env_map(&[("PYTHONSAFEPATH", "1"), (HOST_SAFEPATH_MARKER_ENV, "1")]);
+        protect_kernel_env(&mut env, Some(project.path()));
+        assert_eq!(
+            env,
+            env_map(&[
+                ("PYTHONSAFEPATH", "1"),
+                (HOST_PYTHONPATH_ENV, HOST_PYTHONPATH_UNSET),
+            ]),
+            "the user's safepath stays, the stale marker goes"
         );
     }
 }

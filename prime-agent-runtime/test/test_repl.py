@@ -3226,8 +3226,14 @@ class HostSafepathPopTest(unittest.TestCase):
             environ, {"PRIME_AGENT_KERNEL_SAFEPATH": "1", "PYTHONSAFEPATH": "1"}
         ):
             self.repl_module._drop_host_import_protection()
-            self.assertNotIn("PRIME_AGENT_KERNEL_SAFEPATH", environ)
-            self.assertNotIn("PYTHONSAFEPATH", environ)
+            self.assertIsNone(
+                environ.get("PRIME_AGENT_KERNEL_SAFEPATH"),
+                "the host marker must be popped, not left for a bash() child",
+            )
+            self.assertIsNone(
+                environ.get("PYTHONSAFEPATH"),
+                "the host's safepath must be popped, not left for a bash() child",
+            )
 
     def test_user_set_safepath_stays_without_the_marker(self):
         environ = self.repl_module.os.environ
@@ -3240,7 +3246,7 @@ class HostSafepathPopTest(unittest.TestCase):
 
 
 class HostPythonpathPopTest(unittest.TestCase):
-    """The host records the pre-strip PYTHONPATH in
+    r"""The host records the pre-strip PYTHONPATH in
     PRIME_AGENT_KERNEL_PYTHONPATH — the ``\x01`` sentinel when it was
     unset. ``_drop_host_import_protection`` must restore exactly that
     state: unset stays unset (the sentinel is never restored verbatim),
@@ -3258,18 +3264,23 @@ class HostPythonpathPopTest(unittest.TestCase):
             {"PRIME_AGENT_KERNEL_PYTHONPATH": "\x01", "PYTHONPATH": "stripped"},
         ):
             self.repl_module._drop_host_import_protection()
-            self.assertNotIn("PRIME_AGENT_KERNEL_PYTHONPATH", environ)
-            self.assertNotIn(
-                "PYTHONPATH",
-                environ,
-                "the unset sentinel must remove PYTHONPATH, not restore \x01 verbatim",
+            self.assertIsNone(
+                environ.get("PRIME_AGENT_KERNEL_PYTHONPATH"),
+                "the record must be popped, not left for a bash() child",
+            )
+            self.assertIsNone(
+                environ.get("PYTHONPATH"),
+                "the unset sentinel must remove PYTHONPATH, not restore \\x01 verbatim",
             )
 
     def test_empty_original_is_restored_verbatim(self):
         environ = self.repl_module.os.environ
         with mock.patch.dict(environ, {"PRIME_AGENT_KERNEL_PYTHONPATH": ""}):
             self.repl_module._drop_host_import_protection()
-            self.assertNotIn("PRIME_AGENT_KERNEL_PYTHONPATH", environ)
+            self.assertIsNone(
+                environ.get("PRIME_AGENT_KERNEL_PYTHONPATH"),
+                "the record must be popped, not left for a bash() child",
+            )
             self.assertEqual(
                 environ.get("PYTHONPATH"),
                 "",
