@@ -1636,15 +1636,28 @@ def _wait_owner_posix(owner: int, initial_ppid: int) -> None:
             )
             wait_for_exit = functools.partial(kq.control, None, 1)
         else:
+            if hasattr(os, "pidfd_open"):
+                pidfd = os.pidfd_open(owner)
+            elif sys.platform == "linux":
+                # uv's standalone CPython builds (the kernel venv's interpreter)
+                # ship without os.pidfd_open; issue the syscall directly
+                # (pidfd_open is 434 on every Linux ABI except alpha).
+                libc = ctypes.CDLL(None, use_errno=True)
+                pidfd = libc.syscall(434, ctypes.c_int(owner), ctypes.c_uint(0))
+                if pidfd < 0:
+                    err = ctypes.get_errno()
+                    # OSError maps ESRCH to ProcessLookupError (owner already gone).
+                    raise OSError(err, os.strerror(err))
+            else:
+                raise OSError("no process exit notification on this platform")
             poller = select.poll()
-            poller.register(os.pidfd_open(owner), select.POLLIN)
+            poller.register(pidfd, select.POLLIN)
             wait_for_exit = poller.poll
     except ProcessLookupError:
         return  # already gone
     except (AttributeError, OSError):
         # Slow fallback, only where exit notification is unavailable: Linux
-        # before 5.3, a seccomp filter denying pidfd_open, a CPython built
-        # without os.pidfd_open.
+        # before 5.3, a seccomp filter denying pidfd_open.
         while _owner_alive_posix(owner, initial_ppid):
             time.sleep(30.0)
         return
