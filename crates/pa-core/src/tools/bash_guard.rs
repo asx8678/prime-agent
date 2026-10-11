@@ -83,11 +83,14 @@ fn is_forced_clean_segment(args: &str) -> bool {
     })
 }
 
-/// Replace characters inside single- or double-quoted spans with spaces so the discard matcher
-/// cannot match quoted data; character positions stay identical. Command substitution (`$(...)`,
-/// backticks) is left live because it executes; unquoted `#` at a word boundary starts a comment.
-fn mask_quoted_spans(command: &str) -> Vec<char> {
-    let mut chars: Vec<char> = command.chars().collect();
+/// Mask characters inside single- or double-quoted spans with spaces so the discard matcher
+/// cannot match quoted data. A masked character renders as spaces matching its UTF-8 width, so
+/// byte offsets in the masked string are byte offsets in the original command. Command
+/// substitution (`$(...)`, backticks) is left live because it executes; unquoted `#` at a word
+/// boundary starts a comment.
+fn mask_quoted_spans(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut masked = vec![false; chars.len()];
     let mut quote: Option<char> = None;
     let len = chars.len();
     let mut i = 0usize;
@@ -103,7 +106,7 @@ fn mask_quoted_spans(command: &str) -> Vec<char> {
             {
                 let mut j = i;
                 while j < len && chars[j] != '\n' {
-                    chars[j] = ' ';
+                    masked[j] = true;
                     j += 1;
                 }
                 i = j;
@@ -116,13 +119,13 @@ fn mask_quoted_spans(command: &str) -> Vec<char> {
             if ch == '\'' {
                 quote = None;
             } else {
-                chars[i] = ' ';
+                masked[i] = true;
             }
         } else if ch == '"' {
             quote = None;
         } else if ch == '\\' && i + 1 < len {
-            chars[i] = ' ';
-            chars[i + 1] = ' ';
+            masked[i] = true;
+            masked[i + 1] = true;
             i += 1;
         } else if ch == '$' && i + 1 < len && chars[i + 1] == '(' {
             let mut depth = 0i32;
@@ -146,17 +149,27 @@ fn mask_quoted_spans(command: &str) -> Vec<char> {
             }
             i = j.saturating_sub(1);
         } else {
-            chars[i] = ' ';
+            masked[i] = true;
         }
         i += 1;
     }
     chars
+        .iter()
+        .zip(masked.iter())
+        .map(|(ch, &is_masked)| {
+            if is_masked {
+                " ".repeat(ch.len_utf8())
+            } else {
+                ch.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Find every destructive git discard command in `command`, returning the
 /// byte index where each `git` token starts (empty when none match).
 pub fn find_destructive_git_discard_commands(command: &str) -> Vec<usize> {
-    let masked: String = mask_quoted_spans(command).into_iter().collect();
+    let masked = mask_quoted_spans(command);
     let mut indices: Vec<usize> = Vec::new();
     for pattern in [
         discard_checkout_pattern(),

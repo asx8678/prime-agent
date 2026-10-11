@@ -679,3 +679,16 @@ fn destructive_git_discard_detection_examples() {
         !crate::tools::bash_guard::is_destructive_git_discard_command("git clean --dry-run -f")
     );
 }
+
+#[test]
+fn destructive_discard_offsets_survive_multibyte_masks() {
+    let command = "# éé\ngit checkout -- .";
+    let indices = crate::tools::bash_guard::find_destructive_git_discard_commands(command);
+    // The masked comment's multibyte chars must not shift the reported offsets.
+    assert_eq!(indices, vec![command.find("git").expect("git token")]);
+    let resolution = crate::tools::bash_guard::resolve_discard_probe_target(command, indices[0], 0);
+    assert_eq!(
+        resolution,
+        crate::tools::bash_guard::DiscardProbeResolution::Unresolvable
+    );
+}
