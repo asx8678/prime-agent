@@ -48,10 +48,12 @@ impl Fold {
     }
 
     /// The summary, quoting `request` (the `/compact` instructions), and the
-    /// state to save on the new compaction row. The summary takes at most
-    /// 32 KiB and at most half the model's context window in bytes, about an
-    /// eighth of it in tokens, so a small window keeps room for the kept
-    /// messages.
+    /// state to save on the new compaction row. The rendered state takes at
+    /// most 32 KiB and at most half the model's context window in bytes,
+    /// about an eighth of it in tokens, so a small window keeps room for the
+    /// kept messages. The file-list block appended after it (itself capped
+    /// by `FILE_LIST_MAX_ENTRIES` / `FILE_LIST_MAX_COMBINED_CHARS` in
+    /// `compaction_utils.rs`) is outside this bound.
     pub(crate) fn summarize(&self, request: Option<&str>, context_window: u64) -> (String, Value) {
         let mut state = self.state.clone();
         state.fold(&self.events);

@@ -203,8 +203,8 @@ impl AgentSession {
             compaction_trace::trace("compact.skipped", &serde_json::Value::Null);
             return Ok(outcome);
         }
-        // Every compaction path runs through here: the opt-in engine's
-        // adoption counts once per committed compaction.
+        // Every compaction path runs through here: the deterministic
+        // engine's adoption counts once per committed compaction.
         if options.settings.engine == crate::settings::CompactionEngine::Deterministic {
             if let Some(telemetry) = &self.telemetry {
                 telemetry.note_deterministic_compaction();
