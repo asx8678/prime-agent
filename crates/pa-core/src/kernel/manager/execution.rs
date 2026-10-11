@@ -188,11 +188,10 @@ impl Inner {
             }
             if let Some(text) = &result {
                 if text.len() > execution.max_chars {
-                    let mut clipped = text[..execution.max_chars.clamp(0, text.len())].to_string();
-                    // Trim at a char boundary when max_chars split a multi-byte char.
-                    while !clipped.is_char_boundary(clipped.len()) {
-                        clipped.pop();
-                    }
+                    // Cut at a char boundary: max_chars is a byte budget and can
+                    // land inside a multi-byte char.
+                    let mut clipped =
+                        text[..text.floor_char_boundary(execution.max_chars)].to_string();
                     let _ = write!(
                         clipped,
                         "\n[... output truncated at {} chars ...]",

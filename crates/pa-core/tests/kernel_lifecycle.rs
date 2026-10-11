@@ -560,3 +560,29 @@ async fn project_rlm_package_does_not_shadow_the_kernel_runtime() {
     let shutdown = manager.shutdown(KernelShutdownOptions::default()).await;
     assert!(shutdown.is_ok());
 }
+
+/// An oversized result whose byte cut lands inside a multi-byte character is
+/// clipped at a char boundary; the reader task survives to settle later cells.
+#[tokio::test]
+async fn oversized_non_ascii_result_is_clipped_and_the_kernel_keeps_running() {
+    let Some(options) = test_options(None) else {
+        return;
+    };
+    let manager = started_manager(options).await;
+
+    // 2-byte chars: the 65,536-byte cap falls after the quote, mid-character.
+    // Before the fix the clip panicked the stdout reader and the cell never settled.
+    let big = tokio::time::timeout(Duration::from_secs(30), execute(&manager, "'ł' * 40000"))
+        .await
+        .expect("the oversized cell must settle");
+    let text = big.result.expect("the oversized cell carries a result");
+    let marker = "\n[... output truncated at 65536 chars ...]";
+    assert_eq!(
+        (big.status, text.len(), text.ends_with(marker)),
+        (ExecuteStatus::Ok, 65_535 + marker.len(), true)
+    );
+    let next = execute(&manager, "1 + 1").await;
+    assert_eq!(next.result.as_deref(), Some("2"));
+    let shutdown = manager.shutdown(KernelShutdownOptions::default()).await;
+    assert!(shutdown.is_ok());
+}
