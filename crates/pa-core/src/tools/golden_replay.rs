@@ -91,9 +91,12 @@ fn make_fixture(case: &serde_json::Value) -> (tempfile::TempDir, String) {
     if let Some(commands) = case.get("fixture").and_then(serde_json::Value::as_array) {
         for command in commands {
             let command = command.as_str().expect("fixture command");
+            // The fixtures pin GIT_*_DATE without an offset, which git reads in
+            // the local zone; the TS capture ran in UTC, so pin it for the hashes.
             let status = std::process::Command::new("/bin/bash")
                 .arg("-c")
                 .arg(command)
+                .env("TZ", "UTC")
                 .current_dir(dir.path())
                 .status()
                 .expect("run fixture command");
