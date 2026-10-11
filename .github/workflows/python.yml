@@ -1,0 +1,40 @@
+# Python gates: the kernel runtime suite (prime-agent-runtime/test) and the
+# skill suites. No other workflow runs them. The runtime suite runs on
+# uv-managed CPython 3.11, the kernel's interpreter: distro Pythons expose
+# os.pidfd_open where uv's build does not, which hides a whole bug class.
+name: python
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+      - name: Runtime suite
+        working-directory: prime-agent-runtime
+        run: uv run --frozen --managed-python --python 3.11 --group dev python -m unittest discover -s test
+      - name: decision-api skill suite
+        working-directory: skills/decision-api
+        env:
+          PYTHONPATH: src
+        run: uv run --no-project --managed-python --python 3.11 python -m unittest discover -s tests
+      - name: edit skill suite
+        working-directory: skills/edit
+        run: uv run --no-project --managed-python --python 3.11 python -m unittest discover -s tests
