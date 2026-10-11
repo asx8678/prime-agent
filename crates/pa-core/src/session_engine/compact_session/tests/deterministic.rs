@@ -312,6 +312,121 @@ async fn an_abandoned_branch_never_reaches_the_deterministic_summary() {
     registration.unregister();
 }
 
+/// Compacting on a branch and then branching back leaves the abandoned rows
+/// — and the compaction that branch ended in — out of the next fold: it
+/// starts from the active branch alone, so no abandoned fact reappears and
+/// the user numbering restarts at the branch point.
+#[tokio::test]
+async fn a_compaction_after_a_branch_back_leaves_the_abandoned_branch_behind() {
+    let registration = faux_registration();
+    registration.set_responses(Vec::new());
+    let model = wide_model(&registration);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::in_memory(tmp.path());
+    session.append_message(user("first request")).unwrap();
+    let branch_point = session.append_message(reply("first reply")).unwrap();
+    session.append_message(user("abandoned plan")).unwrap();
+    session.append_message(reply("abandoned reply")).unwrap();
+    session.append_message(user("abandoned more")).unwrap();
+    session
+        .append_message(reply("abandoned more reply"))
+        .unwrap();
+    ran(
+        execute_compaction(&mut session, deterministic(model.clone()))
+            .await
+            .unwrap(),
+    );
+    session.branch(&branch_point);
+    session.append_message(user("second request")).unwrap();
+    session.append_message(reply("second reply")).unwrap();
+    session.append_message(user("third request")).unwrap();
+    session.append_message(reply("third reply")).unwrap();
+    let second = ran(execute_compaction(&mut session, deterministic(model))
+        .await
+        .unwrap());
+    assert!(
+        !second.result.summary.contains("abandoned"),
+        "{}",
+        second.result.summary
+    );
+    assert!(
+        second
+            .result
+            .summary
+            .contains("User instruction [u1]:\nfirst request"),
+        "{}",
+        second.result.summary
+    );
+    assert!(
+        second
+            .result
+            .summary
+            .contains("User instruction [u2]:\nsecond request"),
+        "{}",
+        second.result.summary
+    );
+    assert_eq!(users_folded(&second), json!(2));
+    registration.unregister();
+}
+
+/// A long abandoned branch with a short active tail never moves the kept
+/// boundary off the active path: the branch-only cut either keeps an
+/// on-branch row or the compaction skips — the abandoned rows alone are
+/// never enough history to cut into.
+#[tokio::test]
+async fn a_long_abandoned_branch_never_cuts_the_kept_boundary_off_the_active_path() {
+    let registration = faux_registration();
+    registration.set_responses(Vec::new());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::in_memory(tmp.path());
+    session.append_message(user("root request")).unwrap();
+    let branch_point = session.append_message(reply("root reply")).unwrap();
+    for turn in 0..8 {
+        session
+            .append_message(user(&format!(
+                "abandoned request {turn} {}",
+                "x".repeat(400)
+            )))
+            .unwrap();
+        session
+            .append_message(reply(&format!(
+                "abandoned reply {turn} {}",
+                "y".repeat(400)
+            )))
+            .unwrap();
+    }
+    session.branch(&branch_point);
+    session.append_message(user("tail request")).unwrap();
+    session.append_message(reply("tail reply")).unwrap();
+    let active_ids: std::collections::HashSet<String> = session
+        .active_branch_entries()
+        .into_iter()
+        .filter_map(|entry| entry.id().map(str::to_string))
+        .collect();
+    let outcome = execute_compaction(
+        &mut session,
+        CompactOptions {
+            settings: super::super::compaction::CompactionSettings {
+                keep_recent_tokens: 50,
+                engine: CompactionEngine::Deterministic,
+                ..Default::default()
+            },
+            ..deterministic(wide_model(&registration))
+        },
+    )
+    .await
+    .unwrap();
+    match outcome {
+        CompactOutcome::Skipped(_) => {}
+        CompactOutcome::Ran(run) => assert!(
+            active_ids.contains(&run.result.first_kept_entry_id),
+            "the cut kept an off-branch row: {}",
+            run.result.first_kept_entry_id
+        ),
+    }
+    registration.unregister();
+}
+
 /// A small context window scales the summary down to half its size in
 /// bytes, so the kept messages still fit.
 #[tokio::test]

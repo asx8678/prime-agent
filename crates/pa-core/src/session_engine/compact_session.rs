@@ -150,24 +150,26 @@ pub(crate) fn prepare_attempt(
     session: &SessionManager,
     options: &CompactOptions<'_>,
 ) -> Result<CompactionAttempt, CompactSkip> {
-    let entries = session.retained_entries().to_vec();
+    // The cut, the fold, and every index resolve over the active branch
+    // alone: the retained rows also carry abandoned branches' rows (and, in
+    // a resumed window, off-branch history), none of which the compaction
+    // may summarize or keep — the daemon's durable re-cut walks the same
+    // branch view.
+    let entries: Vec<FileEntry> = session
+        .active_branch_entries()
+        .into_iter()
+        .cloned()
+        .collect();
     let prefix_leaf = session.get_leaf_id().map(str::to_string);
     let preparation = prepare_compaction(&entries, options.settings.keep_recent_tokens)?;
-    // The deterministic engine folds the active branch only: a resumed
-    // window also retains the rows of abandoned branches.
+    // The deterministic engine folds the branch rows between the prior
+    // compaction's boundary and the new cut.
     let structural = (options.settings.engine == crate::settings::CompactionEngine::Deterministic)
         .then(|| {
-            let on_path: std::collections::HashSet<&str> = session
-                .active_branch_entries()
-                .into_iter()
-                .filter_map(FileEntry::id)
-                .collect();
             super::structural_compaction::Fold::new(
                 preparation.previous_state.as_ref(),
                 preparation.previous_summary.as_deref(),
-                entries[preparation.boundary_start..preparation.cut.first_kept_entry_index]
-                    .iter()
-                    .filter(|entry| entry.id().is_some_and(|id| on_path.contains(id))),
+                entries[preparation.boundary_start..preparation.cut.first_kept_entry_index].iter(),
             )
         });
     // TS `beginCompaction` after the preparation resolved: a skipped

@@ -277,8 +277,16 @@ impl TurnBoundaryRequests {
                         ));
                     }
                     // TS `prepareCompaction`: only schedule a compaction
-                    // that has history to summarize.
-                    let entries = runtime.session.lock().await.retained_entries().to_vec();
+                    // that has history to summarize — judged over the active
+                    // branch alone, the same view the cut resolves over.
+                    let entries: Vec<FileEntry> = runtime
+                        .session
+                        .lock()
+                        .await
+                        .active_branch_entries()
+                        .into_iter()
+                        .cloned()
+                        .collect();
                     if let Some(reason) =
                         compaction_request_skip_reason(&entries, keep_recent_tokens)
                     {
