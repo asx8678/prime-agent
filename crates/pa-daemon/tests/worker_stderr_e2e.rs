@@ -182,13 +182,15 @@ fn worker_stderr_lands_in_the_per_worker_log_and_prunes_retention() {
     std::fs::create_dir_all(agent_dir.join("logs")).expect("logs dir");
     // Retention pressure: more leftover logs than the daemon keeps, each
     // older than anything this run writes.
-    for index in 0..70 {
+    for index in 0..70_u64 {
         let path = agent_dir
             .join("logs")
             .join(format!("worker-old{index:03}.stderr.log"));
         std::fs::write(&path, "leftover from an earlier daemon run\n").expect("leftover log");
-        let mtime = filetime::FileTime::from_unix_time(i64::from(index), 0);
-        filetime::set_file_mtime(&path, mtime).expect("set mtime");
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(index);
+        std::fs::File::open(&path)
+            .and_then(|file| file.set_modified(mtime))
+            .expect("set mtime");
     }
     // PA_DAEMON_DEBUG makes the real worker narrate its boot on stderr
     // (accepted connection, auth ok): the capture's observable content.

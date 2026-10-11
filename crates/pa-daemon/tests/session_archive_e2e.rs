@@ -234,9 +234,10 @@ fn write_fixture(sessions_dir: &Path, name: &str) -> String {
 
 /// Backdate a file's mtime (the age rule keys on it).
 fn age_days(path: &Path, days: u64) {
-    let seconds = days * 24 * 60 * 60;
-    let mtime = filetime::FileTime::from_unix_time(seconds as i64, 0);
-    filetime::set_file_mtime(path, mtime).expect("set mtime");
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(days * 24 * 60 * 60);
+    std::fs::File::open(path)
+        .and_then(|file| file.set_modified(mtime))
+        .expect("set mtime");
 }
 
 /// An active scheduled job pinning one session file (the disk analogue of

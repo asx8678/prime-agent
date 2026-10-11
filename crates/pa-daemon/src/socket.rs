@@ -596,9 +596,12 @@ mod tests {
         bind_stale_socket(&socket).await;
         let crashed_lock = dir.path().join("daemon.sock.lock");
         std::fs::create_dir(&crashed_lock).unwrap();
-        let six_seconds_ago =
-            filetime::FileTime::from_system_time(std::time::SystemTime::now() - LOCK_STALE_AFTER);
-        filetime::set_file_mtime(&crashed_lock, six_seconds_ago).unwrap();
+        let six_seconds_ago = std::time::SystemTime::now() - LOCK_STALE_AFTER;
+        // A directory opens read-only on unix, which is enough for futimens.
+        std::fs::File::open(&crashed_lock)
+            .unwrap()
+            .set_modified(six_seconds_ago)
+            .unwrap();
         // A lock whose holder crashed (mtime past LOCK_STALE_AFTER) is reclaimed instead of
         // waiting out the full retry budget.
         tokio::time::timeout(Duration::from_secs(2), prepare_socket_path(&socket))

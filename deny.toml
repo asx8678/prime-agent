@@ -12,11 +12,13 @@ yanked = "deny"
 # a landed fix upstream means the entry is removed instead of silenced.
 ignore = [
   # Marvin Attack timing sidechannel in rsa; no patch exists upstream
-  # (RustCrypto/RSA#626 tracks it). `rsa` is currently a dead dependency in
-  # pa-ai (declared, never referenced); no signing path executes it, so no
-  # timing oracle exists. Reviewed 2026-09-17; drop rsa (pa-ai lane) or
-  # re-triage when rsa publishes a fix.
-  { id = "RUSTSEC-2023-0071", reason = "unpatched upstream; rsa is an unused pa-ai dep, no signing path executes it (reviewed 2026-09-17)" },
+  # (RustCrypto/RSA#626 tracks it). pa-core/pa-cli use rsa for the Prime
+  # browser logins: OAEP encryption to the server's public key, and one OAEP
+  # decryption of the login result under a fresh per-login 2048-bit key. The
+  # attack needs many timed decryptions under one key; a key that decrypts
+  # once offers no oracle. Reviewed 2026-10-11; re-triage when rsa publishes
+  # a fix or a long-lived private key appears.
+  { id = "RUSTSEC-2023-0071", reason = "unpatched upstream; rsa private keys are per-login and decrypt one result, so no timing oracle exists (reviewed 2026-10-11)" },
   # `paste` proc-macro is unmaintained; pulled by ratatui (build-time only,
   # no vulnerable code path). Reviewed 2026-09-17; revisit when ratatui
   # drops the dep.
