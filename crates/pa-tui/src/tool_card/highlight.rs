@@ -519,8 +519,11 @@ fn header_mode(
 ) -> Option<usize> {
     let mut i = at + keyword_len;
     let gap_start = i;
-    while code[i..].starts_with(|c: char| c.is_whitespace()) && !code[i..].starts_with('\n') {
-        i += 1;
+    while let Some(ch) = code[i..].chars().next() {
+        if !ch.is_whitespace() || ch == '\n' {
+            break;
+        }
+        i += ch.len_utf8();
     }
     let name_len = code[i..]
         .char_indices()
@@ -647,6 +650,16 @@ mod tests {
         let lines = highlight_python(code, &SyntaxPalette::from_theme(&theme()));
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), code);
+    }
+
+    #[test]
+    fn def_header_multibyte_gap_keeps_all_text() {
+        let code = "def\u{00a0}foo():\n    pass\n";
+        let toks = scopes(code);
+        assert_eq!(
+            toks.iter().map(|(t, _)| t.as_str()).collect::<String>(),
+            code
+        );
     }
 
     #[test]
