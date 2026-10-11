@@ -674,26 +674,43 @@ async fn bash_child_sibling_imports_keep_working() {
         .expect("shutdown");
 }
 
-/// An oversized result whose byte cut lands inside a multi-byte character is
-/// clipped at a char boundary; the reader task survives to settle later cells.
+/// The result clip budget counts characters, not bytes: the contract is
+/// "Cap stdout / stderr / result at this many characters"
+/// (`ExecuteOptions::max_output_chars`) and the stream paths already count
+/// chars. A 40,000-char result of a 2-byte character (80,000 bytes) fits
+/// the 65,536-char budget untruncated — a byte budget would clip it; a
+/// 70,000-char result is cut to exactly 65,536 chars plus the marker, and
+/// the kernel keeps running.
 #[tokio::test]
-async fn oversized_non_ascii_result_is_clipped_and_the_kernel_keeps_running() {
+async fn oversized_non_ascii_result_is_clipped_at_the_char_budget() {
     let Some(options) = test_options(None) else {
         return;
     };
     let manager = started_manager(options).await;
 
-    // 2-byte chars: the 65,536-byte cap falls after the quote, mid-character.
-    // Before the fix the clip panicked the stdout reader and the cell never settled.
-    let big = tokio::time::timeout(Duration::from_secs(30), execute(&manager, "'ł' * 40000"))
+    let fits = tokio::time::timeout(Duration::from_secs(30), execute(&manager, "'ł' * 40000"))
         .await
         .expect("the oversized cell must settle");
+    assert_eq!(fits.status, ExecuteStatus::Ok, "cell: {:?}", fits.error);
+    let expected_full = format!("'{}'", "ł".repeat(40_000));
+    assert_eq!(
+        fits.result.as_deref(),
+        Some(expected_full.as_str()),
+        "a result inside the char budget must not be truncated"
+    );
+
+    let big = tokio::time::timeout(Duration::from_secs(30), execute(&manager, "'ł' * 70000"))
+        .await
+        .expect("the oversized cell must settle");
+    assert_eq!(big.status, ExecuteStatus::Ok, "cell: {:?}", big.error);
     let text = big.result.expect("the oversized cell carries a result");
     let marker = "\n[... output truncated at 65536 chars ...]";
+    let expected_clipped = format!("'{}{}", "ł".repeat(65_535), marker);
     assert_eq!(
-        (big.status, text.len(), text.ends_with(marker)),
-        (ExecuteStatus::Ok, 65_535 + marker.len(), true)
+        text, expected_clipped,
+        "the clip keeps exactly the first 65,536 chars plus the marker"
     );
+    assert_eq!(text.chars().count(), 65_536 + marker.chars().count());
     let next = execute(&manager, "1 + 1").await;
     assert_eq!(next.result.as_deref(), Some("2"));
     let shutdown = manager.shutdown(KernelShutdownOptions::default()).await;

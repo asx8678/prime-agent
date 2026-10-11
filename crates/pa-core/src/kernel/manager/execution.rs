@@ -187,11 +187,15 @@ impl Inner {
                 );
             }
             if let Some(text) = &result {
-                if text.len() > execution.max_chars {
-                    // Cut at a char boundary: max_chars is a byte budget and can
-                    // land inside a multi-byte char.
-                    let mut clipped =
-                        text[..text.floor_char_boundary(execution.max_chars)].to_string();
+                if text.chars().count() > execution.max_chars {
+                    // The budget counts characters (the stream paths count
+                    // chars too): cut at the byte index of the max_chars-th
+                    // character.
+                    let end = text
+                        .char_indices()
+                        .nth(execution.max_chars)
+                        .map_or(text.len(), |(i, _)| i);
+                    let mut clipped = text[..end].to_string();
                     let _ = write!(
                         clipped,
                         "\n[... output truncated at {} chars ...]",
