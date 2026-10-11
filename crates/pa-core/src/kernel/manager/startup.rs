@@ -175,8 +175,15 @@ impl Inner {
         // fail to start); repl.py appends the cwd last so project modules import.
         // The marker lets repl.py pop PYTHONSAFEPATH before any bash() child can
         // inherit it: the protection is for the runtime's own imports, not the
-        // agent's commands. A PYTHONSAFEPATH the user set themselves is kept.
-        if !env.contains_key("PYTHONSAFEPATH") {
+        // agent's commands. A non-empty PYTHONSAFEPATH the user set themselves
+        // is their choice and stays (free of any inherited marker); an empty
+        // value means "unset" to Python, so it still gets the protection.
+        if env
+            .get("PYTHONSAFEPATH")
+            .is_some_and(|value| !value.is_empty())
+        {
+            env.remove(crate::kernel::python_env::HOST_SAFEPATH_MARKER_ENV);
+        } else {
             env.insert("PYTHONSAFEPATH".to_string(), "1".to_string());
             env.insert(
                 crate::kernel::python_env::HOST_SAFEPATH_MARKER_ENV.to_string(),
@@ -185,13 +192,31 @@ impl Inner {
         }
         // Empty PYTHONPATH entries resolve to the cwd at import time, which
         // would re-enable the project-package shadowing above; real entries
-        // stay honored.
-        if let Some(pythonpath) = env.get("PYTHONPATH").cloned() {
-            let stripped = crate::kernel::python_env::strip_empty_pythonpath_entries(&pythonpath);
-            if stripped.is_empty() {
-                env.remove("PYTHONPATH");
-            } else {
-                env.insert("PYTHONPATH".to_string(), stripped);
+        // stay honored. The original is recorded next to the strip so repl.py
+        // can restore it before any cell or bash() child inherits the
+        // stripped value — a bash() child must see the user's PYTHONPATH,
+        // empty entries included, like in their own shell. The sentinel
+        // covers an unset PYTHONPATH so a stale inherited record cannot
+        // survive into a fresh kernel.
+        match env.get("PYTHONPATH").cloned() {
+            Some(pythonpath) => {
+                env.insert(
+                    crate::kernel::python_env::HOST_PYTHONPATH_ENV.to_string(),
+                    pythonpath.clone(),
+                );
+                let stripped =
+                    crate::kernel::python_env::strip_empty_pythonpath_entries(&pythonpath);
+                if stripped.is_empty() {
+                    env.remove("PYTHONPATH");
+                } else {
+                    env.insert("PYTHONPATH".to_string(), stripped);
+                }
+            }
+            None => {
+                env.insert(
+                    crate::kernel::python_env::HOST_PYTHONPATH_ENV.to_string(),
+                    crate::kernel::python_env::HOST_PYTHONPATH_UNSET.to_string(),
+                );
             }
         }
         env.insert(

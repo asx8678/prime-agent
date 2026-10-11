@@ -14,6 +14,22 @@
 /// themselves (no marker) survives.
 pub const HOST_SAFEPATH_MARKER_ENV: &str = "PRIME_AGENT_KERNEL_SAFEPATH";
 
+/// The original PYTHONPATH the host records next to the entries it strips
+/// from the kernel's environment. The runtime pops it at the very start of
+/// `rlm.repl.main()` and restores (or, for the sentinel, removes) PYTHONPATH
+/// before any cell or `bash()` child can inherit the stripped value: the
+/// strip protects the runtime's own imports, not the agent's commands.
+/// Always written when the host applies its protection, so a stale inherited
+/// value can never survive into a fresh kernel.
+pub const HOST_PYTHONPATH_ENV: &str = "PRIME_AGENT_KERNEL_PYTHONPATH";
+
+/// Sentinel recorded in [`HOST_PYTHONPATH_ENV`] when PYTHONPATH was unset:
+/// a leading `\u{1}` cannot occur in a real path list (Windows forbids
+/// control characters in filenames; on every platform it is not a path
+/// anyone sets). Must stay byte-identical to `_HOST_PYTHONPATH_UNSET` in
+/// `prime-agent-runtime/src/rlm/repl.py`.
+pub const HOST_PYTHONPATH_UNSET: &str = "\u{1}";
+
 /// Drop empty PYTHONPATH entries: the common `export PYTHONPATH=$PYTHONPATH:/x`
 /// yields ":/x", and an empty entry resolves to the cwd at import time —
 /// putting the project directory back on `sys.path` ahead of the installed

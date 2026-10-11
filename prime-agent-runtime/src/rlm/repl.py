@@ -1737,16 +1737,36 @@ def _setup_fds() -> int:
     return stdin_fd
 
 
-def _drop_host_safepath() -> None:
-    """Pop the host's PYTHONSAFEPATH before any child can inherit it.
+_HOST_PYTHONPATH_UNSET = "\x01"
+"""Sentinel the host records in PRIME_AGENT_KERNEL_PYTHONPATH when PYTHONPATH
+was unset; must stay byte-identical to HOST_PYTHONPATH_UNSET in
+crates/pa-core/src/kernel/python_env.rs."""
+
+
+def _drop_host_import_protection() -> None:
+    """Undo the host's import protection before any child can inherit it.
 
     The host sets PYTHONSAFEPATH only so a project's own ``rlm`` package
     cannot shadow the runtime at import time. It is not meant for the
     commands the agent runs through ``bash()``: inherited, it breaks
     ``python3 script.py`` sibling imports, ``python3 -m mypkg`` and
-    pytest's cwd-based imports. Popped only when the host's marker is
-    present, so a PYTHONSAFEPATH the user set themselves stays.
+    pytest's cwd-based imports. The pair (host marker + PYTHONSAFEPATH)
+    is popped only when the marker is present, so a PYTHONSAFEPATH the
+    user set themselves stays.
+
+    The host also strips PYTHONPATH entries that resolve to the session
+    cwd (empty entries included) and records the original in
+    PRIME_AGENT_KERNEL_PYTHONPATH — the sentinel ``\x01`` when it was
+    unset. The original is restored here, and the private variable
+    popped, before any cell or ``bash()`` child can inherit the stripped
+    value: children see the PYTHONPATH the user actually set.
     """
+    original = os.environ.pop("PRIME_AGENT_KERNEL_PYTHONPATH", None)
+    if original is not None:
+        if original == _HOST_PYTHONPATH_UNSET:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = original
     if os.environ.pop("PRIME_AGENT_KERNEL_SAFEPATH", None) is not None:
         os.environ.pop("PYTHONSAFEPATH", None)
 
@@ -1770,7 +1790,7 @@ def _append_startup_cwd_to_path() -> None:
 
 def main() -> None:
     global _loop, _serve_task
-    _drop_host_safepath()
+    _drop_host_import_protection()
     stdin_fd = _setup_fds()
     _append_startup_cwd_to_path()
     _start_owner_watchdog()

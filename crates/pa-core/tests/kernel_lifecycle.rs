@@ -674,6 +674,82 @@ async fn bash_child_sibling_imports_keep_working() {
         .expect("shutdown");
 }
 
+/// A user PYTHONSAFEPATH that is set but empty is "unset" to Python
+/// (`PYTHONSAFEPATH=` leaves `sys.flags.safe_path` False), so the empty
+/// value must not count as the user opting out: the host still applies its
+/// own protection (PYTHONSAFEPATH=1 plus the marker). A non-empty user
+/// value, by contrast, is the user's choice and stays marker-free.
+#[tokio::test]
+async fn an_empty_user_python_safepath_does_not_disable_the_protection() {
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    // Pinned to the empty value: also overrides a developer shell that
+    // exports PYTHONSAFEPATH=1, so the host branch under test is fixed.
+    options
+        .env
+        .insert("PYTHONSAFEPATH".to_string(), String::new());
+    let project = tempfile::tempdir().expect("tempdir");
+    let marker = project.path().join("shadowed.marker");
+    std::fs::create_dir(project.path().join("rlm")).expect("create rlm package");
+    std::fs::write(
+        project.path().join("rlm/__init__.py"),
+        format!("open({:?}, 'w').close()\n", marker.display().to_string()),
+    )
+    .expect("plant rlm package");
+    options.cwd = Some(project.path().to_path_buf());
+    let manager = started_manager(options).await;
+
+    assert!(
+        !marker.exists(),
+        "an empty PYTHONSAFEPATH put the project's rlm package on sys.path"
+    );
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
+/// The host strips PYTHONPATH entries that resolve to the session cwd
+/// inside the kernel, so the runtime's own imports cannot be shadowed.
+/// That stripped value must not leak to `bash()` children: the host
+/// records the original next to the strip, and the runtime restores it
+/// before any cell or `bash()` runs. A child then sees the PYTHONPATH the
+/// user actually set (empty entries included), like in their own shell.
+#[tokio::test]
+async fn bash_children_inherit_the_original_pythonpath_not_the_stripped_one() {
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    // Pin the host-protection branch: an empty PYTHONSAFEPATH also overrides
+    // a developer shell exporting PYTHONSAFEPATH=1, so the run is hermetic.
+    options
+        .env
+        .insert("PYTHONSAFEPATH".to_string(), String::new());
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let original = format!(":{}", elsewhere.path().display());
+    options
+        .env
+        .insert("PYTHONPATH".to_string(), original.clone());
+    let manager = started_manager(options).await;
+
+    let result = execute(
+        &manager,
+        "from rlm import bash\nr = await bash('printf %s \"$PYTHONPATH\"')\nr.output.strip()",
+    )
+    .await;
+    assert_eq!(
+        (result.status, result.result.as_deref()),
+        (ExecuteStatus::Ok, Some(format!("'{original}'").as_str())),
+        "bash() children must see the original PYTHONPATH, cell: {:?}",
+        result.error
+    );
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
 /// The result clip budget counts characters, not bytes: the contract is
 /// "Cap stdout / stderr / result at this many characters"
 /// (`ExecuteOptions::max_output_chars`) and the stream paths already count

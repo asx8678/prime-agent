@@ -3222,7 +3222,7 @@ class HostSafepathPopTest(unittest.TestCase):
         with mock.patch.dict(
             environ, {"PRIME_AGENT_KERNEL_SAFEPATH": "1", "PYTHONSAFEPATH": "1"}
         ):
-            self.repl_module._drop_host_safepath()
+            self.repl_module._drop_host_import_protection()
             self.assertNotIn("PRIME_AGENT_KERNEL_SAFEPATH", environ)
             self.assertNotIn("PYTHONSAFEPATH", environ)
 
@@ -3232,8 +3232,42 @@ class HostSafepathPopTest(unittest.TestCase):
             environ, {"PRIME_AGENT_KERNEL_SAFEPATH": "0", "PYTHONSAFEPATH": "1"}
         ):
             del environ["PRIME_AGENT_KERNEL_SAFEPATH"]
-            self.repl_module._drop_host_safepath()
+            self.repl_module._drop_host_import_protection()
             self.assertEqual(environ["PYTHONSAFEPATH"], "1")
+
+
+class HostProtectionRoundTripTest(unittest.TestCase):
+    """The full ``main()`` path, not just the helper: with the host's
+    protection in the environment (PYTHONSAFEPATH + marker, the stripped
+    PYTHONPATH plus the recorded original), a ``bash()`` child must see the
+    user's environment — safe_path off, the original PYTHONPATH back, and no
+    private host variable."""
+
+    def test_bash_children_see_the_user_environment_after_main(self):
+        original = os.pathsep.join(["", SRC])  # the leading empty entry is what the host strips
+        repl = ReplProcess(
+            env={
+                "PYTHONSAFEPATH": "1",
+                "PRIME_AGENT_KERNEL_SAFEPATH": "1",
+                "PRIME_AGENT_KERNEL_PYTHONPATH": original,
+                "PYTHONPATH": SRC,  # the stripped value the host leaves in place
+            }
+        )
+        self.addCleanup(repl.close)
+        repl.ready()
+        probe = (
+            "import sys, os; "
+            'print(sys.flags.safe_path, os.environ.get("PYTHONPATH"), '
+            '"PRIME_AGENT_KERNEL_PYTHONPATH" in os.environ)'
+        )
+        code = (
+            "from rlm import bash\n"
+            "r = await bash(" + repr("python3 -c " + repr(probe)) + ")\n"
+            "r.output.strip()"
+        )
+        events = repl.execute("host-protection", code)
+        expected = f"False {original} False"
+        self.assertEqual(one(events, "result")["text"], repr(expected))
 
 
 if __name__ == "__main__":
