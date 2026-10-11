@@ -213,3 +213,57 @@ pub fn invalidate_runtime_probe_cache() {
 pub(crate) fn clear_in_process_probe_memo_for_tests() {
     *lock_probe_memo() = None;
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The kernel Python with prime-agent-runtime installed (ambient product
+    /// state, the auto-bootstrapped kernel venv); skipped with a note on
+    /// machines without a live install, like the kernel verifier tests.
+    fn ambient_kernel_python() -> Option<String> {
+        if let Some(explicit) = std::env::var_os("PA_CORE_KERNEL_PYTHON") {
+            let explicit = PathBuf::from(explicit);
+            assert!(
+                explicit.exists(),
+                "PA_CORE_KERNEL_PYTHON {} not found",
+                explicit.display()
+            );
+            return Some(explicit.display().to_string());
+        }
+        let candidate = PathBuf::from(std::env::var("HOME").map_or_else(
+            |_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string(),
+            |home| format!("{home}/.prime/agent/kernel-venv/bin/python"),
+        ));
+        if candidate.exists() {
+            Some(candidate.display().to_string())
+        } else {
+            eprintln!(
+                "kernel python {} not found; skipping the probe safe-path test",
+                candidate.display()
+            );
+            None
+        }
+    }
+
+    /// The probe half of the safepath protection: the probe runs its
+    /// interpreter with `-c` in the process cwd (the user's project), so
+    /// `import rlm` must not run a project's own package — its interpreter
+    /// runs with `sys.flags.safe_path`.
+    #[test]
+    fn the_probe_interpreter_runs_with_safe_path() {
+        let Some(python) = ambient_kernel_python() else {
+            return;
+        };
+        assert!(
+            run_quiet(
+                &python,
+                &[
+                    "-c",
+                    "import sys; sys.exit(0 if sys.flags.safe_path else 1)"
+                ]
+            ),
+            "the probe's interpreter must run with sys.flags.safe_path"
+        );
+    }
+}

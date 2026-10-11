@@ -1758,7 +1758,12 @@ def _append_startup_cwd_to_path() -> None:
     prepended to sys.path; appending it lets cells import project modules while
     the stdlib, site-packages and this runtime always win.
     """
-    cwd = os.path.abspath(os.getcwd())
+    try:
+        cwd = os.path.abspath(os.getcwd())
+    except OSError:
+        # A session cwd that vanished before startup (deleted by another
+        # process) must not crash the kernel: nothing can be appended then.
+        return
     if cwd not in sys.path:
         sys.path.append(cwd)
 

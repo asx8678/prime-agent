@@ -3194,6 +3194,18 @@ class StartupCwdPathTest(unittest.TestCase):
             events = repl.execute("cwd", code)
             self.assertEqual(one(events, "result")["text"], "('from the project', True)")
 
+    def test_startup_cwd_append_survives_a_vanished_cwd(self):
+        # A session cwd that vanished before the kernel starts (deleted by
+        # another process) must not crash startup: nothing is appended then.
+        import rlm.repl as repl_module
+
+        original = os.getcwd()
+        self.addCleanup(os.chdir, original)
+        gone = tempfile.mkdtemp()
+        os.chdir(gone)
+        os.rmdir(gone)
+        repl_module._append_startup_cwd_to_path()
+
 
 class HostSafepathPopTest(unittest.TestCase):
     """The host's PYTHONSAFEPATH (with its marker) is popped at the very start
