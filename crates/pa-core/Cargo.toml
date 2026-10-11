@@ -55,7 +55,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # bindings' legitimate unsafe blocks (process/termios/lock-dir). The
 # clippy rows mirror the workspace table, and the pedantic class rides
 # here so CI's -D warnings bar enforces it on this crate too.
-pedantic = "warn"
+pedantic = { level = "warn", priority = -1 }
 redundant_clone = "warn"
 clone_on_copy = "warn"
 assigning_clones = "warn"
@@ -116,3 +116,6 @@ unnecessary_join = "warn"
 unnecessary_literal_bound = "warn"
 unnecessary_semicolon = "warn"
 used_underscore_binding = "warn"
+# Mirrors the workspace exception (see the root Cargo.toml): clippy
+# 1.99's assert_is_empty rewrite does not compile.
+assert_is_empty = "allow"

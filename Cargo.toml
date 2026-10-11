@@ -54,8 +54,9 @@ unsafe_code = "forbid"
 # every workspace member is pedantic-clean; CI's -D warnings bar turns
 # this warn class into errors, and the per-crate #![allow] exceptions
 # (the design-choice classes, each with its in-code justification) keep
-# their force under the manifest route.
-pedantic = "warn"
+# their force under the manifest route. Priority -1 applies the group
+# first, so a single-lint entry below overrides it.
+pedantic = { level = "warn", priority = -1 }
 redundant_clone = "warn"
 clone_on_copy = "warn"
 assigning_clones = "warn"
@@ -116,6 +117,13 @@ unnecessary_join = "warn"
 unnecessary_literal_bound = "warn"
 unnecessary_semicolon = "warn"
 used_underscore_binding = "warn"
+# Clippy 1.99 added assert_is_empty to pedantic. Its fix rewrites
+# `assert!(v.is_empty())` as `assert_eq!(v, [] as [T; 0])`, spelling T with
+# crate-relative paths that do not resolve (`cargo clippy --fix` rolls it
+# back in six crates), and its ~266 hits are all test assertions whose
+# `is_empty()` reads clearer than an empty-array literal. Revisit when the
+# suggestion produces a usable rewrite.
+assert_is_empty = "allow"
 
 # Shipping posture, pinned (Kevin, Option C): thin LTO plus 4 codegen
 # units for cross-crate inlining in the hot render path. Builds emit line
