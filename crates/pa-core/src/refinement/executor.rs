@@ -57,14 +57,14 @@ pub fn overview_for_prompt(state: &HarnessState) -> String {
             let arguments_text =
                 if entry.kind == RefinementKind::Skill && !entry.arguments.is_empty() {
                     let serialized = serde_json::to_string(&entry.arguments).unwrap_or_default();
-                    format!(" args={}", &serialized[..serialized.len().min(240)])
+                    format!(" args={}", serialized.chars().take(240).collect::<String>())
                 } else {
                     String::new()
                 };
             let reference_text =
                 if entry.kind == RefinementKind::Skill && !entry.reference.is_empty() {
                     let serialized = serde_json::to_string(&entry.reference).unwrap_or_default();
-                    format!(" ref={}", &serialized[..serialized.len().min(240)])
+                    format!(" ref={}", serialized.chars().take(240).collect::<String>())
                 } else {
                     String::new()
                 };
@@ -518,6 +518,46 @@ mod tests {
         assert!(overview.contains("memory: 1"));
         assert!(overview.contains("- [local:m1] Fact (/m/m1, v0): builds are green"));
         assert_eq!(history_for_prompt(&[]), "No prior refinement history.");
+    }
+
+    #[test]
+    fn overview_caps_skill_json_by_chars() {
+        let mut state = super::super::empty_harness_state();
+        // The é straddles byte 240 of the serialized args/ref JSON.
+        let straddling = format!("{}é{}", "a".repeat(233), "b".repeat(20));
+        let json_map = |key: &str| {
+            [(
+                key.to_string(),
+                serde_json::Value::String(straddling.clone()),
+            )]
+            .into_iter()
+            .collect()
+        };
+        state
+            .entries
+            .get_mut(&RefinementKind::Skill)
+            .unwrap()
+            .insert(
+                "s1".to_string(),
+                super::super::HarnessEntry {
+                    id: "s1".to_string(),
+                    kind: RefinementKind::Skill,
+                    title: "Straddler".to_string(),
+                    content: "c".to_string(),
+                    path: "/s/s1".to_string(),
+                    scope: Some(HarnessScope::Local),
+                    reference: json_map("r"),
+                    arguments: json_map("k"),
+                    metadata: serde_json::Map::default(),
+                    source: "test".to_string(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    version: 0,
+                },
+            );
+        let overview = overview_for_prompt(&state);
+        assert!(overview.contains("- [local:s1] Straddler (/s/s1, v0) ref={\"r\":"));
+        assert!(overview.contains("args={\"k\":"));
     }
 
     #[tokio::test]
