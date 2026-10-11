@@ -378,37 +378,21 @@ def _child_result_from_payload(payload: Any) -> RLMChildResult:
     if not isinstance(settled, bool):
         raise RuntimeError("rlm.collect entry has invalid settled flag")
 
-    def _optional_str(field: str) -> str | None:
-        value = payload.get(field)
-        if value is None:
-            return None
-        if not isinstance(value, str):
-            raise RuntimeError(f"rlm.collect entry has invalid {field}")
-        return value
-
-    def _optional_int(field: str) -> int | None:
-        value = payload.get(field)
-        if value is None:
-            return None
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise RuntimeError(f"rlm.collect entry has invalid {field}")
-        return value
-
-    session_dir = _optional_str("session_dir")
+    session_dir = _optional_str_field(payload, "session_dir", "rlm.collect")
     replied = payload.get("replied_since_task")
     if replied is not None and not isinstance(replied, bool):
         raise RuntimeError("rlm.collect entry has invalid replied_since_task")
     return RLMChildResult(
         rlm_child_id=child_id,
-        session_name=_optional_str("session_name"),
+        session_name=_optional_str_field(payload, "session_name", "rlm.collect"),
         session_dir=Path(session_dir) if session_dir else None,
         status=status,
         settled=settled,
-        answer_preview=_optional_str("answer_preview"),
-        answer_text=_optional_str("answer_text"),
-        error=_optional_str("error"),
-        duration_ms=_optional_int("duration_ms"),
-        tool_use_count=_optional_int("tool_use_count"),
+        answer_preview=_optional_str_field(payload, "answer_preview", "rlm.collect"),
+        answer_text=_optional_str_field(payload, "answer_text", "rlm.collect"),
+        error=_optional_str_field(payload, "error", "rlm.collect"),
+        duration_ms=_optional_int_field(payload, "duration_ms", "rlm.collect"),
+        tool_use_count=_optional_int_field(payload, "tool_use_count", "rlm.collect"),
         replied_since_task=replied,
     )
 
