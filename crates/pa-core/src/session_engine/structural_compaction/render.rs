@@ -9,7 +9,7 @@ use super::state::{BlockOrigin, Exchange, State, EXCHANGE_TEXT_BYTES};
 /// The default summary budget in UTF-8 bytes.
 pub(crate) const DEFAULT_MAX_BYTES: usize = 32 * 1024;
 
-const HEADER: &str = "[Deterministic summary] Built from the session log without a model: older facts are sampled, not interpreted. uN is the Nth user message and uN.cM the Mth Python cell after it.";
+pub(super) const HEADER: &str = "[Deterministic summary] Built from the session log without a model: older facts are sampled, not interpreted. uN is the Nth user message and uN.cM the Mth Python cell after it.";
 const DIALOGUE_HEADER: &str = "[Recent user directions and discussion]";
 const DIALOGUE_MAX_BYTES: usize = 12_288;
 const REQUEST_HEADER: &str = "[Compaction Request]";
@@ -150,6 +150,7 @@ fn history_blocks(state: &State) -> Vec<HistoryBlock> {
         let origin = match block.origin {
             BlockOrigin::BranchSummary => "Branch summary, model-written",
             BlockOrigin::EarlierSummary => "Earlier compaction summary, model-written",
+            BlockOrigin::EarlierDeterministic => "Earlier compaction summary, deterministic",
         };
         Some(format!(
             "{origin} [{}]:\n{}",

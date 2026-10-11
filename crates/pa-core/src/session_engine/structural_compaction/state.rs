@@ -78,6 +78,9 @@ pub(crate) enum BlockOrigin {
     BranchSummary,
     /// The summary of a compaction made by another engine.
     EarlierSummary,
+    /// The summary of a compaction this engine wrote, carried after its
+    /// saved state was dropped (a version bump or an unreadable state).
+    EarlierDeterministic,
 }
 
 /// Model-written text carried verbatim (bounded), never summarized again.
@@ -177,17 +180,24 @@ impl State {
         }
     }
 
-    /// A fresh state carrying a bounded, labeled excerpt of a summary another
-    /// engine wrote, so switching engines keeps that context once.
+    /// A fresh state carrying a bounded, labeled excerpt of a summary
+    /// another engine wrote, so switching engines keeps that context once.
+    /// A summary this engine wrote (its saved state was dropped) keeps its
+    /// deterministic label.
     #[must_use]
     pub(crate) fn from_summary(summary: &str) -> State {
         let mut state = State::new();
         if !summary.trim().is_empty() {
+            let origin = if summary.starts_with(super::render::HEADER) {
+                BlockOrigin::EarlierDeterministic
+            } else {
+                BlockOrigin::EarlierSummary
+            };
             let at = state.address();
             state.blocks.push(
                 Block {
                     at,
-                    origin: BlockOrigin::EarlierSummary,
+                    origin,
                     text: Excerpt::of(summary, EARLIER_SUMMARY_BYTES),
                 },
                 BLOCKS,

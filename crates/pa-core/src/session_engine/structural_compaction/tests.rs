@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use super::events::{
     normalize, BashOutcome, CellOutcome, CellStatus, Event, NoticeKind, SentMessage,
 };
-use super::render::{render, DEFAULT_MAX_BYTES};
+use super::render::{render, DEFAULT_MAX_BYTES, HEADER};
 use super::state::{State, STATE_VERSION};
 use crate::autonomous::AUTONOMOUS_CONTINUATION_LABEL;
 
@@ -176,6 +176,22 @@ fn switching_engines_keeps_a_labeled_excerpt_of_the_earlier_summary() {
         ),
         "got: {summary}"
     );
+}
+
+#[test]
+fn a_carried_deterministic_summary_is_not_labeled_model_written() {
+    // A version bump or an unreadable state drops the saved fold, so this
+    // engine's own summary is carried as an excerpt: it keeps its
+    // deterministic label instead of the model-written one.
+    let state = State::from_summary(&format!(
+        "{HEADER}\n\n[Current Status]\nOpen turn [u1]: \"Ship the parser fix.\""
+    ));
+    let summary = render(&state, None, DEFAULT_MAX_BYTES);
+    assert!(
+        summary.contains("Earlier compaction summary, deterministic [u0]:"),
+        "got: {summary}"
+    );
+    assert!(!summary.contains("model-written"), "got: {summary}");
 }
 
 #[test]
