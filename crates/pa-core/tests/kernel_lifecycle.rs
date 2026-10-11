@@ -520,3 +520,43 @@ async fn graceful_shutdown_flushes_the_final_snapshot() {
         .await
         .expect("shutdown");
 }
+
+/// A project directory that ships its own `rlm` package must not shadow the
+/// kernel runtime: the kernel starts in the session cwd, and `python -m`
+/// would otherwise put that cwd first on `sys.path`. Project modules stay
+/// importable from the end of `sys.path`.
+#[tokio::test]
+async fn project_rlm_package_does_not_shadow_the_kernel_runtime() {
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    let marker = project.path().join("shadowed.marker");
+    std::fs::create_dir(project.path().join("rlm")).expect("create rlm package");
+    std::fs::write(
+        project.path().join("rlm/__init__.py"),
+        format!("open({:?}, 'w').close()\n", marker.display().to_string()),
+    )
+    .expect("plant rlm package");
+    std::fs::write(
+        project.path().join("project_helper.py"),
+        "VALUE = 'from the project'\n",
+    )
+    .expect("write project module");
+    options.cwd = Some(project.path().to_path_buf());
+    let manager = started_manager(options).await;
+
+    let result = execute(&manager, "import project_helper\nproject_helper.VALUE").await;
+    assert_eq!(
+        (result.status, result.result.as_deref()),
+        (ExecuteStatus::Ok, Some("'from the project'")),
+        "cell: {:?}",
+        result.error
+    );
+    assert!(
+        !marker.exists(),
+        "the project's rlm package ran in the kernel"
+    );
+    let shutdown = manager.shutdown(KernelShutdownOptions::default()).await;
+    assert!(shutdown.is_ok());
+}

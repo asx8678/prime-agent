@@ -1737,9 +1737,22 @@ def _setup_fds() -> int:
     return stdin_fd
 
 
+def _append_startup_cwd_to_path() -> None:
+    """Keep project modules importable without letting them shadow anything.
+
+    The host starts the kernel with PYTHONSAFEPATH, so the session cwd is not
+    prepended to sys.path; appending it lets cells import project modules while
+    the stdlib, site-packages and this runtime always win.
+    """
+    cwd = os.path.abspath(os.getcwd())
+    if cwd not in sys.path:
+        sys.path.append(cwd)
+
+
 def main() -> None:
     global _loop, _serve_task
     stdin_fd = _setup_fds()
+    _append_startup_cwd_to_path()
     _start_owner_watchdog()
 
     # Alias the executing module so an in-cell `from rlm.repl import emit`

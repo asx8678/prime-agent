@@ -169,6 +169,11 @@ impl Inner {
         for (key, value) in &self.options.env {
             env.insert(key.clone(), value.clone());
         }
+        // `-m` would put the session cwd first on sys.path, so a project's own
+        // `rlm` package would run instead of the runtime. Python 3.11+ honors
+        // PYTHONSAFEPATH (older custom interpreters ignore it, where `-P` would
+        // fail to start); repl.py appends the cwd last so project modules import.
+        env.insert("PYTHONSAFEPATH".to_string(), "1".to_string());
         env.insert(
             "PRIME_AGENT_KERNEL_OWNER_PID".to_string(),
             std::process::id().to_string(),

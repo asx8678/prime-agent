@@ -21,7 +21,7 @@ _EOF = object()
 class ReplProcess:
     """Drives one `python -m rlm.repl` subprocess over the JSON-lines protocol."""
 
-    def __init__(self, env: dict[str, str] | None = None) -> None:
+    def __init__(self, env: dict[str, str] | None = None, cwd: str | None = None) -> None:
         env = {
             **os.environ,
             "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", ""),
@@ -35,6 +35,7 @@ class ReplProcess:
             stderr=subprocess.DEVNULL,
             text=True,
             env=env,
+            cwd=cwd,
         )
         self.raw_lines: list[str] = []
         self._lines: queue.Queue[object] = queue.Queue()
@@ -3174,6 +3175,24 @@ class OwnerExitWaitTest(unittest.TestCase):
         ):
             self.repl_module._wait_owner_posix(self.owner.pid, os.getppid())
         sleep.assert_called_once()
+
+
+class StartupCwdPathTest(unittest.TestCase):
+    def test_startup_cwd_is_importable_but_last_on_sys_path(self):
+        # The host starts the kernel with PYTHONSAFEPATH so a project's own
+        # `rlm` package cannot shadow the runtime; project modules must still
+        # import, from the end of sys.path.
+        with tempfile.TemporaryDirectory() as project:
+            project = os.path.realpath(project)
+            with open(os.path.join(project, "project_helper.py"), "w") as fh:
+                fh.write("VALUE = 'from the project'\n")
+            # An empty PYTHONPATH entry would itself add the cwd; pass SRC alone.
+            repl = ReplProcess(env={"PYTHONSAFEPATH": "1", "PYTHONPATH": SRC}, cwd=project)
+            self.addCleanup(repl.close)
+            repl.ready()
+            code = f"import sys, project_helper\n(project_helper.VALUE, sys.path.index({project!r}) == len(sys.path) - 1)"
+            events = repl.execute("cwd", code)
+            self.assertEqual(one(events, "result")["text"], "('from the project', True)")
 
 
 if __name__ == "__main__":
