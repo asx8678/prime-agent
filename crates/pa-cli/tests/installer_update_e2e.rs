@@ -233,8 +233,7 @@ fn a_failing_installer_keeps_the_previous_install() {
     // A previous install exists; the funnel must leave it in place.
     std::fs::create_dir_all(sandbox.prefix.join("bin")).expect("bin dir");
     let previous = sandbox.prefix.join("bin/prime-agent");
-    std::fs::write(&previous, "#!/bin/sh\necho 9.9.7-continuous.0000001\n").expect("launcher");
-    make_executable(&previous);
+    write_executable(&previous, "#!/bin/sh\necho 9.9.7-continuous.0000001\n");
     let url = serve(FAILING_INSTALLER);
     let output = run_prime_agent(&["update"], &sandbox, &url);
     assert_eq!(
@@ -279,19 +278,15 @@ fn installer_env(command: &mut Command, sandbox: &Sandbox) {
     .find(|path| Path::new(path).is_file())
     .expect("a python3 for the installer's scripting steps");
     let uv = shims.join("uv");
-    std::fs::write(
+    write_executable(
         &uv,
         format!("#!/bin/sh\n[ \"$1 $2\" = \"python find\" ] && echo {python} && exit 0\nexit 1\n"),
-    )
-    .expect("uv shim");
-    make_executable(&uv);
+    );
     let npm = shims.join("npm");
-    std::fs::write(
+    write_executable(
         &npm,
         "#!/bin/sh\n[ \"$1\" = root ] && echo /nonexistent\nexit 0\n",
-    )
-    .expect("npm shim");
-    make_executable(&npm);
+    );
     let tmp = sandbox.root.join("tmp");
     std::fs::create_dir_all(&tmp).expect("tmp dir");
     command
@@ -308,8 +303,7 @@ fn fake_release(sandbox: &Sandbox, version: &str) -> PathBuf {
     let payload = sandbox.root.join(format!("payload-{version}"));
     std::fs::create_dir_all(&payload).expect("payload dir");
     let binary = payload.join("prime-agent");
-    std::fs::write(&binary, format!("#!/bin/sh\necho {version}\n")).expect("payload binary");
-    make_executable(&binary);
+    write_executable(&binary, format!("#!/bin/sh\necho {version}\n"));
     let platform = pa_core::update::install::current_platform_alias();
     let archive = sandbox
         .root
@@ -364,7 +358,7 @@ fn update_archive_and_rollback_swap_installer_payloads() {
     let live = sandbox.prefix.join("share/prime-agent");
     std::fs::create_dir_all(&live).expect("payload dir");
     let binary = live.join("prime-agent");
-    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    install_executable(Path::new(env!("CARGO_BIN_EXE_prime-agent")), &binary);
     std::fs::write(
         live.join(".prime-agent-install"),
         "install-rust.sh channel beta\nversion 9.9.9\n",
@@ -423,7 +417,7 @@ fn rollback_check_answers_synchronously_without_touching_the_payload() {
     let live = sandbox.prefix.join("share/prime-agent");
     std::fs::create_dir_all(&live).expect("payload dir");
     let binary = live.join("prime-agent");
-    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    install_executable(Path::new(env!("CARGO_BIN_EXE_prime-agent")), &binary);
     std::fs::write(
         live.join(".prime-agent-install"),
         "install-rust.sh channel beta\nversion 9.9.9\n",
@@ -492,7 +486,7 @@ fn update_archive_refuses_a_misnamed_payload_version() {
     let live = sandbox.prefix.join("share/prime-agent");
     std::fs::create_dir_all(&live).expect("payload dir");
     let binary = live.join("prime-agent");
-    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    install_executable(Path::new(env!("CARGO_BIN_EXE_prime-agent")), &binary);
     std::fs::write(
         live.join(".prime-agent-install"),
         "install-rust.sh channel beta\nversion 9.9.9\n",
@@ -502,8 +496,7 @@ fn update_archive_refuses_a_misnamed_payload_version() {
     let payload_dir = sandbox.root.join("payload-misnamed");
     std::fs::create_dir_all(&payload_dir).expect("payload dir");
     let payload = payload_dir.join("prime-agent");
-    std::fs::write(&payload, "#!/bin/sh\necho 0.9.7\n").expect("payload binary");
-    make_executable(&payload);
+    write_executable(&payload, "#!/bin/sh\necho 0.9.7\n");
     let archive = sandbox
         .root
         .join(format!("prime-agent-9.9.9-{platform}.tar.gz"));
@@ -544,7 +537,7 @@ fn update_rollback_reads_the_unsuffixed_installer_slot() {
     let live = sandbox.prefix.join("share/prime-agent");
     std::fs::create_dir_all(&live).expect("payload dir");
     let binary = live.join("prime-agent");
-    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    install_executable(Path::new(env!("CARGO_BIN_EXE_prime-agent")), &binary);
     std::fs::write(
         live.join(".prime-agent-install"),
         "install-rust.sh channel beta\nversion 9.9.9\n",
@@ -559,8 +552,7 @@ fn update_rollback_reads_the_unsuffixed_installer_slot() {
         "install-rust.sh channel beta\nversion 1.0.0\n",
     )
     .expect("slot marker");
-    std::fs::write(slot.join("prime-agent"), b"payload\n").expect("slot payload");
-    make_executable(&slot.join("prime-agent"));
+    write_executable(&slot.join("prime-agent"), b"payload\n");
 
     let mut command = Command::new(&binary);
     command.args(["update", "--rollback"]);
@@ -594,7 +586,7 @@ fn update_rollback_without_a_kept_version_changes_nothing() {
     let live = sandbox.prefix.join("share/prime-agent");
     std::fs::create_dir_all(&live).expect("payload dir");
     let binary = live.join("prime-agent");
-    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    install_executable(Path::new(env!("CARGO_BIN_EXE_prime-agent")), &binary);
     std::fs::write(
         live.join(".prime-agent-install"),
         "install-rust.sh channel beta\nversion 9.9.9\n",
@@ -645,7 +637,7 @@ fn archive_check_answers_synchronously_without_publishing() {
     let live = sandbox.prefix.join("share/prime-agent");
     std::fs::create_dir_all(&live).expect("payload dir");
     let binary = live.join("prime-agent");
-    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    install_executable(Path::new(env!("CARGO_BIN_EXE_prime-agent")), &binary);
     std::fs::write(
         live.join(".prime-agent-install"),
         "install-rust.sh channel beta\nversion 9.9.9\n",
@@ -701,8 +693,7 @@ fn fake_release_payload(sandbox: &Sandbox, named: &str, reported: &str) -> PathB
     let payload = sandbox.root.join(format!("payload-mismatch-{named}"));
     std::fs::create_dir_all(&payload).expect("payload dir");
     let binary = payload.join("prime-agent");
-    std::fs::write(&binary, format!("#!/bin/sh\necho {reported}\n")).expect("payload binary");
-    make_executable(&binary);
+    write_executable(&binary, format!("#!/bin/sh\necho {reported}\n"));
     let platform = pa_core::update::install::current_platform_alias();
     let archive = sandbox
         .root
@@ -719,9 +710,23 @@ fn fake_release_payload(sandbox: &Sandbox, named: &str, reported: &str) -> PathB
     archive
 }
 
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
-    permissions.set_mode(permissions.mode() | 0o755);
-    std::fs::set_permissions(path, permissions).expect("chmod");
+/// Lands `source` at `dest` as an executable through a child `install`: the
+/// writable descriptor must never exist in this process, or a concurrent test
+/// thread's fork inherits it and exec'ing `dest` fails with ETXTBSY.
+fn install_executable(source: &Path, dest: &Path) {
+    let status = Command::new("install")
+        .arg("-m")
+        .arg("755")
+        .arg(source)
+        .arg(dest)
+        .status()
+        .expect("run install");
+    assert!(status.success(), "install {}", dest.display());
+}
+
+/// Writes an executable script (staged in a file that is never exec'd).
+fn write_executable(dest: &Path, contents: impl AsRef<[u8]>) {
+    let staging = tempfile::NamedTempFile::new().expect("staging file");
+    std::fs::write(staging.path(), contents).expect("write staging file");
+    install_executable(staging.path(), dest);
 }
