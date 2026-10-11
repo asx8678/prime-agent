@@ -163,14 +163,28 @@ mod tests {
     #[test]
     fn expands_tilde() {
         let _env = env_lock();
+        let ambient = std::env::var_os("HOME");
         std::env::set_var("HOME", "/home/tester");
-        assert_eq!(expand_tilde_path("~"), PathBuf::from("/home/tester"));
-        assert_eq!(
-            expand_tilde_path("~/sessions"),
-            PathBuf::from("/home/tester/sessions")
-        );
-        assert_eq!(expand_tilde_path("/abs/path"), PathBuf::from("/abs/path"));
-        assert_eq!(expand_tilde_path("~foo"), PathBuf::from("~foo"));
+        // Restore the env FIRST, then resume the panic: a failed assertion
+        // must fail the test (never swallow) — and must never leak
+        // HOME=/home/tester into the rest of the test process, where the
+        // factory dispatch test resolves the kernel venv through it.
+        let outcome = std::panic::catch_unwind(|| {
+            assert_eq!(expand_tilde_path("~"), PathBuf::from("/home/tester"));
+            assert_eq!(
+                expand_tilde_path("~/sessions"),
+                PathBuf::from("/home/tester/sessions")
+            );
+            assert_eq!(expand_tilde_path("/abs/path"), PathBuf::from("/abs/path"));
+            assert_eq!(expand_tilde_path("~foo"), PathBuf::from("~foo"));
+        });
+        match ambient {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// The TS `expandTildePath` win32 arm (the pa-types twin carries it too).

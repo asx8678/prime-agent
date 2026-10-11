@@ -559,6 +559,11 @@ mod tests {
         // product state: an explicit PA_CORE_KERNEL_PYTHON, else the
         // auto-bootstrapped kernel venv); skipped with a note on machines
         // without a live install, like the pa-core kernel verifier tests.
+        // The venv lookup reads HOME and the loop below mutates PYTHONPATH,
+        // both process-global: hold the crate's env lock for the whole test
+        // (the with_clean_telemetry_env convention) so no other test
+        // interleaves — including expands_tilde's HOME rewrite.
+        let _env = crate::config::env_lock();
         let python = std::env::var_os("PA_CORE_KERNEL_PYTHON")
             .map(PathBuf::from)
             .inspect(|explicit| {
@@ -588,29 +593,37 @@ mod tests {
         .expect("plant rlm package");
         let project_entry = project.path().display().to_string();
         // PYTHONPATH entries that resolve to the child's cwd (the project)
-        // must be stripped exactly like empty ones; restore the shared
-        // environment afterwards whatever the ambient PYTHONPATH was.
+        // must be stripped exactly like empty ones — `:` is the empty-entry
+        // case (Python 3.11 ignores a fully empty PYTHONPATH, so `""` would
+        // prove nothing; `:` is two empty entries, which do resolve to the
+        // cwd). Restore the shared environment afterwards whatever the
+        // ambient PYTHONPATH was, even on a failed assertion.
         let ambient = std::env::var_os("PYTHONPATH");
-        for cwd_entry in ["", ".", "./", project_entry.as_str()] {
-            let _ = std::fs::remove_file(&marker);
-            std::env::set_var("PYTHONPATH", cwd_entry);
-            let result =
-                dispatch_via_kernel_in(&python, &list_payload(), Some(project.path()))
-                    .unwrap_or_else(|error| {
-                        panic!("the factory dispatch must survive a planted rlm package with PYTHONPATH=`{cwd_entry}`: {error}")
-                    });
-            assert!(
-                !marker.exists(),
-                "a `{cwd_entry}` PYTHONPATH entry ran the project's rlm package in the factory dispatch"
-            );
-            assert!(
-                result.get("ok").and_then(Value::as_bool).unwrap_or(false),
-                "the dispatch must answer a list payload with PYTHONPATH=`{cwd_entry}`, got {result}"
-            );
-        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for cwd_entry in [":", ".", "./", project_entry.as_str()] {
+                let _ = std::fs::remove_file(&marker);
+                std::env::set_var("PYTHONPATH", cwd_entry);
+                let result =
+                    dispatch_via_kernel_in(&python, &list_payload(), Some(project.path()))
+                        .unwrap_or_else(|error| {
+                            panic!("the factory dispatch must survive a planted rlm package with PYTHONPATH=`{cwd_entry}`: {error}")
+                        });
+                assert!(
+                    !marker.exists(),
+                    "a `{cwd_entry}` PYTHONPATH entry ran the project's rlm package in the factory dispatch"
+                );
+                assert!(
+                    result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                    "the dispatch must answer a list payload with PYTHONPATH=`{cwd_entry}`, got {result}"
+                );
+            }
+        }));
         match ambient {
             Some(value) => std::env::set_var("PYTHONPATH", value),
             None => std::env::remove_var("PYTHONPATH"),
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
         }
     }
 }
