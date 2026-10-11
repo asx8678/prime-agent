@@ -495,9 +495,9 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 }
             }
             "response.output_item.done" => {
-                if let Some(index) = output_index {
-                    self.slots.remove(&index);
-                }
+                // The item's slot must be read before it is retired: the done handler
+                // finalizes the live block the slot points at, so removing the slot
+                // first would make the lookup miss and skip the finalization.
                 let item = event.get("item").cloned().unwrap_or(Value::Null);
                 let item_type = item
                     .get("type")
@@ -714,6 +714,9 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         }
                     }
                     _ => {}
+                }
+                if let Some(index) = output_index {
+                    self.slots.remove(&index);
                 }
             }
             "response.completed" | "response.incomplete" => {
@@ -938,5 +941,145 @@ fn map_responses_stop_reason(status: Option<&str>) -> StopReason {
         None | Some("completed" | "in_progress" | "queued") => StopReason::Stop,
         Some("incomplete") => StopReason::Length,
         Some(_) => StopReason::Error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_stream::{create_assistant_message_event_stream, initial_assistant_message};
+
+    fn stream_model() -> Model {
+        serde_json::from_value(json!({
+            "id": "gpt-5.1", "name": "GPT-5.1", "api": "openai-responses", "provider": "openai",
+            "baseUrl": "https://api.openai.com/v1", "reasoning": true, "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1000, "maxTokens": 100
+        }))
+        .expect("valid model fixture")
+    }
+
+    #[tokio::test]
+    async fn output_item_done_finalizes_the_existing_reasoning_block() {
+        let model = stream_model();
+        let (writer, stream) = create_assistant_message_event_stream();
+        let mut output = initial_assistant_message("openai-responses", "openai", &model.id);
+        let mut processor = ResponsesStreamProcessor::new(
+            &model,
+            &mut output,
+            &writer,
+            ResponsesStreamHooks::default(),
+        );
+
+        processor
+            .handle_event(&json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"}
+            }))
+            .unwrap();
+        processor
+            .handle_event(&json!({
+                "type": "response.reasoning_summary_text.delta", "output_index": 0,
+                "delta": "Think"
+            }))
+            .unwrap();
+        let done_item = json!({
+            "type": "reasoning", "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "Thought it through"}]
+        });
+        processor
+            .handle_event(&json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": done_item
+            }))
+            .unwrap();
+
+        // The done item finalizes the live thinking block in place (final text + signature)
+        // instead of leaving the deltas unconfirmed — and never appends a second block.
+        assert_eq!(
+            output.content,
+            vec![AssistantContent::Thinking(ThinkingContent {
+                thinking: "Thought it through".to_string(),
+                thinking_signature: Some(done_item.to_string()),
+                redacted: None,
+                rest: Map::default(),
+            })]
+        );
+
+        writer.end(None);
+        let events = stream.collect().await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(AssistantMessageEvent::ThinkingEnd { content_index: 0, content, .. })
+                    if content == "Thought it through"
+            ),
+            "the done item must emit the ThinkingEnd event, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_item_done_finalizes_the_existing_function_call_block() {
+        let model = stream_model();
+        let (writer, stream) = create_assistant_message_event_stream();
+        let mut output = initial_assistant_message("openai-responses", "openai", &model.id);
+        let mut processor = ResponsesStreamProcessor::new(
+            &model,
+            &mut output,
+            &writer,
+            ResponsesStreamHooks::default(),
+        );
+
+        processor
+            .handle_event(&json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {
+                    "type": "function_call", "call_id": "call_1", "id": "fc_1",
+                    "name": "bash", "arguments": ""
+                }
+            }))
+            .unwrap();
+        // A partial argument delta never parses on its own: only the done item carries the
+        // authoritative arguments.
+        processor
+            .handle_event(&json!({
+                "type": "response.function_call_arguments.delta", "output_index": 0,
+                "delta": "{\"cmd\""
+            }))
+            .unwrap();
+        processor
+            .handle_event(&json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {
+                    "type": "function_call", "call_id": "call_1", "id": "fc_1",
+                    "name": "bash", "arguments": "{\"cmd\":\"ls\"}"
+                }
+            }))
+            .unwrap();
+
+        // The done item finalizes the live tool-call block in place with the parsed arguments —
+        // no second, synthesized block.
+        let finalized = ToolCall {
+            id: "call_1|fc_1".to_string(),
+            name: "bash".to_string(),
+            arguments: [("cmd".to_string(), json!("ls"))].into_iter().collect(),
+            thought_signature: None,
+            rest: Map::default(),
+        };
+        assert_eq!(
+            output.content,
+            vec![AssistantContent::ToolCall(finalized.clone())]
+        );
+
+        writer.end(None);
+        let events = stream.collect().await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(AssistantMessageEvent::ToolcallEnd { content_index: 0, tool_call, .. })
+                    if *tool_call == finalized
+            ),
+            "the done item must emit the ToolcallEnd event, got: {events:?}"
+        );
     }
 }
