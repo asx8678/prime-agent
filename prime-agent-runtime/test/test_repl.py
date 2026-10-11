@@ -3196,15 +3196,18 @@ class StartupCwdPathTest(unittest.TestCase):
 
     def test_startup_cwd_append_survives_a_vanished_cwd(self):
         # A session cwd that vanished before the kernel starts (deleted by
-        # another process) must not crash startup: nothing is appended then.
+        # another process) must not crash startup — and must append
+        # nothing: there is no directory to import from.
         import rlm.repl as repl_module
 
+        before = list(sys.path)
         original = os.getcwd()
         self.addCleanup(os.chdir, original)
         gone = tempfile.mkdtemp()
         os.chdir(gone)
         os.rmdir(gone)
         repl_module._append_startup_cwd_to_path()
+        self.assertEqual(sys.path, before, "a vanished cwd must append nothing to sys.path")
 
 
 class HostSafepathPopTest(unittest.TestCase):

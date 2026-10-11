@@ -170,7 +170,7 @@ impl Inner {
             env.insert(key.clone(), value.clone());
         }
         // The session cwd the kernel runs in: the explicit option, else the
-        // inherited process cwd (the PYTHONPATH strip below must judge
+        // inherited process cwd (the import protection must judge PYTHONPATH
         // entries against the directory the child actually runs in).
         let cwd = self
             .options
@@ -178,63 +178,15 @@ impl Inner {
             .clone()
             .or_else(|| std::env::current_dir().ok());
         // `-m` would put the session cwd first on sys.path, so a project's own
-        // `rlm` package would run instead of the runtime. Python 3.11+ honors
-        // PYTHONSAFEPATH (older custom interpreters ignore it, where `-P` would
-        // fail to start); repl.py appends the cwd last so project modules import.
-        // The marker lets repl.py pop PYTHONSAFEPATH before any bash() child can
-        // inherit it: the protection is for the runtime's own imports, not the
-        // agent's commands. A non-empty PYTHONSAFEPATH the user set themselves
-        // is their choice and stays (free of any inherited marker); an empty
-        // value means "unset" to Python, so it still gets the protection.
-        if env
-            .get("PYTHONSAFEPATH")
-            .is_some_and(|value| !value.is_empty())
-        {
-            env.remove(crate::kernel::python_env::HOST_SAFEPATH_MARKER_ENV);
-        } else {
-            env.insert("PYTHONSAFEPATH".to_string(), "1".to_string());
-            env.insert(
-                crate::kernel::python_env::HOST_SAFEPATH_MARKER_ENV.to_string(),
-                "1".to_string(),
-            );
-        }
-        // PYTHONPATH entries that resolve to the session cwd (the empty
-        // ones, but also `.`, `./` and the absolute path) put the project
-        // back on sys.path at import time, which would re-enable the
-        // shadowing above; real entries stay honored. The original is
-        // recorded next to the strip so repl.py can restore it before any
-        // cell or bash() child inherits the stripped value — a bash()
-        // child must see the user's PYTHONPATH, like in their own shell.
-        // The sentinel covers an unset PYTHONPATH so a stale inherited
-        // record cannot survive into a fresh kernel.
-        match env.get("PYTHONPATH").cloned() {
-            Some(pythonpath) => {
-                env.insert(
-                    crate::kernel::python_env::HOST_PYTHONPATH_ENV.to_string(),
-                    pythonpath.clone(),
-                );
-                match crate::kernel::python_env::strip_cwd_resolving_pythonpath_entries(
-                    std::ffi::OsStr::new(pythonpath.as_str()),
-                    cwd.as_deref(),
-                ) {
-                    Some(stripped) => {
-                        env.insert(
-                            "PYTHONPATH".to_string(),
-                            stripped.to_string_lossy().into_owned(),
-                        );
-                    }
-                    None => {
-                        env.remove("PYTHONPATH");
-                    }
-                }
-            }
-            None => {
-                env.insert(
-                    crate::kernel::python_env::HOST_PYTHONPATH_ENV.to_string(),
-                    crate::kernel::python_env::HOST_PYTHONPATH_UNSET.to_string(),
-                );
-            }
-        }
+        // `rlm` package would run instead of the runtime; Python 3.11+
+        // honors PYTHONSAFEPATH (older custom interpreters ignore it, where
+        // `-P` would fail to start), and repl.py appends the cwd last so
+        // project modules import. The whole import protection — the
+        // PYTHONSAFEPATH + marker pair that repl.py pops before any bash()
+        // child can inherit it, the cwd-resolving PYTHONPATH strip, and the
+        // original recorded for the runtime to restore — lives in
+        // python_env, one implementation shared with the `-c` sites.
+        crate::kernel::python_env::protect_kernel_env(&mut env, cwd.as_deref());
         env.insert(
             "PRIME_AGENT_KERNEL_OWNER_PID".to_string(),
             std::process::id().to_string(),

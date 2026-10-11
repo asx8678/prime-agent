@@ -15,12 +15,16 @@
 //! that contains an `rlm/` package (for example `PYTHONPATH=src`) can
 //! still shadow the runtime — detecting that would mean inspecting
 //! project contents, which is out of scope here.
+//!
+//! The module is crate-internal except for
+//! [`protect_user_project_imports`], which pa-cli's factory dispatch
+//! needs (re-exported at the kernel facade).
 
 /// Marker the host sets next to the PYTHONSAFEPATH it injects. The runtime
 /// pops the pair at the very start of `rlm.repl.main()` before any cell or
 /// `bash()` child can inherit them, so a PYTHONSAFEPATH the user set
 /// themselves (no marker) survives.
-pub const HOST_SAFEPATH_MARKER_ENV: &str = "PRIME_AGENT_KERNEL_SAFEPATH";
+pub(crate) const HOST_SAFEPATH_MARKER_ENV: &str = "PRIME_AGENT_KERNEL_SAFEPATH";
 
 /// The original PYTHONPATH the host records next to the entries it strips
 /// from the kernel's environment. The runtime pops it at the very start of
@@ -29,14 +33,14 @@ pub const HOST_SAFEPATH_MARKER_ENV: &str = "PRIME_AGENT_KERNEL_SAFEPATH";
 /// strip protects the runtime's own imports, not the agent's commands.
 /// Always written when the host applies its protection, so a stale inherited
 /// value can never survive into a fresh kernel.
-pub const HOST_PYTHONPATH_ENV: &str = "PRIME_AGENT_KERNEL_PYTHONPATH";
+pub(crate) const HOST_PYTHONPATH_ENV: &str = "PRIME_AGENT_KERNEL_PYTHONPATH";
 
 /// Sentinel recorded in [`HOST_PYTHONPATH_ENV`] when PYTHONPATH was unset:
 /// a leading `\u{1}` cannot occur in a real path list (Windows forbids
 /// control characters in filenames; on every platform it is not a path
 /// anyone sets). Must stay byte-identical to `_HOST_PYTHONPATH_UNSET` in
 /// `prime-agent-runtime/src/rlm/repl.py`.
-pub const HOST_PYTHONPATH_UNSET: &str = "\u{1}";
+pub(crate) const HOST_PYTHONPATH_UNSET: &str = "\u{1}";
 
 /// Drop PYTHONPATH entries that resolve to the child's working directory:
 /// the common `export PYTHONPATH=$PYTHONPATH:/x` yields ":/x", and an
@@ -52,7 +56,7 @@ pub const HOST_PYTHONPATH_UNSET: &str = "\u{1}";
 /// runtime; detecting that would mean inspecting project contents, not
 /// path hygiene.
 #[must_use]
-pub fn strip_cwd_resolving_pythonpath_entries(
+pub(crate) fn strip_cwd_resolving_pythonpath_entries(
     value: &std::ffi::OsStr,
     cwd: Option<&std::path::Path>,
 ) -> Option<std::ffi::OsString> {
@@ -121,13 +125,70 @@ fn lexical_absolute(path: &std::path::Path) -> std::path::PathBuf {
     normalized
 }
 
+/// Apply the kernel-start import protection to the environment map the
+/// kernel child receives — the single implementation behind
+/// `manager::startup`'s spawn (the `-c` sites use
+/// [`protect_user_project_imports`], sharing the strip below):
+///
+/// * `PYTHONSAFEPATH=1` is injected with the [`HOST_SAFEPATH_MARKER_ENV`]
+///   marker unless the user set a non-empty value themselves (an empty
+///   value means "unset" to Python, so it still gets the protection); the
+///   user branch drops any inherited marker so the runtime can never pop
+///   the user's own setting.
+/// * `PYTHONPATH` entries that resolve to the kernel's cwd are stripped,
+///   and the original is recorded in [`HOST_PYTHONPATH_ENV`] (the
+///   [`HOST_PYTHONPATH_UNSET`] sentinel when it was unset) so the runtime
+///   restores it before any cell or `bash()` child can inherit the
+///   stripped value. Recording always happens so a stale inherited value
+///   can never survive into a fresh kernel.
+pub(crate) fn protect_kernel_env(
+    env: &mut std::collections::HashMap<String, String>,
+    cwd: Option<&std::path::Path>,
+) {
+    if env
+        .get("PYTHONSAFEPATH")
+        .is_some_and(|value| !value.is_empty())
+    {
+        env.remove(HOST_SAFEPATH_MARKER_ENV);
+    } else {
+        env.insert("PYTHONSAFEPATH".to_string(), "1".to_string());
+        env.insert(HOST_SAFEPATH_MARKER_ENV.to_string(), "1".to_string());
+    }
+    match env.get("PYTHONPATH").cloned() {
+        Some(pythonpath) => {
+            env.insert(HOST_PYTHONPATH_ENV.to_string(), pythonpath.clone());
+            match strip_cwd_resolving_pythonpath_entries(
+                std::ffi::OsStr::new(pythonpath.as_str()),
+                cwd,
+            ) {
+                Some(stripped) => {
+                    env.insert(
+                        "PYTHONPATH".to_string(),
+                        stripped.to_string_lossy().into_owned(),
+                    );
+                }
+                None => {
+                    env.remove("PYTHONPATH");
+                }
+            }
+        }
+        None => {
+            env.insert(
+                HOST_PYTHONPATH_ENV.to_string(),
+                HOST_PYTHONPATH_UNSET.to_string(),
+            );
+        }
+    }
+}
+
 /// Apply the user-project import protection to a command about to run the
 /// kernel Python with `-c` in a user project directory: PYTHONSAFEPATH stops
 /// the interpreter from prepending the process cwd to `sys.path`, and the
 /// inherited PYTHONPATH is stripped of entries that resolve to the child's
 /// cwd (which put the project back on `sys.path` at import time and would
 /// re-enable that shadowing). Used by the runtime-ready probe and the
-/// CLI's factory dispatch. The child runs no user code of its own, so
+/// CLI's factory dispatch — the module's only public item, re-exported at
+/// the kernel facade. The child runs no user code of its own, so
 /// PYTHONSAFEPATH is set unconditionally, with no marker to pop.
 pub fn protect_user_project_imports(command: &mut std::process::Command) {
     command.env("PYTHONSAFEPATH", "1");

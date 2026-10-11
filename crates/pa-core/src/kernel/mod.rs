@@ -11,7 +11,7 @@ pub mod manager;
 pub mod orphan_journal;
 pub mod protocol;
 pub mod provisioner;
-pub mod python_env;
+mod python_env;
 pub mod rlm_runtime;
 pub mod shared;
 pub mod state_snapshot;
@@ -23,6 +23,7 @@ pub use bootstrap::{
 pub use cancellation::AbortSignal;
 pub use manager::ReplKernelManager;
 pub use provisioner::IpythonKernelProvisioner;
+pub use python_env::protect_user_project_imports;
 pub use rlm_runtime::{
     create_default_rlm_subagent_session_name, find_rlm_model_matches,
     find_unique_rlm_short_form_model_match, format_rlm_model_unavailable_error,

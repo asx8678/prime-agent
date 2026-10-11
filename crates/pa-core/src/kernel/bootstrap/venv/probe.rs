@@ -216,35 +216,8 @@ pub(crate) fn clear_in_process_probe_memo_for_tests() {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::super::{kernel_venv_dir, kernel_venv_python};
     use super::*;
-
-    /// The kernel Python with prime-agent-runtime installed (ambient product
-    /// state, the auto-bootstrapped kernel venv); skipped with a note on
-    /// machines without a live install, like the kernel verifier tests.
-    fn ambient_kernel_python() -> Option<String> {
-        if let Some(explicit) = std::env::var_os("PA_CORE_KERNEL_PYTHON") {
-            let explicit = PathBuf::from(explicit);
-            assert!(
-                explicit.exists(),
-                "PA_CORE_KERNEL_PYTHON {} not found",
-                explicit.display()
-            );
-            return Some(explicit.display().to_string());
-        }
-        let candidate = PathBuf::from(std::env::var("HOME").map_or_else(
-            |_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string(),
-            |home| format!("{home}/.prime/agent/kernel-venv/bin/python"),
-        ));
-        if candidate.exists() {
-            Some(candidate.display().to_string())
-        } else {
-            eprintln!(
-                "kernel python {} not found; skipping the probe safe-path test",
-                candidate.display()
-            );
-            None
-        }
-    }
 
     /// The probe half of the safepath protection: the probe runs its
     /// interpreter with `-c` in the process cwd (the user's project), so
@@ -252,7 +225,26 @@ mod tests {
     /// runs with `sys.flags.safe_path`.
     #[test]
     fn the_probe_interpreter_runs_with_safe_path() {
-        let Some(python) = ambient_kernel_python() else {
+        // The kernel Python with prime-agent-runtime installed (ambient
+        // product state: an explicit PA_CORE_KERNEL_PYTHON, else the
+        // auto-bootstrapped kernel venv); skipped with a note on machines
+        // without a live install, like the pa-core kernel verifier tests.
+        let python = std::env::var_os("PA_CORE_KERNEL_PYTHON")
+            .map(|explicit| {
+                let explicit = PathBuf::from(explicit);
+                assert!(
+                    explicit.exists(),
+                    "PA_CORE_KERNEL_PYTHON {} not found",
+                    explicit.display()
+                );
+                explicit.display().to_string()
+            })
+            .or_else(|| {
+                let candidate = kernel_venv_python(&kernel_venv_dir());
+                candidate.exists().then(|| candidate.display().to_string())
+            });
+        let Some(python) = python else {
+            eprintln!("kernel python not found; skipping the probe safe-path test");
             return;
         };
         assert!(

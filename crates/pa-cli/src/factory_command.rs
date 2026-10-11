@@ -267,7 +267,7 @@ fn resolve_kernel_python() -> Result<PathBuf, String> {
 
 /// Drive one `rlm.factory.cli_dispatch` payload through the kernel Python.
 fn dispatch_via_kernel(python: &std::path::Path, payload: &Value) -> Result<Value, String> {
-    dispatch_via_kernel_in(python, payload, None)
+    dispatch_via_kernel_in(python, payload, /*cwd*/ None)
 }
 
 /// The cwd-taking core of [`dispatch_via_kernel`]: the dispatch runs the
@@ -296,7 +296,7 @@ fn dispatch_via_kernel_in(
     // `-c` puts the process cwd (the user's project) first on sys.path, so a
     // planted `rlm` package would run instead of the installed runtime; the
     // same import protection the kernel start and probe apply belongs here.
-    pa_core::kernel::python_env::protect_user_project_imports(&mut child);
+    pa_core::kernel::protect_user_project_imports(&mut child);
     let mut child = child
         .spawn()
         .map_err(|error| format!("failed to run the kernel python: {error}"))?;
@@ -553,38 +553,29 @@ mod tests {
         assert_eq!(render_list(&result, false), 0);
     }
 
-    /// The kernel Python with prime-agent-runtime installed (ambient
-    /// product state, the auto-bootstrapped kernel venv); skipped with a
-    /// note on machines without a live install, like the pa-core kernel
-    /// verifier tests.
-    fn ambient_kernel_python() -> Option<PathBuf> {
-        if let Some(explicit) = std::env::var_os("PA_CORE_KERNEL_PYTHON") {
-            let explicit = PathBuf::from(explicit);
-            assert!(
-                explicit.exists(),
-                "PA_CORE_KERNEL_PYTHON {} not found",
-                explicit.display()
-            );
-            return Some(explicit);
-        }
-        let candidate = PathBuf::from(std::env::var("HOME").map_or_else(
-            |_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string(),
-            |home| format!("{home}/.prime/agent/kernel-venv/bin/python"),
-        ));
-        if candidate.exists() {
-            Some(candidate)
-        } else {
-            eprintln!(
-                "kernel python {} not found; skipping the live factory dispatch test",
-                candidate.display()
-            );
-            None
-        }
-    }
-
     #[test]
     fn factory_dispatch_survives_a_planted_project_rlm_package() {
-        let Some(python) = ambient_kernel_python() else {
+        // The kernel Python with prime-agent-runtime installed (ambient
+        // product state: an explicit PA_CORE_KERNEL_PYTHON, else the
+        // auto-bootstrapped kernel venv); skipped with a note on machines
+        // without a live install, like the pa-core kernel verifier tests.
+        let python = std::env::var_os("PA_CORE_KERNEL_PYTHON")
+            .map(PathBuf::from)
+            .inspect(|explicit| {
+                assert!(
+                    explicit.exists(),
+                    "PA_CORE_KERNEL_PYTHON {} not found",
+                    explicit.display()
+                );
+            })
+            .or_else(|| {
+                let candidate = pa_core::kernel::bootstrap::kernel_venv_python(
+                    &pa_core::kernel::kernel_venv_dir(),
+                );
+                candidate.exists().then_some(candidate)
+            });
+        let Some(python) = python else {
+            eprintln!("kernel python not found; skipping the live factory dispatch test");
             return;
         };
         let project = tempfile::tempdir().expect("tempdir");
