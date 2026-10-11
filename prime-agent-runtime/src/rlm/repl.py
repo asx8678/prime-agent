@@ -1737,6 +1737,20 @@ def _setup_fds() -> int:
     return stdin_fd
 
 
+def _drop_host_safepath() -> None:
+    """Pop the host's PYTHONSAFEPATH before any child can inherit it.
+
+    The host sets PYTHONSAFEPATH only so a project's own ``rlm`` package
+    cannot shadow the runtime at import time. It is not meant for the
+    commands the agent runs through ``bash()``: inherited, it breaks
+    ``python3 script.py`` sibling imports, ``python3 -m mypkg`` and
+    pytest's cwd-based imports. Popped only when the host's marker is
+    present, so a PYTHONSAFEPATH the user set themselves stays.
+    """
+    if os.environ.pop("PRIME_AGENT_KERNEL_SAFEPATH", None) is not None:
+        os.environ.pop("PYTHONSAFEPATH", None)
+
+
 def _append_startup_cwd_to_path() -> None:
     """Keep project modules importable without letting them shadow anything.
 
@@ -1751,6 +1765,7 @@ def _append_startup_cwd_to_path() -> None:
 
 def main() -> None:
     global _loop, _serve_task
+    _drop_host_safepath()
     stdin_fd = _setup_fds()
     _append_startup_cwd_to_path()
     _start_owner_watchdog()

@@ -561,6 +561,73 @@ async fn project_rlm_package_does_not_shadow_the_kernel_runtime() {
     assert!(shutdown.is_ok());
 }
 
+/// The host's PYTHONSAFEPATH protection exists so a project's own `rlm`
+/// package cannot shadow the runtime at import time. It is not for the
+/// commands the agent runs through `bash()`: a `bash()` child inherits
+/// `os.environ`, and with PYTHONSAFEPATH=1 a plain `python3 script.py`
+/// loses cwd-based sibling imports (and `-m`, and pytest's cwd imports).
+/// The runtime therefore pops the pair (host marker + PYTHONSAFEPATH)
+/// before any cell or `bash()` can run.
+#[tokio::test]
+async fn bash_children_do_not_inherit_the_host_safepath() {
+    let Some(options) = test_options(None) else {
+        return;
+    };
+    let manager = started_manager(options).await;
+
+    let result = execute(
+        &manager,
+        "from rlm import bash\nr = await bash(\"python3 -c 'import sys; print(sys.flags.safe_path)'\")\nr.output.strip()",
+    )
+    .await;
+    assert_eq!(
+        (result.status, result.result.as_deref()),
+        (ExecuteStatus::Ok, Some("'False'")),
+        "bash() children must not inherit the host's PYTHONSAFEPATH, cell: {:?}",
+        result.error
+    );
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
+/// A script in the session project importing a sibling module through
+/// `bash()` is the canonical safe-path break: `python3 script.py` normally
+/// puts the script's directory on `sys.path`, PYTHONSAFEPATH removes that,
+/// and the import fails. The host's protection must not reach the child.
+#[tokio::test]
+async fn bash_child_sibling_imports_keep_working() {
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    std::fs::write(project.path().join("helper.py"), "VALUE = 'sibling'\n").expect("write helper");
+    std::fs::write(
+        project.path().join("main.py"),
+        "import helper\nprint(helper.VALUE)\n",
+    )
+    .expect("write main");
+    options.cwd = Some(project.path().to_path_buf());
+    let manager = started_manager(options).await;
+
+    let result = execute(
+        &manager,
+        "from rlm import bash\nr = await bash('python3 main.py')\n(r.exit_code, r.output.strip())",
+    )
+    .await;
+    assert_eq!(
+        (result.status, result.result.as_deref()),
+        (ExecuteStatus::Ok, Some("(0, 'sibling')")),
+        "sibling imports must survive the host's PYTHONSAFEPATH, cell: {:?}",
+        result.error
+    );
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
 /// An oversized result whose byte cut lands inside a multi-byte character is
 /// clipped at a char boundary; the reader task survives to settle later cells.
 #[tokio::test]

@@ -3195,5 +3195,34 @@ class StartupCwdPathTest(unittest.TestCase):
             self.assertEqual(one(events, "result")["text"], "('from the project', True)")
 
 
+class HostSafepathPopTest(unittest.TestCase):
+    """The host's PYTHONSAFEPATH (with its marker) is popped at the very start
+    of ``main()``: it protects the runtime's own imports only, and a bash()
+    child inheriting it would lose cwd-based sibling imports."""
+
+    def setUp(self) -> None:
+        import rlm.repl as repl_module
+
+        self.repl_module = repl_module
+
+    def test_host_safepath_pair_is_popped_when_the_marker_is_present(self):
+        environ = self.repl_module.os.environ
+        with mock.patch.dict(
+            environ, {"PRIME_AGENT_KERNEL_SAFEPATH": "1", "PYTHONSAFEPATH": "1"}
+        ):
+            self.repl_module._drop_host_safepath()
+            self.assertNotIn("PRIME_AGENT_KERNEL_SAFEPATH", environ)
+            self.assertNotIn("PYTHONSAFEPATH", environ)
+
+    def test_user_set_safepath_stays_without_the_marker(self):
+        environ = self.repl_module.os.environ
+        with mock.patch.dict(
+            environ, {"PRIME_AGENT_KERNEL_SAFEPATH": "0", "PYTHONSAFEPATH": "1"}
+        ):
+            del environ["PRIME_AGENT_KERNEL_SAFEPATH"]
+            self.repl_module._drop_host_safepath()
+            self.assertEqual(environ["PYTHONSAFEPATH"], "1")
+
+
 if __name__ == "__main__":
     unittest.main()

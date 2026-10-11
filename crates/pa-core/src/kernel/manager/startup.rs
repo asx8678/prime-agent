@@ -173,7 +173,16 @@ impl Inner {
         // `rlm` package would run instead of the runtime. Python 3.11+ honors
         // PYTHONSAFEPATH (older custom interpreters ignore it, where `-P` would
         // fail to start); repl.py appends the cwd last so project modules import.
-        env.insert("PYTHONSAFEPATH".to_string(), "1".to_string());
+        // The marker lets repl.py pop PYTHONSAFEPATH before any bash() child can
+        // inherit it: the protection is for the runtime's own imports, not the
+        // agent's commands. A PYTHONSAFEPATH the user set themselves is kept.
+        if !env.contains_key("PYTHONSAFEPATH") {
+            env.insert("PYTHONSAFEPATH".to_string(), "1".to_string());
+            env.insert(
+                crate::kernel::python_env::HOST_SAFEPATH_MARKER_ENV.to_string(),
+                "1".to_string(),
+            );
+        }
         env.insert(
             "PRIME_AGENT_KERNEL_OWNER_PID".to_string(),
             std::process::id().to_string(),

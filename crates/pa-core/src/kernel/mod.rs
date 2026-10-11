@@ -11,6 +11,7 @@ pub mod manager;
 pub mod orphan_journal;
 pub mod protocol;
 pub mod provisioner;
+pub mod python_env;
 pub mod rlm_runtime;
 pub mod shared;
 pub mod state_snapshot;
