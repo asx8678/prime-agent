@@ -1,0 +1,77 @@
+# Tests that failed on clean main on this Mac (macOS, Rust 1.98.1,
+# 2026-10-11), almost all for environment reasons: Unix socket paths over
+# the macOS limit (SUN_LEN), /proc, /private/var. Compare a run's failures
+# against this list; any name not here is new. Re-baseline with Rust 1.99.
+
+## pa-types (cargo test -p pa-types)
+platform::transport::tests::over_limit_paths_bind_connect_and_land_in_place
+platform::transport::tests::paths_at_the_limit_bind_directly
+
+## pa-core unit tests (cargo test -p pa-core --lib)
+packages::tests::exe_dir_of_resolves_a_launcher_symlink
+update::install::tests::anchors_the_running_release_directory
+
+## pa-core integration tests (cargo test -p pa-core --test '*' --no-fail-fast)
+kernel_startup_memo::dispose_after_a_kill_waits_the_doomed_boot
+kernel_teardown::session_engine_drop_kills_the_prewarmed_kernel_process
+kernel_teardown::engine_dispose_kernel_kills_the_prewarmed_kernel_process
+release_channel_manifest::assembled_archives_carry_the_platform_alias_the_reader_demands
+
+## Flaky under load (passed when re-run alone)
+readoption_wake_e2e::a_heartbeat_keeps_firing_across_a_supervisor_restart
+kernel_startup_memo::doomed_settle_keeps_the_newer_boot_listener_state
+
+## pa-daemon (cargo test -p pa-daemon --no-fail-fast): 53 tests, unit and e2e
+a_settled_child_passivates_stays_listable_and_revives_by_agent_message
+an_idle_root_passivates_and_resumes_by_its_durable_id_with_its_transcript
+attach::chunked_snapshot_attach_streams_begin_chunk_end
+compaction::compaction_commands_scripted_session
+control_plane_stays_responsive_while_a_large_adoption_pass_recovers
+create_over_a_dead_workers_file_launches_and_rebinds
+fork_disposes_the_kernel_and_starts_cold
+herdr::tests::a_dropped_reporter_stays_silent_without_releasing
+herdr::tests::a_replacement_resets_the_predecessor_failure_state
+herdr::tests::a_reporter_into_a_non_socket_target_stays_silent
+herdr::tests::a_retry_within_the_grace_keeps_the_pane_working
+herdr::tests::a_stale_generation_reporter_never_writes
+herdr::tests::a_stale_release_neither_writes_nor_stalls
+herdr::tests::a_state_is_re_sent_after_the_socket_comes_up
+herdr::tests::an_error_end_holds_then_blocks_with_the_message
+herdr::tests::the_pane_socket_fence_decides_by_type_and_owner
+herdr::tests::the_release_is_the_last_write_and_never_reclaims
+herdr::tests::the_reporter_publishes_the_wire_contract_states
+kill_disposes_the_session_kernel
+lifecycle::supervisor_end_to_end_scripted_session_lifecycle
+list_all_returns_the_full_synthetic_thousand_child_roster
+navigate_tree_keeps_the_kernel_warm
+new_session_disposes_the_kernel_and_starts_cold
+orphan_exit_disposes_the_kernel_before_the_worker_exits
+orphaned_worker_exits_when_the_supervisor_socket_never_answers
+plain_boot::plain_boot_revives_only_journal_busy_workers
+read_goldens::session_stats_and_header_match_live_daemon_goldens
+restart::supervisor_kill9_restart_sessions_re_register_and_survive
+roster_subscribe_snapshot_and_live_update_pushes
+routed_shutdown_removes_the_workers_own_socket_file
+saved_session_commands::tombstone_usage_tests::a_non_regular_session_path_captures_nothing
+shutdown_disposes_session_kernels_before_the_worker_exits
+shutdown::a_sigterm_exits_the_supervisor_through_the_graceful_drain
+shutdown::shutdown_command_exits_the_supervisor_process
+sigkill_closes_the_spawned_child_and_passivates_the_row
+sigkill_keeps_a_created_root_session_running
+stale_active_id_rebinds_after_worker_replacement
+stop_cleanup::tests::finalize_cancels_the_tree_and_archives_the_root
+supervisor_fd_count_stable_across_session_cycles
+supervisor_restart_loop_leaves_no_orphan_workers
+supervisor_roster_seed::tests::family_seed_renders_edges_then_hydrates_in_the_background
+supervisor::handshake_tests::a_lost_worker_connection_fails_its_in_flight_route
+supervisor::handshake_tests::a_mid_handshake_registration_cannot_kill_the_handshake
+supervisor::handshake_tests::handshake_channel_stays_private_until_auth_answers
+supervisor::tests::a_ledger_delete_never_tombstones_an_unrelated_edge_sharing_the_child_id
+supervisor::tests::worker_probe_accepts_a_live_socket
+switch_session_disposes_the_kernel_and_a_failed_target_keeps_it
+switch_session_rebinds_the_kernel_cwd_onto_the_target_session
+tool_results::tool_result_entries_persisted_and_streamed
+update_boot::update_boot_revives_only_roster_kept_workers
+wave_b11_saved_sessions_wire_shapes
+worker_fd_table_stable_across_client_connection_churn
+worker::tests::kill_broadcast_tests::kill_cancels_the_sessions_scheduled_jobs
