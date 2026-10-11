@@ -3239,6 +3239,44 @@ class HostSafepathPopTest(unittest.TestCase):
             self.assertEqual(environ["PYTHONSAFEPATH"], "1")
 
 
+class HostPythonpathPopTest(unittest.TestCase):
+    """The host records the pre-strip PYTHONPATH in
+    PRIME_AGENT_KERNEL_PYTHONPATH — the ``\x01`` sentinel when it was
+    unset. ``_drop_host_import_protection`` must restore exactly that
+    state: unset stays unset (the sentinel is never restored verbatim),
+    and a set-but-empty original stays an empty string."""
+
+    def setUp(self) -> None:
+        import rlm.repl as repl_module
+
+        self.repl_module = repl_module
+
+    def test_unset_sentinel_removes_pythonpath(self):
+        environ = self.repl_module.os.environ
+        with mock.patch.dict(
+            environ,
+            {"PRIME_AGENT_KERNEL_PYTHONPATH": "\x01", "PYTHONPATH": "stripped"},
+        ):
+            self.repl_module._drop_host_import_protection()
+            self.assertNotIn("PRIME_AGENT_KERNEL_PYTHONPATH", environ)
+            self.assertNotIn(
+                "PYTHONPATH",
+                environ,
+                "the unset sentinel must remove PYTHONPATH, not restore \x01 verbatim",
+            )
+
+    def test_empty_original_is_restored_verbatim(self):
+        environ = self.repl_module.os.environ
+        with mock.patch.dict(environ, {"PRIME_AGENT_KERNEL_PYTHONPATH": ""}):
+            self.repl_module._drop_host_import_protection()
+            self.assertNotIn("PRIME_AGENT_KERNEL_PYTHONPATH", environ)
+            self.assertEqual(
+                environ.get("PYTHONPATH"),
+                "",
+                "a set-but-empty original must be restored as an empty string",
+            )
+
+
 class HostProtectionRoundTripTest(unittest.TestCase):
     """The full ``main()`` path, not just the helper: with the host's
     protection in the environment (PYTHONSAFEPATH + marker, the stripped

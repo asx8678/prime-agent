@@ -767,6 +767,87 @@ async fn bash_children_inherit_the_original_pythonpath_not_the_stripped_one() {
         .expect("shutdown");
 }
 
+/// The host records the pre-strip PYTHONPATH state in its private
+/// variable even when PYTHONPATH is unset (the `\u{1}` sentinel), so a
+/// stale inherited record — a kernel spawned from an environment that
+/// still carries one — can never survive into a fresh kernel: the
+/// runtime would otherwise pop it and hand a `bash()` child a PYTHONPATH
+/// nobody set.
+#[tokio::test]
+async fn a_stale_inherited_record_never_overrides_an_unset_pythonpath() {
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    // The kernel env is the test process env plus options.env, and
+    // options.env can only add: an ambient PYTHONPATH would mask the
+    // unset case under test, so skip (with a note) when it is exported.
+    if std::env::var_os("PYTHONPATH").is_some() {
+        eprintln!("ambient PYTHONPATH set; skipping the unset-pythonpath test");
+        return;
+    }
+    // Pin the host-protection branch: an empty PYTHONSAFEPATH also overrides
+    // a developer shell exporting PYTHONSAFEPATH=1, so the run is hermetic.
+    options
+        .env
+        .insert("PYTHONSAFEPATH".to_string(), String::new());
+    options.env.insert(
+        "PRIME_AGENT_KERNEL_PYTHONPATH".to_string(),
+        "/stale".to_string(),
+    );
+    let manager = started_manager(options).await;
+
+    let result = execute(
+        &manager,
+        "from rlm import bash\nr = await bash('if [ -z \"${PYTHONPATH+x}\" ]; then echo unset; else echo set; fi')\nr.output.strip()",
+    )
+    .await;
+    assert_eq!(
+        (result.status, result.result.as_deref()),
+        (ExecuteStatus::Ok, Some("'unset'")),
+        "a stale inherited PRIME_AGENT_KERNEL_PYTHONPATH must not become a bash() child's PYTHONPATH, cell: {:?}",
+        result.error
+    );
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
+/// A non-empty PYTHONSAFEPATH is the user's own choice: the host leaves it
+/// in place, marker-free, and the runtime keeps it. A stale inherited
+/// marker next to it must be dropped by the host — the runtime would
+/// otherwise pop the pair and remove the user's setting from every
+/// `bash()` child.
+#[tokio::test]
+async fn a_stale_inherited_marker_never_pops_a_user_set_safepath() {
+    let Some(mut options) = test_options(None) else {
+        return;
+    };
+    options
+        .env
+        .insert("PYTHONSAFEPATH".to_string(), "1".to_string());
+    options
+        .env
+        .insert("PRIME_AGENT_KERNEL_SAFEPATH".to_string(), "1".to_string());
+    let manager = started_manager(options).await;
+
+    let result = execute(
+        &manager,
+        "from rlm import bash\nr = await bash(\"python3 -c 'import sys; print(sys.flags.safe_path)'\")\nr.output.strip()",
+    )
+    .await;
+    assert_eq!(
+        (result.status, result.result.as_deref()),
+        (ExecuteStatus::Ok, Some("'True'")),
+        "a user-set PYTHONSAFEPATH must survive a stale inherited marker, cell: {:?}",
+        result.error
+    );
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
 /// The result clip budget counts characters, not bytes: the contract is
 /// "Cap stdout / stderr / result at this many characters"
 /// (`ExecuteOptions::max_output_chars`) and the stream paths already count
