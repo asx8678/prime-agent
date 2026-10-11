@@ -37,6 +37,10 @@ pub const UNLIMITED_AUTONOMOUS_LIMIT: u64 = 9_007_199_254_740_991;
 /// the driver's stop rows share it).
 pub const AUTONOMOUS_STATUS_CUSTOM_TYPE: &str = "autonomous_status";
 
+/// The opening of every continuation prompt autonomous mode sends as a user
+/// row (`[autonomous-continuation]`, `[autonomous-continuation: subagent-keep-alive]`).
+pub const AUTONOMOUS_CONTINUATION_LABEL: &str = "[autonomous-continuation";
+
 /// User-facing configuration (`/autonomous` options).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -426,7 +430,10 @@ pub fn build_autonomous_gate_failure_continuation(
 
 #[must_use]
 pub fn autonomous_continuation_text(state: &AutonomousRuntimeState) -> String {
-    format!("[autonomous-continuation]\n\n{}", state.continuation_prompt)
+    format!(
+        "{AUTONOMOUS_CONTINUATION_LABEL}]\n\n{}",
+        state.continuation_prompt
+    )
 }
 
 /// The continuation row an in-run continuation hook returns to the agent loop; the loop emits and
@@ -455,7 +462,7 @@ pub fn create_autonomous_subagent_keep_alive_text(state: &AutonomousRuntimeState
     let minutes = (state.subagent_keep_alive_ms / 60_000).max(1);
     let plural = if minutes == 1 { "" } else { "s" };
     format!(
-        "[autonomous-continuation: subagent-keep-alive]\n\nSubagents have been running for at least {minutes} minute{plural} without a reply or exit being delivered. Check their status (for example agent_observe, rlm.list_subagents, or process inspection) and cancel or unblock any that are hung; then continue working."
+        "{AUTONOMOUS_CONTINUATION_LABEL}: subagent-keep-alive]\n\nSubagents have been running for at least {minutes} minute{plural} without a reply or exit being delivered. Check their status (for example agent_observe, rlm.list_subagents, or process inspection) and cancel or unblock any that are hung; then continue working."
     )
 }
 
