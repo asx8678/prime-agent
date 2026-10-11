@@ -541,3 +541,76 @@ fn a_bare_invocation_of_a_close_tagged_body_still_floors() {
     );
     assert_eq!(assistant_texts(&events), vec!["ok"]);
 }
+
+/// The worker writes each accepted row to the session file as the engine
+/// emits it, ahead of the turn. A session the turn builds lazily must not
+/// adopt the turn's own row, or the turn appends it again and the model
+/// reads the prompt twice.
+#[test]
+fn a_lazily_built_session_sends_the_first_prompt_once() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.set_path(session_path.clone());
+    store.rewrite().expect("write session file");
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir,
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: Some(session_path),
+        faux_script: Some(r#"{"responses": [{"text": "the reply"}]}"#.to_string()),
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    engine.run_prompt(
+        0,
+        PromptRequest {
+            batch: Vec::new(),
+            images: Vec::new(),
+            message: "the first prompt".to_string(),
+            source: "user".to_string(),
+            agent_message_id: None,
+            custom_message: None,
+        },
+        &|| false,
+        &mut |event| {
+            if let EngineEvent::UserMessage(message) = &event {
+                store
+                    .persist_entry("message", json!({ "message": message }))
+                    .expect("the durable row");
+            }
+            true
+        },
+    );
+    let context_prompts = engine.runtime.block_on(async {
+        let guard = engine.session.lock().await;
+        let core = guard.as_deref().expect("the turn built the session");
+        core.session
+            .agent()
+            .state()
+            .await
+            .messages
+            .iter()
+            .filter(|message| {
+                let value = serde_json::to_value(message).unwrap_or_default();
+                value["role"] == "user" && value.to_string().contains("the first prompt")
+            })
+            .count()
+    });
+    assert_eq!(
+        (context_prompts, core_session_user_texts(&engine)),
+        (1, vec!["the first prompt".to_string()])
+    );
+}

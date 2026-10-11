@@ -1353,6 +1353,20 @@ impl SessionEngine for AgentSessionEngine {
             }
             None => None,
         };
+        // The worker writes the accepted rows below to the session file as
+        // they emit, and a lazy build adopts that file: a session built by
+        // the turn would hold this prompt ahead of the turn appending it, and
+        // the model would read it twice. Build first, as the `/skill:`
+        // expansion above does; a failed build fails the turn's own build.
+        if self.session.blocking_lock().is_none() {
+            if let Ok(model) = self.resolve_model() {
+                if let Err(error) = self.ensure_core_session(&model) {
+                    eprintln!(
+                        "pa-daemon: session build before the accepted rows failed: {error:#}"
+                    );
+                }
+            }
+        }
         // The accepted turn row: an injected custom row replaces the user
         // message; the plain turn records the accepted row, images after.
         let accepted = if let Some(custom) = &request.custom_message {

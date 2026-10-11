@@ -1,0 +1,1 @@
+- The first prompt a session's worker runs (in a new or resumed session, or after the worker restarts) now reaches the model once. It was sent twice, doubling that request's input tokens for the prompt.
