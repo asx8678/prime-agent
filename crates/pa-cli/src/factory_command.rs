@@ -287,13 +287,16 @@ fn dispatch_via_kernel_in(
         .stderr(Stdio::piped());
     // Hidden window on Windows, matching the kernel probes.
     pa_core::platform::process::set_no_window(&mut child);
+    // The child's cwd (the user's project) must be set before the import
+    // protection runs: it judges PYTHONPATH entries against the directory
+    // this child actually runs in.
+    if let Some(cwd) = cwd {
+        child.current_dir(cwd);
+    }
     // `-c` puts the process cwd (the user's project) first on sys.path, so a
     // planted `rlm` package would run instead of the installed runtime; the
     // same import protection the kernel start and probe apply belongs here.
     pa_core::kernel::python_env::protect_user_project_imports(&mut child);
-    if let Some(cwd) = cwd {
-        child.current_dir(cwd);
-    }
     let mut child = child
         .spawn()
         .map_err(|error| format!("failed to run the kernel python: {error}"))?;
@@ -592,15 +595,31 @@ mod tests {
             format!("open({:?}, 'w').close()\n", marker.display().to_string()),
         )
         .expect("plant rlm package");
-        let result = dispatch_via_kernel_in(&python, &list_payload(), Some(project.path()))
-            .expect("the factory dispatch must survive a planted rlm package");
-        assert!(
-            !marker.exists(),
-            "the project's rlm package ran in the factory dispatch"
-        );
-        assert!(
-            result.get("ok").and_then(Value::as_bool).unwrap_or(false),
-            "the dispatch must answer a list payload, got {result}"
-        );
+        let project_entry = project.path().display().to_string();
+        // PYTHONPATH entries that resolve to the child's cwd (the project)
+        // must be stripped exactly like empty ones; restore the shared
+        // environment afterwards whatever the ambient PYTHONPATH was.
+        let ambient = std::env::var_os("PYTHONPATH");
+        for cwd_entry in ["", ".", "./", project_entry.as_str()] {
+            let _ = std::fs::remove_file(&marker);
+            std::env::set_var("PYTHONPATH", cwd_entry);
+            let result =
+                dispatch_via_kernel_in(&python, &list_payload(), Some(project.path()))
+                    .unwrap_or_else(|error| {
+                        panic!("the factory dispatch must survive a planted rlm package with PYTHONPATH=`{cwd_entry}`: {error}")
+                    });
+            assert!(
+                !marker.exists(),
+                "a `{cwd_entry}` PYTHONPATH entry ran the project's rlm package in the factory dispatch"
+            );
+            assert!(
+                result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                "the dispatch must answer a list payload with PYTHONPATH=`{cwd_entry}`, got {result}"
+            );
+        }
+        match ambient {
+            Some(value) => std::env::set_var("PYTHONPATH", value),
+            None => std::env::remove_var("PYTHONPATH"),
+        }
     }
 }

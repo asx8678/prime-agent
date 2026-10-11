@@ -169,6 +169,14 @@ impl Inner {
         for (key, value) in &self.options.env {
             env.insert(key.clone(), value.clone());
         }
+        // The session cwd the kernel runs in: the explicit option, else the
+        // inherited process cwd (the PYTHONPATH strip below must judge
+        // entries against the directory the child actually runs in).
+        let cwd = self
+            .options
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
         // `-m` would put the session cwd first on sys.path, so a project's own
         // `rlm` package would run instead of the runtime. Python 3.11+ honors
         // PYTHONSAFEPATH (older custom interpreters ignore it, where `-P` would
@@ -190,26 +198,34 @@ impl Inner {
                 "1".to_string(),
             );
         }
-        // Empty PYTHONPATH entries resolve to the cwd at import time, which
-        // would re-enable the project-package shadowing above; real entries
-        // stay honored. The original is recorded next to the strip so repl.py
-        // can restore it before any cell or bash() child inherits the
-        // stripped value — a bash() child must see the user's PYTHONPATH,
-        // empty entries included, like in their own shell. The sentinel
-        // covers an unset PYTHONPATH so a stale inherited record cannot
-        // survive into a fresh kernel.
+        // PYTHONPATH entries that resolve to the session cwd (the empty
+        // ones, but also `.`, `./` and the absolute path) put the project
+        // back on sys.path at import time, which would re-enable the
+        // shadowing above; real entries stay honored. The original is
+        // recorded next to the strip so repl.py can restore it before any
+        // cell or bash() child inherits the stripped value — a bash()
+        // child must see the user's PYTHONPATH, like in their own shell.
+        // The sentinel covers an unset PYTHONPATH so a stale inherited
+        // record cannot survive into a fresh kernel.
         match env.get("PYTHONPATH").cloned() {
             Some(pythonpath) => {
                 env.insert(
                     crate::kernel::python_env::HOST_PYTHONPATH_ENV.to_string(),
                     pythonpath.clone(),
                 );
-                let stripped =
-                    crate::kernel::python_env::strip_empty_pythonpath_entries(&pythonpath);
-                if stripped.is_empty() {
-                    env.remove("PYTHONPATH");
-                } else {
-                    env.insert("PYTHONPATH".to_string(), stripped);
+                match crate::kernel::python_env::strip_cwd_resolving_pythonpath_entries(
+                    std::ffi::OsStr::new(pythonpath.as_str()),
+                    cwd.as_deref(),
+                ) {
+                    Some(stripped) => {
+                        env.insert(
+                            "PYTHONPATH".to_string(),
+                            stripped.to_string_lossy().into_owned(),
+                        );
+                    }
+                    None => {
+                        env.remove("PYTHONPATH");
+                    }
                 }
             }
             None => {
@@ -223,7 +239,6 @@ impl Inner {
             "PRIME_AGENT_KERNEL_OWNER_PID".to_string(),
             std::process::id().to_string(),
         );
-        let cwd = self.options.cwd.clone();
         let mut command = tokio::process::Command::new(&python);
         command
             .args(["-m", "rlm.repl"])

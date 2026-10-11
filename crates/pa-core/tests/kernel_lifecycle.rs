@@ -561,16 +561,14 @@ async fn project_rlm_package_does_not_shadow_the_kernel_runtime() {
     assert!(shutdown.is_ok());
 }
 
-/// An empty PYTHONPATH entry (the common `export PYTHONPATH=$PYTHONPATH:/x`
-/// yields ":/x") resolves to the cwd at import time, which puts the project
-/// directory back on `sys.path` ahead of the installed runtime and re-enables
-/// the shadowing PYTHONSAFEPATH exists to stop. Empty entries are dropped;
+/// PYTHONPATH entries that resolve to the session cwd put the project
+/// directory back on `sys.path` ahead of the installed runtime and
+/// re-enable the shadowing PYTHONSAFEPATH exists to stop. That includes
+/// the common `export PYTHONPATH=$PYTHONPATH:/x` (an empty entry), but
+/// also `.`, `./` and the absolute cwd path. All of them are dropped;
 /// real entries stay honored.
 #[tokio::test]
-async fn empty_pythonpath_entries_do_not_re_enable_project_shadowing() {
-    let Some(mut options) = test_options(None) else {
-        return;
-    };
+async fn cwd_pythonpath_entries_do_not_re_enable_project_shadowing() {
     let project = tempfile::tempdir().expect("tempdir");
     let marker = project.path().join("shadowed.marker");
     std::fs::create_dir(project.path().join("rlm")).expect("create rlm package");
@@ -585,26 +583,33 @@ async fn empty_pythonpath_entries_do_not_re_enable_project_shadowing() {
         "VALUE = 'from the path'\n",
     )
     .expect("write path module");
-    options.env.insert(
-        "PYTHONPATH".to_string(),
-        format!(":{}", elsewhere.path().display()),
-    );
-    options.cwd = Some(project.path().to_path_buf());
-    let manager = started_manager(options).await;
+    let project_entry = project.path().display().to_string();
+    for cwd_entry in ["", ".", "./", project_entry.as_str()] {
+        let Some(mut options) = test_options(None) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&marker);
+        options.env.insert(
+            "PYTHONPATH".to_string(),
+            format!("{cwd_entry}:{}", elsewhere.path().display()),
+        );
+        options.cwd = Some(project.path().to_path_buf());
+        let manager = started_manager(options).await;
 
-    assert!(
-        !marker.exists(),
-        "an empty PYTHONPATH entry put the cwd back on sys.path"
-    );
-    let result = execute(&manager, "import path_helper\npath_helper.VALUE").await;
-    assert_eq!(
-        (result.status, result.result.as_deref()),
-        (ExecuteStatus::Ok, Some("'from the path'")),
-        "real PYTHONPATH entries must stay honored, cell: {:?}",
-        result.error
-    );
-    let shutdown = manager.shutdown(KernelShutdownOptions::default()).await;
-    assert!(shutdown.is_ok());
+        assert!(
+            !marker.exists(),
+            "a `{cwd_entry}` PYTHONPATH entry put the cwd back on sys.path"
+        );
+        let result = execute(&manager, "import path_helper\npath_helper.VALUE").await;
+        assert_eq!(
+            (result.status, result.result.as_deref()),
+            (ExecuteStatus::Ok, Some("'from the path'")),
+            "real PYTHONPATH entries must stay honored (`{cwd_entry}`), cell: {:?}",
+            result.error
+        );
+        let shutdown = manager.shutdown(KernelShutdownOptions::default()).await;
+        assert!(shutdown.is_ok());
+    }
 }
 
 /// The host's PYTHONSAFEPATH protection exists so a project's own `rlm`
