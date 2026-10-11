@@ -23,3 +23,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 This software is a port of the Prime Agent TypeScript product, originally
 Copyright (c) 2025 Mario Zechner, used under the MIT License.
+
+---
+
+Portions of the structural compaction renderer
+(crates/pa-core/src/session_engine/structural_compaction/render.rs: sampled
+lines, bounded blocks and bounded history) are adapted from software
+Copyright (c) 2026 monotykamary, used under the MIT License.
