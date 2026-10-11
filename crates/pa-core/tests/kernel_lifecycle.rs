@@ -621,9 +621,15 @@ async fn cwd_pythonpath_entries_do_not_re_enable_project_shadowing() {
 /// before any cell or `bash()` can run.
 #[tokio::test]
 async fn bash_children_do_not_inherit_the_host_safepath() {
-    let Some(options) = test_options(None) else {
+    let Some(mut options) = test_options(None) else {
         return;
     };
+    // Pinned to the empty value: the host-branch under test is fixed even
+    // when a developer shell exports PYTHONSAFEPATH=1 (which would count
+    // as the user's own choice and stay).
+    options
+        .env
+        .insert("PYTHONSAFEPATH".to_string(), String::new());
     let manager = started_manager(options).await;
 
     let result = execute(
@@ -652,6 +658,12 @@ async fn bash_child_sibling_imports_keep_working() {
     let Some(mut options) = test_options(None) else {
         return;
     };
+    // Pinned to the empty value so the host injects (and the runtime pops)
+    // its own protection even under a developer shell exporting
+    // PYTHONSAFEPATH=1.
+    options
+        .env
+        .insert("PYTHONSAFEPATH".to_string(), String::new());
     let project = tempfile::tempdir().expect("tempdir");
     std::fs::write(project.path().join("helper.py"), "VALUE = 'sibling'\n").expect("write helper");
     std::fs::write(
