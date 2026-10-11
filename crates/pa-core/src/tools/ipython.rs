@@ -53,6 +53,9 @@ pub struct ExecuteResult {
     pub background_output: Option<String>,
     pub error: Option<KernelErrorInfo>,
     pub attachments: Vec<KernelAttachment>,
+    /// Files edited from this cell, in order (`diffs` on the tool-result
+    /// details).
+    pub diffs: Vec<crate::kernel::shared::KernelDiffDisplay>,
     /// Agent messages sent from this cell, in order (TS
     /// `sentAgentMessages` on the tool-result details).
     pub sent_agent_messages: Vec<crate::kernel::shared::KernelSentAgentMessage>,
@@ -470,6 +473,23 @@ pub async fn execute_ipython(
         });
         details["errorEname"] = json!(error.ename);
     }
+    if !r.diffs.is_empty() {
+        details["diffs"] = json!(r
+            .diffs
+            .iter()
+            .map(|diff| {
+                let mut entry = json!({
+                    "path": diff.path,
+                    "oldStr": diff.old_str,
+                    "newStr": diff.new_str,
+                });
+                if let Some(start_line) = diff.start_line {
+                    entry["startLine"] = json!(start_line);
+                }
+                entry
+            })
+            .collect::<Vec<_>>());
+    }
     if !r.sent_agent_messages.is_empty() {
         details["sentAgentMessages"] = json!(r
             .sent_agent_messages
@@ -534,6 +554,75 @@ pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::shared::KernelDiffDisplay;
+
+    /// A kernel whose every cell settles with the given result.
+    struct SettledCell(ExecuteResult);
+
+    impl KernelExecutor for SettledCell {
+        fn execute(&self, _code: &str, _options: KernelExecuteOptions<'_>) -> ExecuteCellFuture {
+            Box::pin(std::future::ready(Ok(self.0.clone())))
+        }
+    }
+
+    impl IpythonKernelProvisioner for SettledCell {
+        fn ensure(
+            &self,
+            _on_progress: Option<BootstrapProgressHandler>,
+            _signal: Option<AbortSignal>,
+        ) -> EnsureFuture {
+            let executor: Box<dyn KernelExecutor> = Box::new(SettledCell(self.0.clone()));
+            Box::pin(std::future::ready(Ok(executor)))
+        }
+
+        fn kill(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn cell_edit_diffs_are_saved_in_the_result_details() {
+        let cell = ExecuteResult {
+            result: Some("'Edited /repo/b.py'".to_string()),
+            duration_ms: Some(4),
+            diffs: vec![
+                KernelDiffDisplay {
+                    path: "/repo/a.py".to_string(),
+                    old_str: "a = 1".to_string(),
+                    new_str: "a = 2".to_string(),
+                    start_line: Some(3),
+                },
+                KernelDiffDisplay {
+                    path: "/repo/b.py".to_string(),
+                    old_str: "x".to_string(),
+                    new_str: "y".to_string(),
+                    start_line: None,
+                },
+            ],
+            ..ExecuteResult::default()
+        };
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(SettledCell(cell)),
+            ui: None,
+            on_late_sent_agent_message: None,
+        };
+        let result = execute_ipython(&options, "await edit(...)", None, None, None)
+            .await
+            .expect("the cell settles");
+        assert_eq!(
+            result.details,
+            Some(json!({
+                "status": "ok",
+                "kernelRestarted": false,
+                "durationMs": 4,
+                "result": "'Edited /repo/b.py'",
+                "diffs": [
+                    { "path": "/repo/a.py", "oldStr": "a = 1", "newStr": "a = 2", "startLine": 3 },
+                    { "path": "/repo/b.py", "oldStr": "x", "newStr": "y" },
+                ],
+            }))
+        );
+    }
 
     #[test]
     fn sent_agent_message_json_matches_ts_wire_shape() {

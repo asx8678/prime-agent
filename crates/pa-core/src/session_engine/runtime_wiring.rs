@@ -344,6 +344,7 @@ fn convert_execute_result(
                 data: attachment.data,
             })
             .collect(),
+        diffs: result.diffs.unwrap_or_default(),
         sent_agent_messages: result.sent_agent_messages.unwrap_or_default(),
         bash_commands: result.bash_commands,
     }
@@ -359,5 +360,35 @@ pub fn ipython_tool_options(
         provisioner,
         ui: None,
         on_late_sent_agent_message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::shared::KernelDiffDisplay;
+
+    #[test]
+    fn the_converted_result_keeps_the_cell_edit_diffs() {
+        let diffs = vec![KernelDiffDisplay {
+            path: "/repo/a.py".to_string(),
+            old_str: "a = 1".to_string(),
+            new_str: "a = 2".to_string(),
+            start_line: Some(3),
+        }];
+        let converted = convert_execute_result(crate::kernel::shared::ExecuteResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            result: Some("'Edited /repo/a.py'".to_string()),
+            diffs: Some(diffs.clone()),
+            attachments: None,
+            sent_agent_messages: None,
+            bash_commands: None,
+            background_output: None,
+            status: crate::kernel::shared::ExecuteStatus::Ok,
+            error: None,
+            duration_ms: 4,
+        });
+        assert_eq!(converted.diffs, diffs);
     }
 }

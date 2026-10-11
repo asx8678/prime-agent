@@ -1,0 +1,1 @@
+- File edits made with `edit()` inside a Python cell are now saved with the cell's result, so compaction lists those files as modified and ACP clients receive the cell's diff count. The terminal view of these cells is unchanged.

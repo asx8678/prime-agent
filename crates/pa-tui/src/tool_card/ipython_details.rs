@@ -120,11 +120,10 @@ impl IpythonDetails {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             error,
-            diffs: record
-                .get("diffs")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
+            // `details.diffs` stays unread until the card draws edit diffs (the
+            // TS diff block is not ported): read diffs hide the `Edited <path>`
+            // confirmation and zero the output count with nothing in their place.
+            diffs: Vec::new(),
             sent_agent_messages: record
                 .get("sentAgentMessages")
                 .and_then(Value::as_array)

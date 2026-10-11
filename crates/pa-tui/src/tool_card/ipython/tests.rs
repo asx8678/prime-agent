@@ -403,3 +403,40 @@ fn bash_minority_cell_stays_python() {
     );
     assert_eq!(bash_dominated_stats(&card), None);
 }
+
+#[test]
+fn edit_diffs_leave_the_cell_card_unchanged_until_they_are_drawn() {
+    let code = "await edit(path=\"a.py\", old_str=\"a = 1\", new_str=\"a = 2\")";
+    let plain = json!({ "status": "ok", "durationMs": 4, "result": "'Edited /repo/a.py'" });
+    let mut with_diffs = plain.clone();
+    with_diffs["diffs"] =
+        json!([{ "path": "/repo/a.py", "oldStr": "a = 1", "newStr": "a = 2", "startLine": 3 }]);
+    let rendered = |details: &Value, detail: Detail| -> Vec<String> {
+        render(
+            &cell_card(code, details.clone(), false, false),
+            0,
+            detail,
+            &theme(),
+            100,
+            true,
+        )
+        .iter()
+        .map(text_of)
+        .collect()
+    };
+    let expanded = rendered(&with_diffs, Detail::All);
+    assert!(
+        expanded
+            .iter()
+            .any(|line| line.contains("Edited /repo/a.py")),
+        "got: {expanded:?}"
+    );
+    for detail in [Detail::Overview, Detail::Details, Detail::All] {
+        assert_eq!(
+            rendered(&with_diffs, detail),
+            rendered(&plain, detail),
+            "{}",
+            detail.wire_name()
+        );
+    }
+}
