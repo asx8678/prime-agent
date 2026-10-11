@@ -1,7 +1,9 @@
 use pa_types::session::FileEntry;
 use proptest::prelude::*;
 
-use super::events::{normalize, CellOutcome, CellStatus, Event, NoticeKind, SentMessage};
+use super::events::{
+    normalize, BashOutcome, CellOutcome, CellStatus, Event, NoticeKind, SentMessage,
+};
 use super::render::{render, DEFAULT_MAX_BYTES};
 use super::state::{State, STATE_VERSION};
 use crate::autonomous::AUTONOMOUS_CONTINUATION_LABEL;
@@ -110,7 +112,7 @@ fn the_session_log_normalizes_to_typed_events() {
             },
             Event::BashDone {
                 command: text("cargo build --release"),
-                exit_code: Some(101),
+                outcome: BashOutcome::Exited(101),
             },
             Event::Notice {
                 kind: NoticeKind::Heartbeat,
@@ -240,7 +242,7 @@ fn autonomous_continuations_do_not_displace_user_directions() {
 fn starting_a_command_does_not_resolve_its_exit_failure() {
     let build = |exit_code| Event::BashDone {
         command: text("cargo build --release"),
-        exit_code: Some(exit_code),
+        outcome: BashOutcome::Exited(exit_code),
     };
     let mut state = State::new();
     state.fold(&[
@@ -268,6 +270,30 @@ fn starting_a_command_does_not_resolve_its_exit_failure() {
     assert!(
         finished.contains("- bash: cargo build --release: exit 101 [resolved] [u0]"),
         "got: {finished}"
+    );
+}
+
+#[test]
+fn a_bash_run_that_never_started_is_not_cancelled() {
+    // A spawn failure records no exit code and never cancels the run: the
+    // fold must read it as a failure to start, not as a cancellation.
+    let spawn_failure = serde_json::json!({
+        "type": "message", "id": "e1", "parentId": null, "timestamp": "2026-10-01T09:00:00.000Z",
+        "message": {
+            "role": "bashExecution",
+            "command": "cargo build --release",
+            "output": "",
+            "cancelled": false,
+            "truncated": false,
+            "timestamp": 0,
+        },
+    });
+    let mut state = State::new();
+    state.fold(&normalize(&entries(&spawn_failure.to_string())));
+    let summary = render(&state, None, DEFAULT_MAX_BYTES);
+    assert!(
+        summary.contains("- bash: cargo build --release: failed to start [u0]"),
+        "got: {summary}"
     );
 }
 
@@ -354,11 +380,15 @@ fn event() -> impl Strategy<Value = Event> {
             .prop_map(|(call_id, error)| Event::ToolEnd { call_id, error }),
         (
             prop::sample::select(vec!["cargo test", "make"]),
-            prop::option::of(-1i64..3)
+            prop_oneof![
+                (-1i64..3).prop_map(BashOutcome::Exited),
+                Just(BashOutcome::Cancelled),
+                Just(BashOutcome::Failed),
+            ]
         )
-            .prop_map(|(command, exit_code)| Event::BashDone {
+            .prop_map(|(command, outcome)| Event::BashDone {
                 command: command.to_string(),
-                exit_code,
+                outcome,
             }),
         (words(), prop::option::of(words()), words()).prop_map(|(from, relationship, text)| {
             Event::MessageIn {

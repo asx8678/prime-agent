@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::bounds::{one_line, Addressed, Excerpt, Line, Sample};
-use super::events::{CellOutcome, CellStatus, Event, NoticeKind};
+use super::events::{BashOutcome, CellOutcome, CellStatus, Event, NoticeKind};
 
 /// Bumped whenever the saved shape or a fold rule changes: a state saved by
 /// another version is not folded further.
@@ -53,7 +53,7 @@ pub(crate) struct Exchange {
 pub(crate) enum FailureKind {
     /// A Python cell raised or was aborted.
     Cell,
-    /// A shell command exited non-zero or was cancelled.
+    /// A shell command exited non-zero, was cancelled, or failed to start.
     Command,
     /// Another tool returned an error.
     Tool,
@@ -254,13 +254,14 @@ impl State {
                     .map(|error| non_empty(one_line(error, LINE_CHARS), "error"));
                 self.settle(&at, FailureKind::Tool, subject, error);
             }
-            Event::BashDone { command, exit_code } => {
+            Event::BashDone { command, outcome } => {
                 let at = self.address();
                 let subject = format!("bash: {}", one_line(command, SUBJECT_CHARS));
-                let error = match exit_code {
-                    Some(0) => None,
-                    Some(code) => Some(format!("exit {code}")),
-                    None => Some("cancelled".to_string()),
+                let error = match outcome {
+                    BashOutcome::Exited(0) => None,
+                    BashOutcome::Exited(code) => Some(format!("exit {code}")),
+                    BashOutcome::Cancelled => Some("cancelled".to_string()),
+                    BashOutcome::Failed => Some("failed to start".to_string()),
                 };
                 self.settle(&at, FailureKind::Command, subject, error);
             }

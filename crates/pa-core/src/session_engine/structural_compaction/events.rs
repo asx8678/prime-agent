@@ -60,10 +60,10 @@ pub(crate) enum Event {
         error: Option<String>,
     },
     /// A shell command that finished outside a cell: a user `!` command or a
-    /// detached `bash()` completion. `None` when it was cancelled.
+    /// detached `bash()` completion.
     BashDone {
         command: String,
-        exit_code: Option<i64>,
+        outcome: BashOutcome,
     },
     /// A message delivered from another agent.
     MessageIn {
@@ -98,6 +98,17 @@ pub(crate) enum NoticeKind {
     Refinement,
     /// An autonomous-mode status.
     Autonomous,
+}
+
+/// The typed outcome of a shell command that ran outside a cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BashOutcome {
+    /// The command ran to completion with its exit status.
+    Exited(i64),
+    /// The command was cancelled before finishing.
+    Cancelled,
+    /// The command never started (a spawn failure).
+    Failed,
 }
 
 /// The typed outcome of one Python cell (`details` of an `ipython` result).
@@ -182,7 +193,11 @@ fn push_message(message: &AgentMessage, events: &mut Vec<Event>) {
             if bash.exclude_from_context != Some(true) {
                 events.push(Event::BashDone {
                     command: bash.command.clone(),
-                    exit_code: if bash.cancelled { None } else { bash.exit_code },
+                    outcome: match (bash.cancelled, bash.exit_code) {
+                        (true, _) => BashOutcome::Cancelled,
+                        (false, Some(code)) => BashOutcome::Exited(code),
+                        (false, None) => BashOutcome::Failed,
+                    },
                 });
             }
         }
@@ -376,7 +391,10 @@ fn push_custom(
         },
         ASYNC_BASH_COMPLETION_CUSTOM_TYPE => Event::BashDone {
             command: str_at(details, "command").unwrap_or_default().to_string(),
-            exit_code: details.get("exitCode").and_then(Value::as_i64),
+            outcome: details
+                .get("exitCode")
+                .and_then(Value::as_i64)
+                .map_or(BashOutcome::Failed, BashOutcome::Exited),
         },
         RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE => Event::ChildEnded {
             name: child_name(details),
