@@ -106,9 +106,14 @@ impl BashOperations for LocalBashOperations {
             });
 
             let mut waiter = tokio::task::spawn_blocking(move || child.wait());
-            let timeout_deadline = timeout
-                .filter(|t| *t > 0.0)
-                .map(|t| tokio::time::Instant::now() + Duration::from_secs_f64(t));
+            let timeout_deadline = timeout.filter(|t| *t > 0.0).and_then(|t| {
+                // The model controls this f64 (tool params), so a value beyond
+                // Duration::MAX or one that overflows the clock is unrepresentable:
+                // run without a deadline rather than panic.
+                Duration::try_from_secs_f64(t)
+                    .ok()
+                    .and_then(|dur| tokio::time::Instant::now().checked_add(dur))
+            });
             let mut abort_watcher = signal
                 .as_ref()
                 .map(|signal| Box::pin(signal.clone().cancelled_owned()));
@@ -169,5 +174,36 @@ impl BashOperations for LocalBashOperations {
             }
             Ok(status.code())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_out_of_range_timeout_runs_without_a_deadline() {
+        let ops = LocalBashOperations::default();
+        let output = std::sync::Mutex::new(String::new());
+        let code = ops
+            .exec(
+                "echo ok",
+                std::env::temp_dir().to_str().unwrap(),
+                ExecOptions {
+                    on_data: &|data: &[u8]| {
+                        output
+                            .lock()
+                            .unwrap()
+                            .push_str(&String::from_utf8_lossy(data));
+                    },
+                    signal: None,
+                    timeout: Some(1e20),
+                    env: None,
+                },
+            )
+            .await
+            .expect("echo should complete normally");
+        assert_eq!(code, Some(0));
+        assert_eq!(output.into_inner().unwrap().trim(), "ok");
     }
 }
