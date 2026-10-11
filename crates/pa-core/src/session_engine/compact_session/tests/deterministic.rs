@@ -188,6 +188,7 @@ async fn switching_from_the_model_summarizer_keeps_its_summary_as_a_labeled_exce
         CompactOptions {
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
+                engine: CompactionEngine::Llm,
                 ..Default::default()
             },
             ..deterministic(registration.get_model())
@@ -256,6 +257,7 @@ async fn switching_back_to_the_model_summarizer_updates_the_deterministic_summar
         CompactOptions {
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
+                engine: CompactionEngine::Llm,
                 ..Default::default()
             },
             ..deterministic(registration.get_model())

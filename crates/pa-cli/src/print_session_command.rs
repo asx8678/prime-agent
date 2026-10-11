@@ -599,7 +599,7 @@ mod tests {
         // Two long seed turns consume the queue; the compactable session's /compact then fails its
         // summarizer call.
         let settings = json!({
-            "compaction": {"enabled": true, "reserveTokens": 1, "keepRecentTokens": 10}
+            "compaction": {"engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10}
         });
         let test =
             bed_with_settings(script(&json!([{"text": "r1"}, {"text": "r2"}])), settings).await;

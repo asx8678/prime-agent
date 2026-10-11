@@ -407,6 +407,7 @@ async fn placement_rig(
     .unwrap();
     engine.set_compaction_settings(crate::session_engine::compaction::CompactionSettings {
         keep_recent_tokens: 2,
+        engine: crate::settings::CompactionEngine::Llm,
         ..Default::default()
     });
     let objective = {

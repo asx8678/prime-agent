@@ -715,7 +715,7 @@ mod tests {
         // everything, so the compaction has no history to summarize.
         let (engine, _dir) = faux_engine_with_compaction_settings(
             &json!({ "responses": [overflow_error(0)] }),
-            &json!({ "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 100_000 } }),
+            &json!({ "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 100_000 } }),
         );
         let mut events: Vec<EngineEvent> = Vec::new();
         admit(&engine, "overflow probe".to_string(), &mut events);
@@ -925,7 +925,7 @@ mod tests {
                     {"text": "the summary"},
                 ]
             }),
-            &json!({ "compaction": { "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 } }),
+            &json!({ "compaction": { "engine": "llm", "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 } }),
         );
         let mut events: Vec<EngineEvent> = Vec::new();
         admit(&engine, "seed turn".to_string(), &mut events);

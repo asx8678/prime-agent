@@ -366,7 +366,7 @@ fn mega_session_threshold_compaction_phase_measurement() {
     // the cut keeps almost nothing — the worst case the operator's stall reports.
     std::fs::write(
         agent_dir.join("settings.json"),
-        json!({ "compaction": {"enabled": true, "reserveTokens": 500, "keepRecentTokens": 10} })
+        json!({ "compaction": {"engine": "llm", "enabled": true, "reserveTokens": 500, "keepRecentTokens": 10} })
             .to_string(),
     )
     .expect("write settings.json");

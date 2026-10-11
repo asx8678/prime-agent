@@ -105,6 +105,7 @@ async fn split_turn_compaction_runs_two_summarizer_calls_and_merges_the_turn_con
             custom_instructions: None,
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
+                engine: crate::settings::CompactionEngine::Llm,
                 ..Default::default()
             },
             abort: None,
@@ -255,6 +256,7 @@ async fn injected_custom_turn_cuts_whole_turns_the_double_row_splits() {
     registration.set_responses(vec![record_summary(seen.clone())]);
     let settings = |keep_recent_tokens: u64| super::super::compaction::CompactionSettings {
         keep_recent_tokens,
+        engine: crate::settings::CompactionEngine::Llm,
         ..Default::default()
     };
 
@@ -436,6 +438,7 @@ async fn split_turn_without_history_makes_only_the_prefix_call() {
             custom_instructions: None,
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
+                engine: crate::settings::CompactionEngine::Llm,
                 ..Default::default()
             },
             abort: None,
@@ -570,6 +573,7 @@ async fn a_split_turn_compaction_commits_both_summary_slices_before_its_entry() 
             custom_instructions: None,
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
+                engine: crate::settings::CompactionEngine::Llm,
                 ..Default::default()
             },
             abort: None,
@@ -674,6 +678,7 @@ async fn an_aborted_compaction_fails_its_slices_and_records_cancelled() {
             custom_instructions: None,
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
+                engine: crate::settings::CompactionEngine::Llm,
                 ..Default::default()
             },
             abort: Some(&signal),

@@ -1920,7 +1920,8 @@ async fn tui_compact_shows_the_loader_then_the_summary_and_rebuilds() {
     // The settings-pinned cut budget keeps the run small on the same keep-recent cut.
     std::fs::write(
         agent_dir.join("settings.json"),
-        serde_json::json!({ "compaction": { "keepRecentTokens": 10 } }).to_string(),
+        serde_json::json!({ "compaction": { "engine": "llm", "keepRecentTokens": 10 } })
+            .to_string(),
     )
     .expect("write settings");
     let supervisor = spawn_supervisor(dir.path());

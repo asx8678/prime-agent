@@ -44,7 +44,7 @@ fn write_compaction_settings(dir: &std::path::Path, reserve_tokens: u64) {
     std::fs::create_dir_all(dir.join("agent")).unwrap();
     std::fs::write(
         dir.join("agent").join("settings.json"),
-        serde_json::json!({ "compaction": { "enabled": true, "reserveTokens": reserve_tokens, "keepRecentTokens": 10 } })
+        serde_json::json!({ "compaction": { "engine": "llm", "enabled": true, "reserveTokens": reserve_tokens, "keepRecentTokens": 10 } })
             .to_string(),
     )
     .unwrap();

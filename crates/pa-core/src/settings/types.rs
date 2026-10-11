@@ -93,10 +93,10 @@ pub enum AutonomousLimitSetting {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompactionEngine {
-    /// A model writes the summary.
-    #[default]
+    /// A model writes the summary (the TS product's compaction).
     Llm,
     /// The summary is built from the session log without a model call.
+    #[default]
     Deterministic,
 }
 

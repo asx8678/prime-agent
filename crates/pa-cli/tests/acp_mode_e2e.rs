@@ -1943,6 +1943,7 @@ fn spawn_with_compaction_settings(
         home.path().join(".prime/agent/settings.json"),
         json!({
             "compaction": {
+                "engine": "llm",
                 "enabled": true,
                 "reserveTokens": reserve_tokens,
                 "keepRecentTokens": keep_recent_tokens,

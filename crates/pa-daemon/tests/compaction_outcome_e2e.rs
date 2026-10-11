@@ -386,7 +386,7 @@ fn forced_failed_auto_compaction_records_the_durable_outcome_row() {
     // puts the combined ceiling at 119_808 on the 128k window — the 126_010 crossing fires.
     std::fs::write(
         agent_dir.join("settings.json"),
-        json!({ "compaction": {"enabled": true, "reserveTokens": 500, "keepRecentTokens": 10} })
+        json!({ "compaction": {"engine": "llm", "enabled": true, "reserveTokens": 500, "keepRecentTokens": 10} })
             .to_string(),
     )
     .expect("write settings.json");

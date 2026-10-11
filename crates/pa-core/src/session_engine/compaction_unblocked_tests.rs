@@ -98,6 +98,7 @@ async fn held_engine(persisted: bool, turns: usize) -> (Arc<AgentSession>, tempf
     let engine = AgentSession::new(agent, manager, Vec::new()).await.unwrap();
     engine.set_compaction_settings(crate::session_engine::compaction::CompactionSettings {
         keep_recent_tokens: 12,
+        engine: crate::settings::CompactionEngine::Llm,
         ..Default::default()
     });
     (Arc::new(engine), tmp)

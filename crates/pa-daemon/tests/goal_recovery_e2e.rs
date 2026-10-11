@@ -202,7 +202,7 @@ fn setup(name: &str) -> Harness {
     std::fs::write(
         agent_dir.join("settings.json"),
         json!({
-            "compaction": { "enabled": true, "keepRecentTokens": 10, "reserveTokens": 100 }
+            "compaction": { "engine": "llm", "enabled": true, "keepRecentTokens": 10, "reserveTokens": 100 }
         })
         .to_string(),
     )

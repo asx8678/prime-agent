@@ -932,7 +932,7 @@ mod tests {
     }
 
     fn no_compaction() -> Value {
-        json!({ "compaction": { "enabled": false } })
+        json!({ "compaction": { "engine": "llm", "enabled": false } })
     }
 
     /// The context row lands ahead of the user row (its slot still zero), and the
@@ -1246,6 +1246,7 @@ mod tests {
             model_script,
             json!({
                 "compaction": {
+                    "engine": "llm",
                     "enabled": true,
                     "reserveTokens": 1,
                     "keepRecentTokens": 10,

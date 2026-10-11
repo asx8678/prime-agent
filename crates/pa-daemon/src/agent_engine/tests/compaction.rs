@@ -178,6 +178,7 @@ fn threshold_compaction_stays_on_the_session_provider_after_a_resolution_drift()
                 "defaultProvider": default_provider,
                 "defaultModel": default_model,
                 "compaction": {
+                    "engine": "llm",
                     "enabled": true,
                     "reserveTokens": reserve_tokens,
                     "keepRecentTokens": 10,

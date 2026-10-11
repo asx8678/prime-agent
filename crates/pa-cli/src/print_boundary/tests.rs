@@ -32,7 +32,7 @@ const OVERFLOW_ERROR: &str = "prompt is too long: 213462 tokens > 200000 maximum
 /// The compactable compaction settings: the `keepRecentTokens` cut
 /// keeps ~10 tokens, so a recovery with pre-cut history summarizes it.
 fn compactable_settings() -> Value {
-    json!({ "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 } })
+    json!({ "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 } })
 }
 
 /// One faux-driven engine over its own tempdir with explicit compaction
@@ -381,6 +381,7 @@ async fn overflow_recovery_skip_surfaces_the_warning_row() {
         }),
         json!({
             "compaction": {
+                "engine": "llm",
                 "enabled": true, "reserveTokens": 1, "keepRecentTokens": 100_000
             }
         }),
@@ -426,7 +427,7 @@ async fn stale_overflow_error_recovers_before_the_next_prompt_after_a_resume() {
     let (engine_a, dir_a, model_a) = faux_engine_with_settings(
         json!({ "responses": [{"text": "seed reply"}, overflow_error(0)] }),
         json!({
-            "compaction": { "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
+            "compaction": { "engine": "llm", "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
         None,
     )
@@ -712,6 +713,7 @@ async fn requested_compaction_skip_streams_the_warning_row_and_end_event() {
         json!({ "responses": [{"text": "seed reply"}] }),
         json!({
             "compaction": {
+                "engine": "llm",
                 "enabled": true, "reserveTokens": 1, "keepRecentTokens": 100_000
             }
         }),
@@ -894,6 +896,7 @@ async fn threshold_compaction_counts_into_the_run_telemetry() {
         }),
         json!({
             "compaction": {
+                "engine": "llm",
                 "enabled": true,
                 "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
                 "keepRecentTokens": 10
@@ -970,6 +973,7 @@ async fn multi_compaction_run_counts_every_arm() {
         }),
         json!({
             "compaction": {
+                "engine": "llm",
                 "enabled": true,
                 "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
                 "keepRecentTokens": 10
@@ -1049,6 +1053,7 @@ async fn threshold_compaction_streams_the_ts_event_pair() {
     let headroom = baseline + big_tokens / 2;
     let settings = json!({
         "compaction": {
+            "engine": "llm",
             "enabled": true,
             "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
             "keepRecentTokens": 10,
@@ -1214,7 +1219,7 @@ async fn pre_turn_threshold_arm_compacts_a_resumed_session_before_the_prompt() {
             "responses": [{"text": "seed reply"}, {"text": "crossing reply"}],
         }),
         json!({
-            "compaction": { "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
+            "compaction": { "engine": "llm", "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
         None,
     )
@@ -1253,7 +1258,7 @@ async fn pre_turn_threshold_arm_compacts_a_resumed_session_before_the_prompt() {
             "responses": [{"text": "the resumed summary"}, {"text": "recovered after the resume"}],
         }),
         json!({
-            "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
+            "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
         Some(resumed),
     )
@@ -1753,7 +1758,7 @@ async fn auto_refine_disabled_settings_drop_the_trigger() {
             ]
         }),
         json!({
-            "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 },
+            "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 },
             "autoRefine": { "enabled": false }
         }),
         None,
@@ -1841,7 +1846,7 @@ async fn overflow_error_with_compaction_disabled_ends_without_recovery() {
             ]
         }),
         json!({
-            "compaction": { "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
+            "compaction": { "engine": "llm", "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
         None,
     )

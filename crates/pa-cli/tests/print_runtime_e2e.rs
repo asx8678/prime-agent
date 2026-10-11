@@ -409,7 +409,7 @@ fn overflow_error(delay_ms: u64) -> serde_json::Value {
 /// `keepRecentTokens` keeps ~10 tokens, so recovery with pre-cut history summarizes it.
 fn compactable_settings() -> serde_json::Value {
     serde_json::json!({
-        "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
+        "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
     })
 }
 
@@ -516,7 +516,7 @@ fn print_mode_overflow_skip_surfaces_the_warning_row() {
     write_compaction_settings(
         home.path(),
         &serde_json::json!({
-            "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 100_000 }
+            "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 100_000 }
         }),
     );
     let script = serde_json::json!({ "responses": [overflow_error(0)] });
@@ -642,7 +642,7 @@ fn print_mode_stale_overflow_recovers_before_the_next_prompt_after_a_resume() {
     write_compaction_settings(
         home.path(),
         &serde_json::json!({
-            "compaction": { "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
+            "compaction": { "engine": "llm", "enabled": false, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
     );
     let script = serde_json::json!({
@@ -804,7 +804,7 @@ fn print_mode_json_streams_the_threshold_compaction_pair() {
     write_compaction_settings(
         home.path(),
         &serde_json::json!({
-            "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
+            "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
     );
     // A small context window: the ~8.1k seed turn stays below the 15_808

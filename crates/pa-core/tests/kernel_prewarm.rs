@@ -138,7 +138,7 @@ async fn prewarmed_kernel_lands_compaction_notice_without_tool_use() {
     std::fs::write(
         agent_dir.join("settings.json"),
         serde_json::json!({
-            "compaction": { "enabled": true, "reserveTokens": 1000, "keepRecentTokens": 10 }
+            "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1000, "keepRecentTokens": 10 }
         })
         .to_string(),
     )

@@ -630,7 +630,7 @@ fn write_fixture(agent_dir: &Path, session_dir: &Path, mock_url: &str) {
     .expect("write models.json");
     std::fs::write(
         agent_dir.join("settings.json"),
-        json!({ "compaction": {"enabled": true, "reserveTokens": 500, "keepRecentTokens": 10} })
+        json!({ "compaction": {"engine": "llm", "enabled": true, "reserveTokens": 500, "keepRecentTokens": 10} })
             .to_string(),
     )
     .expect("write settings.json");
