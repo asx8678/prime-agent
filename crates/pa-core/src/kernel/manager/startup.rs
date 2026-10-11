@@ -183,6 +183,17 @@ impl Inner {
                 "1".to_string(),
             );
         }
+        // Empty PYTHONPATH entries resolve to the cwd at import time, which
+        // would re-enable the project-package shadowing above; real entries
+        // stay honored.
+        if let Some(pythonpath) = env.get("PYTHONPATH").cloned() {
+            let stripped = crate::kernel::python_env::strip_empty_pythonpath_entries(&pythonpath);
+            if stripped.is_empty() {
+                env.remove("PYTHONPATH");
+            } else {
+                env.insert("PYTHONPATH".to_string(), stripped);
+            }
+        }
         env.insert(
             "PRIME_AGENT_KERNEL_OWNER_PID".to_string(),
             std::process::id().to_string(),

@@ -16,10 +16,12 @@ fn run_quiet(command: &str, args: &[&str]) -> bool {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        // `-c` puts the process cwd (the user's project) first on sys.path;
-        // the probe's `import rlm` must not run a project's own package.
-        .env("PYTHONSAFEPATH", "1");
+        .stderr(Stdio::null());
+    // `-c` puts the process cwd (the user's project) first on sys.path;
+    // the probe's `import rlm` must not run a project's own package. The
+    // same protection drops empty PYTHONPATH entries, which resolve to the
+    // cwd at import time and would re-enable that shadowing.
+    crate::kernel::python_env::protect_user_project_imports(&mut child);
     // Hidden window on Windows (TS `spawnHidden`).
     crate::platform::process::set_no_window(&mut child);
     matches!(child.status(), Ok(status) if status.success())

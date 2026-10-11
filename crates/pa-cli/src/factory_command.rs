@@ -267,6 +267,18 @@ fn resolve_kernel_python() -> Result<PathBuf, String> {
 
 /// Drive one `rlm.factory.cli_dispatch` payload through the kernel Python.
 fn dispatch_via_kernel(python: &std::path::Path, payload: &Value) -> Result<Value, String> {
+    dispatch_via_kernel_in(python, payload, None)
+}
+
+/// The cwd-taking core of [`dispatch_via_kernel`]: the dispatch runs the
+/// kernel Python with `-c` in a user project directory, so it needs the
+/// same import protection the kernel start applies (and the tests can
+/// point it at a planted project).
+fn dispatch_via_kernel_in(
+    python: &std::path::Path,
+    payload: &Value,
+    cwd: Option<&std::path::Path>,
+) -> Result<Value, String> {
     let mut child = Command::new(python);
     child
         .args(["-c", CLI_DISPATCH_RUNNER])
@@ -275,6 +287,13 @@ fn dispatch_via_kernel(python: &std::path::Path, payload: &Value) -> Result<Valu
         .stderr(Stdio::piped());
     // Hidden window on Windows, matching the kernel probes.
     pa_core::platform::process::set_no_window(&mut child);
+    // `-c` puts the process cwd (the user's project) first on sys.path, so a
+    // planted `rlm` package would run instead of the installed runtime; the
+    // same import protection the kernel start and probe apply belongs here.
+    pa_core::kernel::python_env::protect_user_project_imports(&mut child);
+    if let Some(cwd) = cwd {
+        child.current_dir(cwd);
+    }
     let mut child = child
         .spawn()
         .map_err(|error| format!("failed to run the kernel python: {error}"))?;
@@ -529,5 +548,59 @@ mod tests {
         let result: Value = serde_json::from_str(r#"{"ok": true, "machines": [], "warnings": []}"#)
             .expect("fixture");
         assert_eq!(render_list(&result, false), 0);
+    }
+
+    /// The kernel Python with prime-agent-runtime installed (ambient
+    /// product state, the auto-bootstrapped kernel venv); skipped with a
+    /// note on machines without a live install, like the pa-core kernel
+    /// verifier tests.
+    fn ambient_kernel_python() -> Option<PathBuf> {
+        if let Some(explicit) = std::env::var_os("PA_CORE_KERNEL_PYTHON") {
+            let explicit = PathBuf::from(explicit);
+            assert!(
+                explicit.exists(),
+                "PA_CORE_KERNEL_PYTHON {} not found",
+                explicit.display()
+            );
+            return Some(explicit);
+        }
+        let candidate = PathBuf::from(std::env::var("HOME").map_or_else(
+            |_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string(),
+            |home| format!("{home}/.prime/agent/kernel-venv/bin/python"),
+        ));
+        if candidate.exists() {
+            Some(candidate)
+        } else {
+            eprintln!(
+                "kernel python {} not found; skipping the live factory dispatch test",
+                candidate.display()
+            );
+            None
+        }
+    }
+
+    #[test]
+    fn factory_dispatch_survives_a_planted_project_rlm_package() {
+        let Some(python) = ambient_kernel_python() else {
+            return;
+        };
+        let project = tempfile::tempdir().expect("tempdir");
+        let marker = project.path().join("shadowed.marker");
+        std::fs::create_dir(project.path().join("rlm")).expect("create rlm package");
+        std::fs::write(
+            project.path().join("rlm/__init__.py"),
+            format!("open({:?}, 'w').close()\n", marker.display().to_string()),
+        )
+        .expect("plant rlm package");
+        let result = dispatch_via_kernel_in(&python, &list_payload(), Some(project.path()))
+            .expect("the factory dispatch must survive a planted rlm package");
+        assert!(
+            !marker.exists(),
+            "the project's rlm package ran in the factory dispatch"
+        );
+        assert!(
+            result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "the dispatch must answer a list payload, got {result}"
+        );
     }
 }
