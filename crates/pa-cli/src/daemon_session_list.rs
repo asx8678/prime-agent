@@ -272,9 +272,11 @@ pub(crate) fn parse_iso_ms(text: &str) -> Option<u64> {
     let (time, offset_ms) = if let Some(time) = rest.strip_suffix('Z') {
         (time, 0i64)
     } else {
-        let index = rest
-            .rfind('+')
-            .or_else(|| rest[1..].rfind('-').map(|i| i + 1))?;
+        let index = rest.rfind('+').or_else(|| {
+            rest.get(1..)
+                .and_then(|after| after.rfind('-'))
+                .map(|i| i + 1)
+        })?;
         let offset = parse_offset(&rest[index..])?;
         (&rest[..index], offset)
     };
@@ -479,6 +481,16 @@ mod tests {
             "1w"
         );
         assert_eq!(format_session_age(None, now), "");
+    }
+
+    #[test]
+    fn iso_parse_rejects_short_and_multibyte_time_parts() {
+        assert_eq!(parse_iso_ms("2024-01-01T"), None);
+        assert_eq!(parse_iso_ms("2024-01-01Té"), None);
+        assert_eq!(
+            parse_iso_ms("2024-01-01T00:00:00Z"),
+            Some(1_704_067_200_000)
+        );
     }
 
     #[test]
