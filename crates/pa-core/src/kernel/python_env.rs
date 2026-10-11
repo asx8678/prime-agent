@@ -16,6 +16,12 @@
 //! still shadow the runtime — detecting that would mean inspecting
 //! project contents, which is out of scope here.
 //!
+//! A user's set-but-empty `PYTHONSAFEPATH=` reaches `bash()` children as
+//! unset instead of being restored verbatim: Python treats the two
+//! identically (`sys.flags.safe_path` is False either way), so a second
+//! record-and-restore pair would add wire surface for no observable
+//! difference.
+//!
 //! The module is crate-internal except for
 //! [`protect_user_project_imports`], which pa-cli's factory dispatch
 //! needs (re-exported at the kernel facade).
@@ -24,7 +30,7 @@
 /// pops the pair at the very start of `rlm.repl.main()` before any cell or
 /// `bash()` child can inherit them, so a PYTHONSAFEPATH the user set
 /// themselves (no marker) survives.
-pub(crate) const HOST_SAFEPATH_MARKER_ENV: &str = "PRIME_AGENT_KERNEL_SAFEPATH";
+const HOST_SAFEPATH_MARKER_ENV: &str = "PRIME_AGENT_KERNEL_SAFEPATH";
 
 /// The original PYTHONPATH the host records next to the entries it strips
 /// from the kernel's environment. The runtime pops it at the very start of
@@ -33,14 +39,66 @@ pub(crate) const HOST_SAFEPATH_MARKER_ENV: &str = "PRIME_AGENT_KERNEL_SAFEPATH";
 /// strip protects the runtime's own imports, not the agent's commands.
 /// Always written when the host applies its protection, so a stale inherited
 /// value can never survive into a fresh kernel.
-pub(crate) const HOST_PYTHONPATH_ENV: &str = "PRIME_AGENT_KERNEL_PYTHONPATH";
+const HOST_PYTHONPATH_ENV: &str = "PRIME_AGENT_KERNEL_PYTHONPATH";
 
 /// Sentinel recorded in [`HOST_PYTHONPATH_ENV`] when PYTHONPATH was unset:
 /// a leading `\u{1}` cannot occur in a real path list (Windows forbids
 /// control characters in filenames; on every platform it is not a path
 /// anyone sets). Must stay byte-identical to `_HOST_PYTHONPATH_UNSET` in
 /// `prime-agent-runtime/src/rlm/repl.py`.
-pub(crate) const HOST_PYTHONPATH_UNSET: &str = "\u{1}";
+const HOST_PYTHONPATH_UNSET: &str = "\u{1}";
+
+/// The delimiter `CPython` splits PYTHONPATH on: the platform separator,
+/// byte against byte, with no quoting convention. Rust's
+/// `std::env::split_paths`/`join_paths` follow PATH's double-quote rules
+/// instead — on Windows `C:\a";.;"C:\b` is one entry to them but three to
+/// Python, including `.`, which would bypass the strip — so the raw
+/// delimiter is the only faithful mirror of what the interpreter does
+/// with the value.
+const PYTHONPATH_DELIMITER: &str = if cfg!(windows) { ";" } else { ":" };
+
+/// Split a PYTHONPATH value the way `CPython` does: on the raw platform
+/// delimiter (see [`PYTHONPATH_DELIMITER`]), no quote handling.
+fn split_pythonpath(value: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
+    // The delimiter is one ASCII byte, so it can never appear inside a
+    // multi-byte sequence of the platform encoding: every split below
+    // lands on an encoding boundary.
+    let bytes = value.as_encoded_bytes();
+    let delimiter = PYTHONPATH_DELIMITER.as_bytes()[0];
+    let mut entries = Vec::new();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == delimiter {
+            // SAFETY: the subslice starts at `bytes`' own start or right
+            // after a delimiter byte, and ends on one, so it is a whole
+            // number of encoded code points.
+            entries.push(
+                unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes[start..index]) }
+                    .to_owned(),
+            );
+            start = index + 1;
+        }
+    }
+    // SAFETY: the final entry starts on the same kind of boundary.
+    entries
+        .push(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes[start..]) }.to_owned());
+    entries
+}
+
+/// Join PYTHONPATH entries back on the raw platform delimiter. Unlike
+/// `std::env::join_paths` this cannot fail — any byte sequence is
+/// expressible — but an entry that itself contains the delimiter is
+/// indistinguishable from two entries, exactly the ambiguity Python has.
+fn join_pythonpath(entries: &[std::ffi::OsString]) -> std::ffi::OsString {
+    let mut joined = std::ffi::OsString::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            joined.push(std::ffi::OsStr::new(PYTHONPATH_DELIMITER));
+        }
+        joined.push(entry);
+    }
+    joined
+}
 
 /// Drop PYTHONPATH entries that resolve to the child's working directory:
 /// the common `export PYTHONPATH=$PYTHONPATH:/x` yields ":/x", and an
@@ -56,61 +114,64 @@ pub(crate) const HOST_PYTHONPATH_UNSET: &str = "\u{1}";
 /// runtime; detecting that would mean inspecting project contents, not
 /// path hygiene.
 #[must_use]
-pub(crate) fn strip_cwd_resolving_pythonpath_entries(
+fn strip_cwd_resolving_pythonpath_entries(
     value: &std::ffi::OsStr,
     cwd: Option<&std::path::Path>,
 ) -> Option<std::ffi::OsString> {
-    let kept: Vec<std::path::PathBuf> = std::env::split_paths(value)
+    // The identities the cwd can compare under, computed once for every
+    // entry checked below.
+    let cwd_identities: Vec<std::path::PathBuf> = cwd.map(path_identities).unwrap_or_default();
+    let kept: Vec<std::ffi::OsString> = split_pythonpath(value)
+        .into_iter()
         .filter(|entry| {
-            !entry.as_os_str().is_empty()
-                && !cwd.is_some_and(|cwd| entry_resolves_to_cwd(entry, cwd))
+            // An empty entry resolves to the child's cwd at import time.
+            if entry.is_empty() {
+                return false;
+            }
+            let Some(cwd) = cwd else {
+                // No cwd to judge against: keep the entry.
+                return true;
+            };
+            // An entry resolves to `cwd` literally, through `.`, `./` or
+            // `sub/..`, or as the absolute path. Existing paths compare
+            // canonically (symlinks included); the lexical identity in
+            // [`path_identities`] covers paths that do not exist yet,
+            // where the OS cannot canonicalize.
+            let entry_path = std::path::Path::new(entry);
+            let joined = if entry_path.is_absolute() {
+                entry_path.to_path_buf()
+            } else {
+                cwd.join(entry_path)
+            };
+            !path_identities(&joined)
+                .iter()
+                .any(|identity| cwd_identities.contains(identity))
         })
         .collect();
-    // join_paths fails only when a kept entry itself contains the platform
-    // separator (possible on Unix): such a value cannot be expressed as a
-    // PYTHONPATH at all, so drop the whole variable rather than risk
-    // re-enabling the shadowing. An empty join (every entry dropped) is the
-    // same case: PYTHONPATH="" is not "unset" to Python — it adds the cwd
-    // back — so the variable must be removed entirely.
-    match std::env::join_paths(kept) {
-        Ok(joined) if !joined.is_empty() => Some(joined),
-        _ => None,
+    if kept.is_empty() {
+        // Every entry dropped: the variable must be removed entirely.
+        // Python 3.11+ treats an empty PYTHONPATH exactly like an unset
+        // one (it is `PYTHONPATH=:` that puts the cwd back on sys.path),
+        // and an older interpreter — one that ignores PYTHONSAFEPATH —
+        // would read an empty entry as the cwd, so removal is the safe
+        // form everywhere.
+        None
+    } else {
+        Some(join_pythonpath(&kept))
     }
 }
 
-/// True when a PYTHONPATH entry resolves to `cwd`: literally, through
-/// `.`, `./` or `sub/..`, or as the absolute path. Existing paths compare
-/// canonically (symlinks included); the lexical fallback covers paths
-/// that do not exist yet, where the OS cannot canonicalize.
-fn entry_resolves_to_cwd(entry: &std::path::Path, cwd: &std::path::Path) -> bool {
-    let joined = if entry.is_absolute() {
-        entry.to_path_buf()
-    } else {
-        cwd.join(entry)
-    };
-    let cwd_identities = path_identities(cwd);
-    path_identities(&joined)
-        .iter()
-        .any(|identity| cwd_identities.contains(identity))
-}
-
 /// The identities a path can compare under: the canonical form when the
-/// path exists, and the lexically normalized absolute form (`.`, `..` and
-/// duplicate separators collapsed without resolving symlinks).
+/// path exists, and the absolute form with `.`, `..` and duplicate
+/// separators collapsed purely lexically — no filesystem access, no
+/// symlink resolution (`std::path::absolute` already normalizes on
+/// Windows; on Unix it does not, so the component walk does it) — which
+/// covers paths that do not exist yet, where the OS cannot canonicalize.
 fn path_identities(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut identities = Vec::new();
     if let Ok(canon) = std::fs::canonicalize(path) {
         identities.push(canon);
     }
-    identities.push(lexical_absolute(path));
-    identities
-}
-
-/// The absolute form of a path with `.`, `..` and duplicate separators
-/// collapsed, purely lexically: no filesystem access, no symlink
-/// resolution (`std::path::absolute` already normalizes on Windows; on
-/// Unix it does not, so the component walk does it).
-fn lexical_absolute(path: &std::path::Path) -> std::path::PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut normalized = std::path::PathBuf::new();
     for component in absolute.components() {
@@ -119,10 +180,42 @@ fn lexical_absolute(path: &std::path::Path) -> std::path::PathBuf {
             std::path::Component::ParentDir => {
                 normalized.pop();
             }
-            other => normalized.push(other.as_os_str()),
+            std::path::Component::RootDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
         }
     }
-    normalized
+    identities.push(normalized);
+    identities
+}
+
+/// Environment lookup for the variable names `CPython` itself reads: exact
+/// on Unix, case-insensitive on Windows, where `PythonPath` is the same
+/// variable as `PYTHONPATH`.
+fn env_lookup(env: &std::collections::HashMap<String, String>, name: &str) -> Option<String> {
+    if cfg!(windows) {
+        env.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    } else {
+        env.get(name).cloned()
+    }
+}
+
+/// Remove `name` under every casing Windows considers its equal (on
+/// case-sensitive platforms a plain exact remove).
+fn env_remove(env: &mut std::collections::HashMap<String, String>, name: &str) {
+    if cfg!(windows) {
+        env.retain(|key, _| !key.eq_ignore_ascii_case(name));
+    } else {
+        env.remove(name);
+    }
+}
+
+/// Set `name` to `value`, replacing whatever casing it was set under.
+fn env_set(env: &mut std::collections::HashMap<String, String>, name: &str, value: &str) {
+    env_remove(env, name);
+    env.insert(name.to_string(), value.to_string());
 }
 
 /// Apply the kernel-start import protection to the environment map the
@@ -145,39 +238,23 @@ pub(crate) fn protect_kernel_env(
     env: &mut std::collections::HashMap<String, String>,
     cwd: Option<&std::path::Path>,
 ) {
-    if env
-        .get("PYTHONSAFEPATH")
-        .is_some_and(|value| !value.is_empty())
-    {
-        env.remove(HOST_SAFEPATH_MARKER_ENV);
+    if env_lookup(env, "PYTHONSAFEPATH").is_some_and(|value| !value.is_empty()) {
+        env_remove(env, HOST_SAFEPATH_MARKER_ENV);
     } else {
-        env.insert("PYTHONSAFEPATH".to_string(), "1".to_string());
-        env.insert(HOST_SAFEPATH_MARKER_ENV.to_string(), "1".to_string());
+        env_set(env, "PYTHONSAFEPATH", "1");
+        env_set(env, HOST_SAFEPATH_MARKER_ENV, "1");
     }
-    match env.get("PYTHONPATH").cloned() {
+    match env_lookup(env, "PYTHONPATH") {
         Some(pythonpath) => {
-            env.insert(HOST_PYTHONPATH_ENV.to_string(), pythonpath.clone());
-            match strip_cwd_resolving_pythonpath_entries(
-                std::ffi::OsStr::new(pythonpath.as_str()),
-                cwd,
-            ) {
-                Some(stripped) => {
-                    env.insert(
-                        "PYTHONPATH".to_string(),
-                        stripped.to_string_lossy().into_owned(),
-                    );
-                }
-                None => {
-                    env.remove("PYTHONPATH");
-                }
+            env_set(env, HOST_PYTHONPATH_ENV, &pythonpath);
+            match strip_cwd_resolving_pythonpath_entries(std::ffi::OsStr::new(&pythonpath), cwd) {
+                // The map's values are String, so the lossy conversion
+                // never fires.
+                Some(stripped) => env_set(env, "PYTHONPATH", &stripped.to_string_lossy()),
+                None => env_remove(env, "PYTHONPATH"),
             }
         }
-        None => {
-            env.insert(
-                HOST_PYTHONPATH_ENV.to_string(),
-                HOST_PYTHONPATH_UNSET.to_string(),
-            );
-        }
+        None => env_set(env, HOST_PYTHONPATH_ENV, HOST_PYTHONPATH_UNSET),
     }
 }
 
@@ -215,11 +292,15 @@ pub fn protect_user_project_imports(command: &mut std::process::Command) {
 mod tests {
     use super::*;
 
-    /// Build a PYTHONPATH value with the platform separator, so the test
-    /// is correct on Unix and Windows alike.
+    /// Build a PYTHONPATH value with the raw platform delimiter, the way
+    /// Python reads one back.
     fn pythonpath(entries: &[&str]) -> std::ffi::OsString {
-        std::env::join_paths(entries.iter().map(std::path::Path::new))
-            .expect("entries without the platform separator")
+        join_pythonpath(
+            &entries
+                .iter()
+                .map(|entry| std::ffi::OsString::from(*entry))
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// The stripped PYTHONPATH for these entries, as text (the inputs are
@@ -275,6 +356,77 @@ mod tests {
         assert_eq!(
             stripped(&["sub", "/x"], cwd),
             Some(pythonpath(&["sub", "/x"]).to_string_lossy().into_owned())
+        );
+    }
+
+    /// The split/join pair mirrors Python exactly: the raw platform
+    /// delimiter, nothing else, so a value rebuilt from entries reads
+    /// back as those entries.
+    #[test]
+    fn split_and_join_round_trip_on_the_raw_platform_delimiter() {
+        let entries = ["", ".", "/x", ""];
+        let joined = pythonpath(&entries);
+        assert_eq!(
+            split_pythonpath(&joined),
+            entries
+                .iter()
+                .map(|entry| std::ffi::OsString::from(*entry))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `CPython` applies no quote handling: `C:\a";.;"C:\b` is three entries
+    /// to Python, the middle one the cwd. `std::env::split_paths` follows
+    /// PATH's double-quote convention and would see one entry, keeping the
+    /// cwd entry and bypassing the strip.
+    #[test]
+    #[cfg(windows)]
+    fn quoted_cwd_entries_split_like_python_splits_them() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let cwd = project.path();
+        let value = std::ffi::OsString::from(r#"C:\a";.;"C:\b"#);
+        assert_eq!(
+            split_pythonpath(&value),
+            [
+                std::ffi::OsString::from(r#"C:\a""#),
+                std::ffi::OsString::from("."),
+                std::ffi::OsString::from(r#""C:\b"#),
+            ]
+        );
+        assert_eq!(
+            strip_cwd_resolving_pythonpath_entries(&value, Some(cwd)),
+            Some(pythonpath(&[r#"C:\a""#, r#""C:\b"#])),
+            "the quoted `.` entry is the cwd and must be dropped"
+        );
+    }
+
+    /// Windows environment names are case-insensitive: a mixed-case
+    /// `PythonPath` is the same variable and must be handled where it
+    /// stands, not duplicated under the canonical spelling.
+    #[test]
+    #[cfg(windows)]
+    fn mixed_case_env_names_are_handled() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let mut env = std::collections::HashMap::new();
+        env.insert("PythonSafePath".to_string(), "1".to_string());
+        env.insert("PythonPath".to_string(), ".".to_string());
+        protect_kernel_env(&mut env, Some(project.path()));
+        // The user's safepath stayed, marker-free.
+        assert_eq!(env_lookup(&env, "PYTHONSAFEPATH").as_deref(), Some("1"));
+        assert!(env
+            .iter()
+            .all(|(key, _)| !key.eq_ignore_ascii_case(HOST_SAFEPATH_MARKER_ENV)));
+        // The mixed-case PYTHONPATH was recorded, fully stripped (a lone
+        // `.`), and removed under its own casing.
+        assert_eq!(
+            env.get(HOST_PYTHONPATH_ENV).map(String::as_str),
+            Some("."),
+            "the original is recorded under the host's own name"
+        );
+        assert!(
+            env.iter()
+                .all(|(key, _)| !key.eq_ignore_ascii_case("PYTHONPATH")),
+            "the mixed-case PYTHONPATH was removed, not duplicated"
         );
     }
 }
