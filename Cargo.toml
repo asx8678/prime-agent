@@ -21,6 +21,7 @@ crossterm = { path = "vendor/crossterm" }
 [workspace.package]
 version = "0.10.0"
 edition = "2021"
+rust-version = "1.99"
 license = "MIT"
 
 [workspace.dependencies]
