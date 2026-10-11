@@ -165,9 +165,18 @@ impl Inner {
 
         // bash.py journals its process groups under this pid so the host can
         // reap them if the runtime dies without running its shutdown hook.
-        let mut env: HashMap<String, String> = std::env::vars().collect();
+        // Collected with `vars_os()`, not `vars()`: a variable the process
+        // holds that is not representable as UTF-8 (an exported shell
+        // function or locale value) would panic there and kill the start,
+        // and the child command takes `OsString` values, so every variable
+        // is passed through exactly as the process holds it.
+        let mut env: HashMap<std::ffi::OsString, std::ffi::OsString> =
+            std::env::vars_os().collect();
         for (key, value) in &self.options.env {
-            env.insert(key.clone(), value.clone());
+            env.insert(
+                std::ffi::OsString::from(key.as_str()),
+                std::ffi::OsString::from(value.as_str()),
+            );
         }
         // The session cwd the kernel runs in: the explicit option, else the
         // inherited process cwd (the import protection must judge PYTHONPATH
@@ -188,8 +197,8 @@ impl Inner {
         // python_env, one implementation shared with the `-c` sites.
         crate::kernel::python_env::protect_kernel_env(&mut env, cwd.as_deref());
         env.insert(
-            "PRIME_AGENT_KERNEL_OWNER_PID".to_string(),
-            std::process::id().to_string(),
+            std::ffi::OsString::from("PRIME_AGENT_KERNEL_OWNER_PID"),
+            std::process::id().to_string().into(),
         );
         let mut command = tokio::process::Command::new(&python);
         command

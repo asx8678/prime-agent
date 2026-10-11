@@ -138,25 +138,37 @@ fn path_identities(path: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Environment lookup for the variable names `CPython` itself reads.
-fn env_lookup(env: &std::collections::HashMap<String, String>, name: &str) -> Option<String> {
-    env.get(name).cloned()
+fn env_lookup(
+    env: &std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
+    name: &str,
+) -> Option<std::ffi::OsString> {
+    env.get(std::ffi::OsStr::new(name)).cloned()
 }
 
 /// Remove `name` from the map.
-fn env_remove(env: &mut std::collections::HashMap<String, String>, name: &str) {
-    env.remove(name);
+fn env_remove(
+    env: &mut std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
+    name: &str,
+) {
+    env.remove(std::ffi::OsStr::new(name));
 }
 
 /// Set `name` to `value`, replacing any earlier value under that name.
-fn env_set(env: &mut std::collections::HashMap<String, String>, name: &str, value: &str) {
+fn env_set(
+    env: &mut std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
+    name: &str,
+    value: &std::ffi::OsStr,
+) {
     env_remove(env, name);
-    env.insert(name.to_string(), value.to_string());
+    env.insert(name.into(), value.to_os_string());
 }
 
 /// Apply the kernel-start import protection to the environment map the
 /// kernel child receives — the single implementation behind
 /// `manager::startup`'s spawn (the `-c` sites use
-/// [`protect_user_project_imports`], sharing the strip below):
+/// [`protect_user_project_imports`], sharing the strip below). The map is
+/// built from `vars_os()`, so a PYTHONPATH the process holds in non-UTF-8
+/// bytes is recorded and restored verbatim, never lossily:
 ///
 /// * `PYTHONSAFEPATH=1` is injected with the [`HOST_SAFEPATH_MARKER_ENV`]
 ///   marker unless the user set a non-empty value themselves (an empty
@@ -170,26 +182,28 @@ fn env_set(env: &mut std::collections::HashMap<String, String>, name: &str, valu
 ///   stripped value. Recording always happens so a stale inherited value
 ///   can never survive into a fresh kernel.
 pub(crate) fn protect_kernel_env(
-    env: &mut std::collections::HashMap<String, String>,
+    env: &mut std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
     cwd: Option<&std::path::Path>,
 ) {
     if env_lookup(env, "PYTHONSAFEPATH").is_some_and(|value| !value.is_empty()) {
         env_remove(env, HOST_SAFEPATH_MARKER_ENV);
     } else {
-        env_set(env, "PYTHONSAFEPATH", "1");
-        env_set(env, HOST_SAFEPATH_MARKER_ENV, "1");
+        env_set(env, "PYTHONSAFEPATH", std::ffi::OsStr::new("1"));
+        env_set(env, HOST_SAFEPATH_MARKER_ENV, std::ffi::OsStr::new("1"));
     }
     match env_lookup(env, "PYTHONPATH") {
         Some(pythonpath) => {
             env_set(env, HOST_PYTHONPATH_ENV, &pythonpath);
-            match strip_cwd_resolving_pythonpath_entries(std::ffi::OsStr::new(&pythonpath), cwd) {
-                // The map's values are String, so the lossy conversion
-                // never fires.
-                Some(stripped) => env_set(env, "PYTHONPATH", &stripped.to_string_lossy()),
+            match strip_cwd_resolving_pythonpath_entries(&pythonpath, cwd) {
+                Some(stripped) => env_set(env, "PYTHONPATH", &stripped),
                 None => env_remove(env, "PYTHONPATH"),
             }
         }
-        None => env_set(env, HOST_PYTHONPATH_ENV, HOST_PYTHONPATH_UNSET),
+        None => env_set(
+            env,
+            HOST_PYTHONPATH_ENV,
+            std::ffi::OsStr::new(HOST_PYTHONPATH_UNSET),
+        ),
     }
 }
 

@@ -848,6 +848,47 @@ async fn a_stale_inherited_marker_never_pops_a_user_set_safepath() {
         .expect("shutdown");
 }
 
+/// A non-UTF-8 environment variable must not break kernel start: the
+/// child's env was collected with `std::env::vars()`, which panics on
+/// any variable not representable as UTF-8 (an exported shell function
+/// or locale name is fair game), and the panic surfaced as a failed
+/// start. The env map is built from `vars_os()` instead, and the child
+/// keeps the variable as-is.
+#[tokio::test]
+async fn kernel_starts_with_a_non_utf8_environment_variable() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(options) = test_options(None) else {
+        return;
+    };
+    let name = std::ffi::OsString::from("PA_KERNEL_TEST_NON_UTF8_ENV");
+    let value = std::ffi::OsStr::from_bytes(b"\xff\xfe not utf-8").to_os_string();
+    // The variable is process-global, so the name is unique to this test
+    // (no concurrent test reads it) and it is removed before any
+    // assertion can fail, keeping the leak out of the rest of the binary.
+    std::env::set_var(&name, &value);
+    let manager = ReplKernelManager::new(options);
+    let start = manager.start(KernelStartOptions::default()).await;
+    std::env::remove_var(&name);
+    start.expect("a non-UTF-8 environment variable must not break kernel start");
+
+    let result = execute(
+        &manager,
+        "import os\nb'PA_KERNEL_TEST_NON_UTF8_ENV' in os.environb and os.environb[b'PA_KERNEL_TEST_NON_UTF8_ENV'] == b'\\xff\\xfe not utf-8'",
+    )
+    .await;
+    assert_eq!(
+        (result.status, result.result.as_deref()),
+        (ExecuteStatus::Ok, Some("True")),
+        "the child must receive the non-UTF-8 variable as-is, cell: {:?}",
+        result.error
+    );
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
 /// The result clip budget counts characters, not bytes: the contract is
 /// "Cap stdout / stderr / result at this many characters"
 /// (`ExecuteOptions::max_output_chars`) and the stream paths already count
