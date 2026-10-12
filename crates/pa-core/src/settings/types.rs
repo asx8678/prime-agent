@@ -169,6 +169,21 @@ pub struct RepeatGuardSettings {
     pub block_at: Option<u64>,
 }
 
+/// `contextFolding`: the model may fold a finished sub-task out of its
+/// working context (`fold.begin` / `fold.end`); later requests carry only
+/// the fold's result. Rust-only and experimental: unset means off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextFoldingSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The estimated size (tokens) an open fold may reach before every
+    /// later result asks the model to close it (default 32768; 0 means the
+    /// default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fold_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderWaitSettings {
@@ -394,6 +409,7 @@ pub struct Settings {
     pub compaction: Option<CompactionSettings>,
     pub auto_refine: Option<AutoRefineSettings>,
     pub repeat_guard: Option<RepeatGuardSettings>,
+    pub context_folding: Option<ContextFoldingSettings>,
     pub agent_traces: Option<AgentTracesSettings>,
     pub factory: Option<FactorySettings>,
     pub telemetry: Option<TelemetrySettings>,

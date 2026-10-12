@@ -15,6 +15,7 @@ pub mod compaction;
 pub mod compaction_exec;
 pub mod compaction_trace;
 pub mod compaction_utils;
+pub mod context_fold;
 pub mod decision_api;
 pub mod engine;
 pub mod error_classify;

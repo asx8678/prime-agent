@@ -103,10 +103,16 @@ fn assistant_text(message: &AssistantMessage) -> String {
 /// ledger stays untouched). The run streams partial answers to `sink`
 /// (returning `false` aborts the run), honors `signal` for external
 /// aborts, and retries provider failures per `retry_policy`. It never
-/// mutates the parent agent or its history.
+/// mutates the parent agent or its history. `context_folding` is the main
+/// thread's request view, applied to the clone.
+// Each argument is a distinct input the daemon reads from a different owner
+// (agent, session wiring, request, policy, abort, sink); a bundle struct
+// would exist only for this call.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_side_question(
     parent: &Arc<Agent>,
     stream_fn: pa_agent::stream::StreamFn,
+    context_folding: super::context_fold::ContextFolding,
     question: &str,
     previous_turns: &[SideQuestionTurn],
     retry_policy: &ProviderRetryPolicy,
@@ -123,7 +129,9 @@ pub async fn run_side_question(
 
     // Each turn re-clones the live main conversation, so follow-ups always see
     // the newest main-thread context; earlier side turns replay after it.
-    let mut messages = parent_state.messages.clone();
+    // The clone gets the main thread's request view (context folding leaves
+    // closed folds out), so the side call shares its cached prefix.
+    let mut messages = context_folding.view(parent_state.messages.clone());
     for (index, turn) in previous_turns.iter().enumerate() {
         messages.push(pa_agent::types::AgentMessage::Standard(Message::User(
             UserMessage {
@@ -457,6 +465,8 @@ async fn assistant_turns_after(
 mod tests {
     use super::super::provider_retry::UNBOUNDED_BACKOFF_MS;
     use super::*;
+    use crate::session_engine::context_fold::tests::{assistant, begin, end, result, user};
+    use crate::session_engine::context_fold::ContextFolding;
     use crate::session_engine::tool_bridge::bridge_tool;
     use crate::tools::tool_definition::{ToolDefinition, ToolExecutionResult};
     use pa_agent::abort::AbortController;
@@ -562,6 +572,7 @@ mod tests {
         run_side_question(
             parent,
             stream_fn,
+            ContextFolding::Off,
             question,
             previous_turns,
             &fast_retry_policy(),
@@ -604,6 +615,62 @@ mod tests {
 
         // Side results never touch the parent history.
         assert_eq!(parent.state().await.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_side_question_sees_the_folded_view() {
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_text_turn("the side answer");
+        provider.push_text_turn("the side answer");
+        let history = vec![
+            user("main thread context"),
+            assistant(&["c1"]),
+            begin("c1"),
+            assistant(&["c2"]),
+            result("c2"),
+            assistant(&["c3"]),
+            end("c3"),
+        ];
+        let parent = Arc::new(Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                system_prompt: Some("main system prompt".to_string()),
+                model: Some(test_model()),
+                messages: Some(history),
+                ..Default::default()
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..Default::default()
+        }));
+        let sink: SideQuestionSink = Arc::new(|_| true);
+        for context_folding in [
+            ContextFolding::On {
+                max_fold_tokens: 1_000_000,
+            },
+            ContextFolding::Off,
+        ] {
+            let result = run_side_question(
+                &parent,
+                parent.stream_fn().cloned().expect("a stream fn"),
+                context_folding,
+                "what is left?",
+                &[],
+                &fast_retry_policy(),
+                &AbortSignal::never(),
+                &sink,
+            )
+            .await;
+            assert_eq!(result.status, SideQuestionStatus::Complete);
+        }
+        let contexts: Vec<String> = provider
+            .calls()
+            .iter()
+            .map(|call| serde_json::to_string(call).unwrap())
+            .collect();
+        assert!(contexts[0].contains("output of c1") && contexts[0].contains("output of c3"));
+        assert!(!contexts[0].contains("output of c2"));
+        assert!(contexts[1].contains("output of c2"));
+        // The parent's own history keeps everything.
+        assert_eq!(parent.state().await.messages.len(), 7);
     }
 
     #[tokio::test]

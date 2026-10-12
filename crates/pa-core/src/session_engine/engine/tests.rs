@@ -507,3 +507,262 @@ async fn create_session_registers_goal_and_heartbeat_handlers() {
         "tools: {names:?}"
     );
 }
+
+/// A tool whose result carries the context-fold marker it is given, the
+/// way the `fold` skill's cells carry theirs through the kernel channel.
+fn marking_cell_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "cell".to_string(),
+        label: "Cell".to_string(),
+        description: "Runs a cell".to_string(),
+        prompt_snippet: String::new(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "marker": { "type": "object" } }
+        }),
+        execution_mode: Some(ExecutionMode::Sequential),
+        prepare_arguments: None,
+        execute: Arc::new(|id, params, _signal, _on_update| {
+            let text = format!("ran {id}");
+            let details = match params.get("marker") {
+                Some(marker) => serde_json::json!({ "status": "ok", "contextFold": marker }),
+                None => serde_json::json!({ "status": "ok" }),
+            };
+            Box::pin(async move {
+                Ok(ToolExecutionResult {
+                    details: Some(details),
+                    ..ToolExecutionResult::text(text)
+                })
+            })
+        }),
+    }
+}
+
+fn fold_test_model() -> pa_agent::types::Model {
+    pa_agent::types::Model {
+        id: "m".into(),
+        name: "m".into(),
+        api: "test".into(),
+        provider: "test".into(),
+        base_url: "http://localhost".into(),
+        reasoning: false,
+        cost: pa_agent::types::UsageCost::default(),
+        context_window: 100_000,
+        max_tokens: 100,
+        max_tokens_explicit: false,
+    }
+}
+
+/// A session over `provider` with `contextFolding.enabled` set to
+/// `folding`, resuming `session_manager`'s entries when given one.
+async fn fold_session(
+    folding: bool,
+    provider: &Arc<ScriptedProvider>,
+    session_manager: Option<crate::session::manager::SessionManager>,
+) -> (SessionEngine, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        serde_json::json!({ "contextFolding": { "enabled": folding } }).to_string(),
+    )
+    .unwrap();
+    let engine = create_session(SessionEngineConfig {
+        cwd,
+        agent_dir,
+        model: Some(fold_test_model()),
+        stream_fn: Some(provider.stream_fn()),
+        tools: vec![bridge_tool(marking_cell_definition())],
+        session_manager,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    (engine, tmp)
+}
+
+fn tool_result_text(content: &[pa_agent::types::ToolResultContent]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            pa_agent::types::ToolResultContent::Text(text) => Some(text.text.as_str()),
+            pa_agent::types::ToolResultContent::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Each provider request's messages as compact lines.
+fn request_lines(provider: &ScriptedProvider) -> Vec<Vec<String>> {
+    provider
+        .calls()
+        .iter()
+        .map(|call| {
+            call.messages
+                .iter()
+                .map(|message| match message {
+                    pa_agent::types::Message::User(_) => "user".to_string(),
+                    pa_agent::types::Message::Assistant(assistant) => format!(
+                        "assistant {}",
+                        assistant
+                            .tool_calls()
+                            .iter()
+                            .map(|call| call.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    pa_agent::types::Message::ToolResult(result) => {
+                        format!(
+                            "result {}: {}",
+                            result.tool_call_id,
+                            tool_result_text(&result.content)
+                        )
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn owned_lines(lines: &[&str]) -> Vec<String> {
+    lines.iter().map(|line| (*line).to_string()).collect()
+}
+
+/// One scripted fold (begin cell, a work cell, end cell, answer) through a
+/// real session. Returns the session, each provider request's messages as
+/// compact lines, and the session's tool-result texts.
+async fn fold_scenario(folding: bool) -> (SessionEngine, Vec<Vec<String>>, Vec<String>) {
+    let provider = Arc::new(ScriptedProvider::new(fold_test_model()));
+    let begin = serde_json::json!({ "kind": "begin", "description": "explore", "goal": "find it" });
+    let end = serde_json::json!({ "kind": "end", "description": "explore", "result": "found it" });
+    provider.push_tool_call_turn(
+        None,
+        vec![("c1", "cell", serde_json::json!({ "marker": begin }))],
+    );
+    provider.push_tool_call_turn(None, vec![("c2", "cell", serde_json::json!({}))]);
+    provider.push_tool_call_turn(
+        None,
+        vec![("c3", "cell", serde_json::json!({ "marker": end }))],
+    );
+    provider.push_text_turn("done");
+    let (engine, _tmp) = fold_session(folding, &provider, None).await;
+    engine
+        .prompt("fold it", PromptOptions::default())
+        .await
+        .unwrap();
+    engine.session.agent().wait_for_idle().await;
+
+    let logged = engine
+        .session
+        .agent()
+        .state()
+        .await
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::ToolResult(
+                result,
+            )) => Some(tool_result_text(&result.content)),
+            pa_agent::types::AgentMessage::Standard(
+                pa_agent::types::Message::User(_) | pa_agent::types::Message::Assistant(_),
+            )
+            | pa_agent::types::AgentMessage::Custom(_) => None,
+        })
+        .collect();
+    (engine, request_lines(&provider), logged)
+}
+
+#[tokio::test]
+async fn a_closed_fold_is_left_out_of_later_requests_only_when_folding_is_enabled() {
+    const REMINDER: &str = "[fold open: explore] Work only on this fold's goal; when it is done, call await fold.end(result).";
+    let with_prefix = |prefix: &[String], rest: &[String]| [prefix, rest].concat();
+
+    let (_engine, requests, logged) = fold_scenario(true).await;
+    assert_eq!(requests.len(), 4);
+    // The first request carries only the prompt-time rows; every later
+    // request starts with them.
+    let prefix = requests[0].clone();
+    let reminder_result = format!("result c2: ran c2 | {REMINDER}");
+    assert_eq!(
+        requests[2],
+        with_prefix(
+            &prefix,
+            &owned_lines(&[
+                "assistant c1",
+                "result c1: ran c1",
+                "assistant c2",
+                &reminder_result
+            ]),
+        )
+    );
+    // After the end cell the work cell is gone; the begin and end cells stay.
+    assert_eq!(
+        requests[3],
+        with_prefix(
+            &prefix,
+            &owned_lines(&[
+                "assistant c1",
+                "result c1: ran c1",
+                "assistant c3",
+                "result c3: ran c3"
+            ]),
+        )
+    );
+    // The session keeps the full history, without the request-only line.
+    assert_eq!(logged, owned_lines(&["ran c1", "ran c2", "ran c3"]));
+
+    // Folding off: every request carries the whole conversation unchanged.
+    let (_engine, requests, logged) = fold_scenario(false).await;
+    let prefix = requests[0].clone();
+    assert_eq!(
+        requests[3],
+        with_prefix(
+            &prefix,
+            &owned_lines(&[
+                "assistant c1",
+                "result c1: ran c1",
+                "assistant c2",
+                "result c2: ran c2",
+                "assistant c3",
+                "result c3: ran c3",
+            ]),
+        )
+    );
+    assert_eq!(logged, owned_lines(&["ran c1", "ran c2", "ran c3"]));
+}
+
+#[tokio::test]
+async fn a_resumed_session_with_a_closed_fold_sends_the_folded_view_only_when_enabled() {
+    // The markers live in the saved tool results, so a resumed session
+    // folds without any state of its own.
+    let (engine, _, _) = fold_scenario(true).await;
+    let entries = engine.session.entries().await;
+    let mut first_requests = Vec::new();
+    for folding in [true, false] {
+        let provider = Arc::new(ScriptedProvider::new(fold_test_model()));
+        provider.push_text_turn("again");
+        let mut manager = crate::session::manager::SessionManager::in_memory(&std::env::temp_dir());
+        manager.adopt_entries(entries.clone());
+        let (resumed, _tmp) = fold_session(folding, &provider, Some(manager)).await;
+        resumed
+            .prompt("next", PromptOptions::default())
+            .await
+            .unwrap();
+        resumed.session.agent().wait_for_idle().await;
+        first_requests.push(request_lines(&provider).remove(0));
+    }
+    let work_cell = "result c2: ran c2".to_string();
+    assert!(
+        !first_requests[0].contains(&work_cell),
+        "{first_requests:?}"
+    );
+    assert!(first_requests[1].contains(&work_cell), "{first_requests:?}");
+    // Folding drops exactly the work cell's assistant group.
+    let mut unfolded = first_requests[1].clone();
+    let at = unfolded.iter().position(|line| *line == work_cell).unwrap();
+    unfolded.drain(at - 1..=at);
+    assert_eq!(first_requests[0], unfolded);
+}

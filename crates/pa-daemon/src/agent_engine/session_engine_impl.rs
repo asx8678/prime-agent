@@ -1011,13 +1011,18 @@ impl SessionEngine for AgentSessionEngine {
         // and the ledger records nothing. The engine build always wires
         // it; no fallback to the agent's own fn, which would leak the
         // id-carrying wrapper into the side call.
-        let side_stream_fn = {
+        // The side call sees the main thread's request view (context
+        // folding), read under the same lock as the stream fn.
+        let side_wiring = {
             let guard = self.session.blocking_lock();
-            guard
-                .as_deref()
-                .and_then(|engine| engine.session.side_question_stream_fn())
+            guard.as_deref().and_then(|engine| {
+                engine
+                    .session
+                    .side_question_stream_fn()
+                    .map(|stream_fn| (stream_fn, engine.context_folding))
+            })
         };
-        let Some(side_stream_fn) = side_stream_fn else {
+        let Some((side_stream_fn, context_folding)) = side_wiring else {
             return SideQuestionOutcome::Failed {
                 answer: String::new(),
                 error: "Select a model before asking a side question".to_string(),
@@ -1028,6 +1033,7 @@ impl SessionEngine for AgentSessionEngine {
                 .block_on(pa_core::session_engine::side_question::run_side_question(
                     &agent,
                     side_stream_fn,
+                    context_folding,
                     &question,
                     &previous_turns,
                     &retry_policy,

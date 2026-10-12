@@ -18,6 +18,6 @@ pub use storage::{
 };
 pub use types::{
     AutoRefineSettings, AutonomousSettings, CacheWarmingMode, CompactionEngine, CompactionSettings,
-    McpServerConfig, QueueModeSetting, RepeatGuardSettings, Settings, ThinkingLevelSetting,
-    TransportSetting, UpdateChannel,
+    ContextFoldingSettings, McpServerConfig, QueueModeSetting, RepeatGuardSettings, Settings,
+    ThinkingLevelSetting, TransportSetting, UpdateChannel,
 };

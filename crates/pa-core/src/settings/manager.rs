@@ -17,6 +17,9 @@ pub const RECENT_MODELS_LIMIT: usize = 20;
 pub const DEFAULT_IDLE_EVICTION_MINUTES: u64 = 90;
 pub const DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS: u64 = 30;
 pub const DEFAULT_SESSION_ARCHIVE_MAX_SESSIONS: usize = 200;
+/// The open-fold size (estimated tokens) past which later results ask the
+/// model to close the fold: the paper's per-branch context.
+pub const DEFAULT_MAX_FOLD_TOKENS: u64 = 32_768;
 
 #[derive(Debug, Clone)]
 pub struct SettingsError {
@@ -448,6 +451,29 @@ impl SettingsManager {
             .get_or_insert_with(Default::default)
             .enabled = Some(enabled);
         self.save_global()
+    }
+
+    /// `contextFolding.enabled`: unset means off (an experimental, Rust-only
+    /// feature).
+    #[must_use]
+    pub fn get_context_folding_enabled(&self) -> bool {
+        self.merged
+            .context_folding
+            .as_ref()
+            .and_then(|folding| folding.enabled)
+            .unwrap_or(false)
+    }
+
+    /// `contextFolding.maxFoldTokens`: the open-fold size past which later
+    /// results ask the model to close the fold; unset or 0 means 32768.
+    #[must_use]
+    pub fn get_context_folding_max_fold_tokens(&self) -> u64 {
+        self.merged
+            .context_folding
+            .as_ref()
+            .and_then(|folding| folding.max_fold_tokens)
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or(DEFAULT_MAX_FOLD_TOKENS)
     }
 
     /// `autoRefine.enabled`: unset means on (the auto-refine gates' default).

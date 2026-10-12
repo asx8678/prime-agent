@@ -147,6 +147,9 @@ pub struct SessionEngine {
     /// prompt), joined with the live model key per request so a model
     /// switch reclassifies the prefix (cache-miss attribution).
     pub(crate) prefix_static_hash: u64,
+    /// What every request of this session sends; side questions apply the
+    /// same view to their copy of the conversation.
+    pub context_folding: super::context_fold::ContextFolding,
 }
 
 /// Skill overrides for built-in integrations the user is not logged into,
@@ -254,6 +257,14 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let repeat_guard = crate::tools::ipython::RepeatGuardConfig::from_settings(
         &settings.settings().repeat_guard.clone().unwrap_or_default(),
     );
+    // Captured before `settings` moves into the resource loader.
+    let context_folding = if settings.get_context_folding_enabled() {
+        super::context_fold::ContextFolding::On {
+            max_fold_tokens: settings.get_context_folding_max_fold_tokens(),
+        }
+    } else {
+        super::context_fold::ContextFolding::Off
+    };
     let auto_refine_gates =
         super::refine::AutoRefineGates::from_settings(settings.settings().auto_refine.as_ref());
     // Request timing: the settings half of the flag is read once here
@@ -707,6 +718,17 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         }
         None => timing_stream_fn,
     };
+    // Context folding leaves closed folds out of every request. While it is
+    // off the instrumented seam wraps a pass-through that only marks the
+    // turn's dispatch moment, exactly as before folding existed.
+    let context_transform: pa_agent::agent_loop::TransformContextFn = match context_folding {
+        super::context_fold::ContextFolding::On { .. } => {
+            std::sync::Arc::new(move |messages, _signal| {
+                Box::pin(async move { Ok(context_folding.view(messages)) })
+            })
+        }
+        super::context_fold::ContextFolding::Off => super::request_timing::pass_through_transform(),
+    };
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
@@ -723,11 +745,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             std::sync::Arc::clone(&request_timing_wiring),
             super::messages::engine_convert_to_llm(),
         )),
-        // The Rust engine wires no transform, so the instrumented seam
-        // wraps a pass-through that marks the turn's dispatch moment.
         transform_context: Some(super::request_timing::instrument_transform_context(
             std::sync::Arc::clone(&request_timing_wiring),
-            super::request_timing::pass_through_transform(),
+            context_transform,
         )),
         should_stop_after_turn: config.queued_steering_probe.take().map(|probe| {
             let probe: pa_agent::agent_loop::ShouldStopAfterTurnFn =
@@ -1040,6 +1060,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         factory_host,
         provisioner,
         prefix_static_hash,
+        context_folding,
     })
 }
 
