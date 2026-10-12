@@ -342,14 +342,15 @@ fn python_skill_functions(package_path: &Path) -> Vec<String> {
 }
 
 /// Bundled skills that are gated: the auth-gated builtin MCP integrations
-/// (disabled when the user is not logged in) and the Decision API (hidden
-/// while decisionApi.systemOneModel is unset). The prompt documents them only
+/// (disabled when the user is not logged in), the Decision API (hidden
+/// while decisionApi.systemOneModel is unset) and context folding (hidden
+/// while contextFolding.enabled is off). The prompt documents them only
 /// through the dynamic skills inventory, not as API surface.
 fn gated_bundled_skills() -> BTreeSet<String> {
     pa_core::mcp::BUILTIN_MCP_CATALOG
         .iter()
         .map(|(server, _, _)| server.to_string())
-        .chain(std::iter::once("decision_api".to_string()))
+        .chain(["decision_api".to_string(), "fold".to_string()])
         .collect()
 }
 
@@ -504,6 +505,8 @@ const TS_PACKAGED_SKILL_SET: &[&str] = &[
     // Experimental, no TS counterpart yet.
     "decision-api",
     "edit",
+    // Experimental, no TS counterpart yet.
+    "fold",
     "goal",
     "mcp",
     "prime-intellect",

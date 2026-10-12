@@ -32,8 +32,11 @@ use crate::goals::{GoalContextDetails, GoalContextKind, GOAL_CONTEXT_CUSTOM_TYPE
 
 use super::messages::loop_convert_to_llm;
 
+mod handlers;
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(crate) use handlers::register_handlers;
 
 /// The tool-result details key the ipython tool saves a cell's marker under.
 const MARKER_DETAILS_KEY: &str = "contextFold";
@@ -174,10 +177,16 @@ struct OpenFold {
 
 /// What the fold rules make of one conversation, per message: whether a
 /// request leaves it out, and the line a tool result inside an open fold
-/// carries.
+/// carries; and the fold state after the last message.
 struct Folds {
     hidden: Vec<bool>,
     lines: Vec<Option<String>>,
+    /// Rows that stay in place inside a fold's span.
+    kept: Vec<bool>,
+    /// The fold still open after the last message.
+    open: Option<OpenFold>,
+    /// The label of the fold new input voided, until a later begin or end.
+    voided: Option<String>,
 }
 
 impl Folds {
@@ -205,6 +214,9 @@ impl Folds {
         let mut folds = Folds {
             hidden: vec![false; rows.len()],
             lines: vec![None; rows.len()],
+            kept: rows.iter().map(|row| matches!(row, Row::Kept)).collect(),
+            open: None,
+            voided: None,
         };
         let mut open: Option<OpenFold> = None;
         for (index, (row, message)) in rows.iter().zip(messages).enumerate() {
@@ -213,7 +225,7 @@ impl Folds {
                 Row::Kept => {}
                 Row::Input => {
                     if inside {
-                        open = None;
+                        folds.voided = open.take().map(|fold| fold.description);
                     }
                 }
                 Row::Assistant(_) => {
@@ -231,6 +243,7 @@ impl Folds {
                             // skill refuses nesting, so only a forged marker
                             // gets here.
                             if open.is_none() {
+                                folds.voided = None;
                                 let after = owner
                                     .get(call_id)
                                     .map_or(index, |&assistant| group_end[assistant]);
@@ -245,6 +258,7 @@ impl Folds {
                             // An end in the begin's own group, or one that
                             // answers no known call, closes the fold and
                             // leaves out nothing.
+                            folds.voided = None;
                             if let Some(fold) = open.take() {
                                 let end_assistant = owner.get(call_id).copied();
                                 if let Some(end_assistant) =
@@ -278,8 +292,73 @@ impl Folds {
                 }
             }
         }
+        folds.open = open;
         folds
     }
+}
+
+/// What `fold.end` would do now, over the live conversation (its own
+/// assistant message is already the last one; its result is not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Close {
+    /// The fold closes, hiding `messages` messages (`tokens` estimated)
+    /// from every later request.
+    Closes {
+        description: String,
+        messages: u64,
+        tokens: u64,
+        over_budget: bool,
+    },
+    /// New input arrived during the fold: nothing is hidden, and the end
+    /// marker stops it counting as open.
+    Voided { description: String },
+    /// Nothing to close; the reason the model reads.
+    Refused(String),
+}
+
+impl Close {
+    pub(crate) fn of(messages: &[AgentMessage], max_fold_tokens: u64) -> Close {
+        let folds = Folds::scan(messages, max_fold_tokens);
+        let Some(fold) = folds.open else {
+            return match folds.voided {
+                Some(description) => Close::Voided { description },
+                None => {
+                    Close::Refused("no fold is open; compaction may have summarized it".to_string())
+                }
+            };
+        };
+        let end_assistant = messages.iter().rposition(|message| match message {
+            AgentMessage::Standard(Message::Assistant(_)) => true,
+            AgentMessage::Standard(Message::User(_) | Message::ToolResult(_))
+            | AgentMessage::Custom(_) => false,
+        });
+        let Some(end_assistant) = end_assistant.filter(|&assistant| assistant > fold.after) else {
+            return Close::Refused(
+                "nothing to fold yet: call fold.end in a later cell".to_string(),
+            );
+        };
+        let span = fold.after + 1..end_assistant;
+        let hidden: Vec<&AgentMessage> = messages[span.clone()]
+            .iter()
+            .zip(&folds.kept[span])
+            .filter(|(_, kept)| !**kept)
+            .map(|(message, _)| message)
+            .collect();
+        let tokens = hidden.iter().map(|message| estimated_tokens(message)).sum();
+        Close::Closes {
+            description: fold.description,
+            messages: u64::try_from(hidden.len()).unwrap_or(u64::MAX),
+            tokens,
+            over_budget: tokens > max_fold_tokens,
+        }
+    }
+}
+
+/// The label of the fold open at the end of `messages`, if any.
+pub(crate) fn open_fold(messages: &[AgentMessage], max_fold_tokens: u64) -> Option<String> {
+    Folds::scan(messages, max_fold_tokens)
+        .open
+        .map(|fold| fold.description)
 }
 
 /// The chars/4 estimate compaction uses, over the message's wire JSON.
@@ -303,7 +382,7 @@ fn fold_view(messages: Vec<AgentMessage>, max_fold_tokens: u64) -> Vec<AgentMess
     if !any_fold {
         return messages;
     }
-    let Folds { hidden, lines } = Folds::scan(&messages, max_fold_tokens);
+    let Folds { hidden, lines, .. } = Folds::scan(&messages, max_fold_tokens);
     messages
         .into_iter()
         .zip(hidden)

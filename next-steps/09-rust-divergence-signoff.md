@@ -48,6 +48,7 @@ default again is decided together with the TS side.
 | 9 | PR-10 `rlm.spawn(schema=…)` | collect validates the child's answer against a JSON Schema | none; TS ships the same Python `rlm` package (`dist/prime-agent-runtime/src/rlm/__init__.py`) without it | **model** (new API) | don't pass `schema` |
 | 10 | PR-11 `rlm.set_cost_ceiling` | opt-in USD/spawn cap over the whole spawn tree, persisted; children inherit the remaining budget | none | **model** (new API), session files, daemon create metadata | opt-in |
 | 11 | next-steps/08 idle passivation waits for a live warm window | a worker defers its own idle stop while warming (only when warming is opted in) | has `idleEvictionMinutes` but no warmer, so nothing to defer | worker lifecycle | default off (follows `cacheWarming`) |
+| 12 | next-steps/05 context folding (`fold.begin` / `fold.end`) | gated `fold` skill; requests leave out the work between a closed fold's begin and end cells (the session log keeps it), add a reminder line to results inside an open fold, and compaction carries each fold's result; 5 telemetry counters | none | **model** (new API, gated), telemetry | default off (`contextFolding.enabled`) |
 
 ## Shared surfaces each item touches
 
@@ -65,14 +66,20 @@ default again is decided together with the TS side.
   opened in TS would show the carry list and ceiling rows to the model. Fix
   options: TS adds both types to its skip list, or Rust accepts the
   one-directional incompatibility.
-- **Kernel API (items 5, 9, 10).** `AGENTS.md` lists the RLM kernel API and the
+- **Kernel API (items 5, 9, 10, 12).** `AGENTS.md` lists the RLM kernel API and the
   `compact` skill as a surface that must not change. `rlm.spawn(schema=)`,
   `rlm.set_cost_ceiling` and `compact.carry` / `compact.drop` /
   `compact.run(preserve=)` extend it, so each needs the TS answer from
   `next-steps/07-rlm-api-trio-decision.md`: adopt with the same names, or
   accept a Rust-only API. Calling `set_cost_ceiling` against a TS host fails
   loudly (unknown host request); `schema=` never reaches the host.
-- **Telemetry schema (items 2, 6, and the pre-existing repeat-guard,
+  The `fold` skill (item 12) is a gated skill package, not part of `rlm`:
+  it loads only with `contextFolding.enabled`, and its `fold.*` host requests
+  register only then. Folding writes no custom rows, so the TS skip-list
+  hazard above does not apply; its markers ride the ipython result
+  `details.contextFold`, which TS ignores, so a Rust session with folds
+  opened in TS shows the full, unfolded history.
+- **Telemetry schema (items 2, 6, 12, and the pre-existing repeat-guard,
   failure-note, output-budget, carry and warm counters).** New optional
   properties on `agent session ended`; counts only.
 
@@ -102,6 +109,7 @@ TS answer where a shared surface is listed.
 | 9 | ☐ | ☐ API | |
 | 10 | ☐ | ☐ API + `rlmCostCeiling` key + skip list | |
 | 11 | ☐ | n/a | |
+| 12 | ☐ (default off) | ☐ API + schema | evaluation (next-steps/05b step 8) decides any default |
 
 Parity-diff evidence (frame diffs, interactive and wire comparisons against a
 running TS binary) is still owed per item before merge. This brief covers the

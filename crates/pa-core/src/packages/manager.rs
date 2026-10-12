@@ -172,14 +172,25 @@ impl PackageManager {
             .unwrap_or(true)
     }
 
-    /// Settings flag: the bundled websearch skill (default true).
-    pub(super) fn bundled_websearch_enabled(&self) -> bool {
-        self.settings
+    /// Exclude patterns for the bundled skills a setting turns off: the
+    /// websearch skill (`bundledSkills.websearch`, default on) and the fold
+    /// skill (`contextFolding.enabled`, default off).
+    pub(super) fn gated_bundled_skill_overrides(&self) -> Vec<String> {
+        let mut overrides = Vec::new();
+        let websearch = self
+            .settings
             .settings()
             .bundled_skills
             .as_ref()
             .and_then(|bundled| bundled.websearch)
-            .unwrap_or(true)
+            .unwrap_or(true);
+        if !websearch {
+            overrides.push("-websearch/SKILL.md".to_string());
+        }
+        if !self.settings.get_context_folding_enabled() {
+            overrides.push("-fold/SKILL.md".to_string());
+        }
+        overrides
     }
 
     /// Extra force-exclude patterns for built-in skills.

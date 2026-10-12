@@ -947,6 +947,43 @@ fn bundled_skills_collect_with_websearch_excluded_until_enabled() {
 }
 
 #[test]
+fn the_fold_skill_loads_only_when_context_folding_is_enabled() {
+    let fixture = Fixture::new();
+    let bundled = fixture.temp_dir.join("bundled-skills");
+    skill_md(&bundled, "fold", "Fold a finished sub-task");
+    let settings_path = fixture.agent_dir.join("settings.json");
+    std::fs::create_dir_all(&fixture.agent_dir).unwrap();
+    let fold_enabled = |manager: &mut PackageManager| {
+        manager
+            .resolve()
+            .unwrap()
+            .skills
+            .iter()
+            .find(|r| r.path.to_string_lossy().contains("fold"))
+            .expect("fold collected")
+            .enabled
+    };
+
+    std::fs::write(&settings_path, serde_json::json!({}).to_string()).unwrap();
+    let mut manager = PackageManager::with_options(PackageManagerOptions {
+        cwd: fixture.manager.cwd().to_path_buf(),
+        agent_dir: fixture.agent_dir.clone(),
+        settings: SettingsManager::create(fixture.manager.cwd(), &fixture.agent_dir),
+        bundled_skills_dir: BundledSkillsDir::Directory(bundled),
+        extra_builtin_skill_overrides: Vec::new(),
+    });
+    assert!(!fold_enabled(&mut manager), "fold is off by default");
+
+    std::fs::write(
+        &settings_path,
+        serde_json::json!({"contextFolding": {"enabled": true}}).to_string(),
+    )
+    .unwrap();
+    manager.reload_settings().unwrap();
+    assert!(fold_enabled(&mut manager), "fold loads once folding is on");
+}
+
+#[test]
 fn empty_bundled_skills_dir_warns() {
     let fixture = Fixture::new();
     let settings = SettingsManager::create(fixture.manager.cwd(), &fixture.agent_dir);

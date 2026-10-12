@@ -413,6 +413,15 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     if auto_refine_allowed {
         turn_boundary.register_refine_handlers(&mut handlers);
     }
+    // `fold.*` exists only while context folding is on: a `fold` package
+    // left in the kernel venv by an earlier enabled session gets "not
+    // available in this session".
+    match context_folding {
+        super::context_fold::ContextFolding::On { max_fold_tokens } => {
+            super::context_fold::register_handlers(&mut handlers, &turn_boundary, max_fold_tokens);
+        }
+        super::context_fold::ContextFolding::Off => {}
+    }
     // Kernel boots (duration, cold/revived, outcome) count into the
     // session counters.
     let on_bootstrap_result = config.telemetry.as_ref().map(|_| {

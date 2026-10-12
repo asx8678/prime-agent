@@ -479,3 +479,234 @@ fn in_fold_results_carry_the_reminder_but_the_begin_and_end_cells_do_not() {
         ]
     );
 }
+
+/// Ask the `fold.*` handler `request_type` with `data`, over a session
+/// whose live conversation is `messages`.
+async fn ask(
+    request_type: &str,
+    data: Value,
+    messages: Vec<AgentMessage>,
+) -> anyhow::Result<Value> {
+    use crate::session_engine::turn_boundary::{
+        ModelInfo, TurnBoundaryRequests, TurnBoundaryRuntime,
+    };
+    use pa_agent::agent::{Agent, AgentInitialState, AgentOptions};
+
+    let requests = std::sync::Arc::new(TurnBoundaryRequests::new());
+    let mut handlers = crate::kernel::shared::HostRequestHandlers::new();
+    super::register_handlers(&mut handlers, &requests, BUDGET);
+    let model = pa_agent::types::Model {
+        id: "m".into(),
+        name: "m".into(),
+        api: "test".into(),
+        provider: "test".into(),
+        base_url: "http://localhost".into(),
+        reasoning: false,
+        cost: pa_agent::types::UsageCost::default(),
+        context_window: 100_000,
+        max_tokens: 100,
+        max_tokens_explicit: false,
+    };
+    requests.bind(TurnBoundaryRuntime {
+        agent: std::sync::Arc::new(Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(model),
+                messages: Some(messages),
+                ..Default::default()
+            },
+            ..Default::default()
+        })),
+        session: std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::session::manager::SessionManager::in_memory(std::path::Path::new("/tmp")),
+        )),
+        context_window: Some(100_000),
+        model_info: ModelInfo {
+            id: "m".to_string(),
+            provider: "test".to_string(),
+            input: Vec::new(),
+        },
+    });
+    let handler = handlers.get(request_type).expect("registered").clone();
+    handler(crate::kernel::shared::HostRequestPayload {
+        data,
+        cell_source_code: None,
+    })
+    .await
+}
+
+fn begin_args() -> Value {
+    json!({ "description": "explore", "goal": "find the bug" })
+}
+
+#[tokio::test]
+async fn begin_opens_a_fold_and_is_refused_while_one_is_open() {
+    let answer = ask(
+        "fold.begin",
+        begin_args(),
+        vec![user("go"), assistant(&["c1"])],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        answer["marker"],
+        json!({ "kind": "begin", "description": "explore", "goal": "find the bug" })
+    );
+    assert!(answer["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("Fold opened: explore. Work only on this goal."));
+
+    let open = vec![
+        user("go"),
+        assistant(&["c1"]),
+        begin("c1"),
+        assistant(&["c2"]),
+    ];
+    let answer = ask(
+        "fold.begin",
+        json!({ "description": "next", "goal": "g" }),
+        open,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        answer,
+        json!({ "text": "Fold not opened: a fold is already open: explore; finish it with fold.end before starting another." })
+    );
+}
+
+#[tokio::test]
+async fn end_without_an_open_begin_answers_not_folded() {
+    // The begin was summarized away by compaction, or never made.
+    let answer = ask(
+        "fold.end",
+        json!({ "result": "done" }),
+        vec![user("go"), assistant(&["c1"])],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        answer,
+        json!({ "text": "Fold not closed: no fold is open; compaction may have summarized it." })
+    );
+}
+
+#[tokio::test]
+async fn end_in_the_same_assistant_turn_as_its_begin_is_refused() {
+    // The begin cell and the end cell are two calls of one assistant message.
+    let answer = ask(
+        "fold.end",
+        json!({ "result": "done" }),
+        vec![user("go"), assistant(&["c1", "c2"]), begin("c1")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        answer,
+        json!({ "text": "Fold not closed: nothing to fold yet: call fold.end in a later cell." })
+    );
+}
+
+#[tokio::test]
+async fn end_reports_the_hidden_span() {
+    let work = vec![
+        assistant(&["c2"]),
+        result("c2"),
+        assistant(&["c3"]),
+        result("c3"),
+    ];
+    let tokens: u64 = work
+        .iter()
+        .map(|message| pa_types::usage::estimate_tokens(&serde_json::to_value(message).unwrap()))
+        .sum();
+    let mut messages = vec![user("go"), assistant(&["c1"]), begin("c1")];
+    messages.extend(work);
+    // The in-flight message that called fold.end; its result is not in yet.
+    messages.push(assistant(&["c4"]));
+    let answer = ask("fold.end", json!({ "result": "found it" }), messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        answer,
+        json!({
+            "text": format!("Fold closed: explore (4 messages, ~{tokens} tokens hidden from later turns).\nResult:\nfound it"),
+            "marker": {
+                "kind": "end", "description": "explore", "result": "found it", "folded": true,
+                "messages": 4, "tokens": tokens, "overBudget": false,
+            },
+        })
+    );
+}
+
+#[tokio::test]
+async fn end_reports_a_voided_fold() {
+    let messages = vec![
+        user("go"),
+        assistant(&["c1"]),
+        begin("c1"),
+        assistant(&["c2"]),
+        result("c2"),
+        user("actually, do something else"),
+        assistant(&["c3"]),
+    ];
+    let answer = ask("fold.end", json!({ "result": "partial" }), messages.clone())
+        .await
+        .unwrap();
+    assert_eq!(answer["marker"]["folded"], json!(false));
+    assert_eq!(
+        answer["text"],
+        json!("Fold not closed: new input arrived during the fold, so nothing was hidden.")
+    );
+    // The voided fold is not open: a new one can begin.
+    let answer = ask("fold.begin", begin_args(), messages).await.unwrap();
+    assert!(answer.get("marker").is_some(), "{answer}");
+}
+
+#[tokio::test]
+async fn begin_and_end_arguments_are_required_and_bounded() {
+    let refused = [
+        (
+            "fold.begin",
+            json!({ "goal": "g" }),
+            "description must be a string",
+        ),
+        (
+            "fold.begin",
+            json!({ "description": "x" }),
+            "goal must be a string",
+        ),
+        (
+            "fold.begin",
+            json!({ "description": "  ", "goal": "g" }),
+            "description must not be empty",
+        ),
+        (
+            "fold.begin",
+            json!({ "description": "two\nlines", "goal": "g" }),
+            "description must be one line",
+        ),
+        (
+            "fold.begin",
+            json!({ "description": "x".repeat(81), "goal": "g" }),
+            "description must be at most 80 characters",
+        ),
+        (
+            "fold.begin",
+            json!({ "description": "x", "goal": "g".repeat(2_001) }),
+            "goal must be at most 2000 characters",
+        ),
+        ("fold.end", json!({}), "result must be a string"),
+        (
+            "fold.end",
+            json!({ "result": "r".repeat(16_385) }),
+            "result must be at most 16384 characters",
+        ),
+    ];
+    for (request_type, data, error) in refused {
+        let answer = ask(request_type, data, vec![user("go")]).await;
+        assert_eq!(
+            answer.map_err(|error| error.to_string()),
+            Err(format!("{request_type} {error}"))
+        );
+    }
+}
