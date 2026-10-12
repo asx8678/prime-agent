@@ -299,11 +299,13 @@ pub enum OauthKind {
 
 /// A bounded echo of an entry id in errors: never reprint untrusted long
 /// (possibly secret-ish) input.
+/// The entry id for error messages: at most 64 characters (cut on a
+/// character boundary, since the id is untrusted catalog input), with an
+/// ellipsis when cut.
 fn safe_entry_id(entry_id: &str) -> String {
-    if entry_id.len() > 64 {
-        format!("{}\u{2026}", &entry_id[..64])
-    } else {
-        entry_id.to_string()
+    match entry_id.char_indices().nth(64) {
+        Some((cut, _)) => format!("{}\u{2026}", &entry_id[..cut]),
+        None => entry_id.to_string(),
     }
 }
 
@@ -706,6 +708,21 @@ mod tests {
             parse_plugins_catalog(doc.to_string().as_bytes()).is_err(),
             "auth unknown key rejects"
         );
+    }
+
+    #[test]
+    fn a_long_multibyte_server_id_is_cut_on_a_character_boundary() {
+        // Byte 64 falls inside the two-byte `é`: a byte cut would panic.
+        let id = format!("{}\u{e9}b", "a".repeat(63));
+        assert_eq!(
+            safe_entry_id(&id),
+            format!("{}\u{e9}\u{2026}", "a".repeat(63))
+        );
+        assert_eq!(safe_entry_id("short"), "short");
+        let entry: McpServiceEntry =
+            serde_json::from_value(valid_entry(&id)).expect("the entry deserializes");
+        let error = entry.validate().expect_err("the id is invalid");
+        assert!(error.contains("server id must match"), "{error}");
     }
 
     fn valid_entry(server: &str) -> serde_json::Value {
