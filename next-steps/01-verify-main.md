@@ -65,3 +65,32 @@ a TS-parity check.
 The other session pinned Rust 1.99.0 (`rust-toolchain.toml`) and fixed the
 1.99 clippy findings. Run the gates once on clean `main` with plain `cargo`,
 then rewrite `known-macos-failures.txt` from the result.
+
+## Status (2026-10-11, Linux run)
+
+Checked on a Linux box (Rust 1.99.0, uv 0.8.22, kernel venv bootstrapped).
+
+1. The five pa-cli e2e failures are macOS-only: they pass on Linux, as do
+   the full `acp_mode_e2e` (45) and `print_runtime_e2e` (24) files.
+2. The switch did break two tests the Mac run never reached. Both scripted
+   model-written summaries under default settings; both now pin
+   `"engine": "llm"`:
+   - `pa-daemon` lib `agent_engine::tests::compaction::compact_session_command_emits_the_result_on_success`
+     (pinned in the `run_prompts` harness, `crates/pa-daemon/src/agent_engine/tests.rs`);
+   - `pa-cli` `rpc_mode_e2e::rpc_compact_flushes_the_start_frame_before_the_pipeline`
+     (pinned in `TimedRpcChild::spawn_stalled`).
+3. CI run 38135197481 (`ci` on `3d9e83111`): shards 2 and 4-7 green; shards
+   3 and 8 failed on exactly the two tests above (reproduced locally with
+   `scripts/ci_test_shard.py`). Shard 1's tests passed; its lifecycle
+   comparison failed because `gh release download v0.9.8` reads
+   `${GITHUB_REPOSITORY}`, and the fork has no such release (the org repo
+   does). Fixed: the step now downloads from `PrimeIntellect-ai/prime-agent`
+   (the sha256 pin is unchanged and matches). Run locally, the
+   `goal_backoff` comparison exits 0; its receipt lists the deliberate
+   divergence from #3408 (Rust wakes the goal after an empty-turn backoff).
+   Job logs need auth; the public API serves runs, jobs and annotations.
+4. Nothing runs `compare_differential.py` in CI, and `compact_command` is too
+   short to compact (no summary is made), so the engine does not matter
+   there. No pin needed.
+5. On Linux with 1.99 the gates are green apart from the above: fmt and
+   clippy pass in CI; `vendor/crossterm` warnings do not fail clippy.
