@@ -415,7 +415,10 @@ pub enum FileEntry {
         base: EntryBase,
     },
     /// An entry this version does not model (unknown `type` tag or failed
-    /// payload); preserved verbatim.
+    /// payload); preserved verbatim. Untagged, so it serializes as exactly the
+    /// object it was read from: its own `type` key, if any, once, and no
+    /// fabricated `"type": "unknown"`.
+    #[serde(untagged)]
     Unknown {
         #[serde(flatten)]
         rest: JsonMap,
@@ -679,6 +682,21 @@ mod tests {
         };
         assert_eq!(rest.get("request_id").and_then(Value::as_str), Some("r"));
         assert_roundtrips(json);
+    }
+
+    #[test]
+    fn unknown_entries_serialize_to_the_exact_bytes_they_were_read_from() {
+        // Compare bytes, not values: a parsed `Value` keeps only the last of
+        // duplicate keys and would hide a second `type`.
+        for json in [
+            r#"{"type":"request_started","request_id":"r","session_id":"s"}"#,
+            r#"{"type":"model_change","id":"m1","provider":123,"modelId":null}"#,
+            r#"{"id":"x","parentId":null}"#,
+        ] {
+            let parsed = entry(json);
+            assert!(matches!(parsed, FileEntry::Unknown { .. }), "{json}");
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        }
     }
 
     #[test]
