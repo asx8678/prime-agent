@@ -62,6 +62,9 @@ pub struct ExecuteResult {
     /// The `bash()` commands this cell started, summarized for display
     /// (`bashCommands` on the tool-result details).
     pub bash_commands: Option<crate::kernel::shared::KernelBashCommands>,
+    /// The context-fold marker the cell emitted, raw (`contextFold` on the
+    /// tool-result details).
+    pub context_fold: Option<serde_json::Value>,
     /// Where the full text of each output that overflowed its kernel
     /// budget lives (the visible text holds only its head and tail).
     pub spilled: crate::kernel::shared::SpilledOutputs,
@@ -827,6 +830,9 @@ pub async fn execute_ipython(
             .iter()
             .map(sent_agent_message_json)
             .collect::<Vec<_>>());
+    }
+    if let Some(marker) = &r.context_fold {
+        details["contextFold"] = marker.clone();
     }
 
     Ok(ToolExecutionResult {
@@ -1705,6 +1711,45 @@ mod tests {
                 ],
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn cell_context_fold_marker_is_saved_in_the_result_details() {
+        let marker = json!({ "kind": "begin", "description": "explore", "goal": "find the bug" });
+        // A failed cell keeps its marker too: the fold opened before the
+        // error, and the session engine decides what it means.
+        for (status, label) in [(ExecuteStatus::Ok, "ok"), (ExecuteStatus::Error, "error")] {
+            let cell = ExecuteResult {
+                status,
+                stdout: "Fold opened: explore.\n".to_string(),
+                duration_ms: Some(4),
+                context_fold: Some(marker.clone()),
+                ..ExecuteResult::default()
+            };
+            let options = IpythonToolOptions {
+                provisioner: Arc::new(SettledCell(cell)),
+                ui: None,
+                on_late_sent_agent_message: None,
+                repeat_guard: None,
+                on_repeat_guard_triggered: None,
+                on_cell_failure_note: None,
+                on_output_budget_spill: None,
+            };
+            let result = execute_ipython(&options, "await fold.begin(...)", None, None, None)
+                .await
+                .expect("the cell settles");
+            assert_eq!(
+                result.details,
+                Some(json!({
+                    "status": label,
+                    "kernelRestarted": false,
+                    "durationMs": 4,
+                    "stdout": "Fold opened: explore.\n",
+                    "contextFold": marker,
+                })),
+                "{label}"
+            );
+        }
     }
 
     #[test]

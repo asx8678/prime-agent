@@ -440,3 +440,32 @@ fn edit_diffs_leave_the_cell_card_unchanged_until_they_are_drawn() {
         );
     }
 }
+
+#[test]
+fn a_context_fold_marker_leaves_the_cell_card_unchanged() {
+    let code = "await fold.begin(\"explore\", goal=\"find the failing parser branch\")";
+    let plain = json!({ "status": "ok", "durationMs": 4, "stdout": "Fold opened: explore.\n" });
+    let mut with_marker = plain.clone();
+    with_marker["contextFold"] = json!({ "kind": "begin", "description": "explore", "goal": "find the failing parser branch" });
+    let rendered = |details: &Value, detail: Detail| -> Vec<String> {
+        render(
+            &cell_card(code, details.clone(), false, false),
+            0,
+            detail,
+            &theme(),
+            100,
+            true,
+        )
+        .iter()
+        .map(text_of)
+        .collect()
+    };
+    for detail in [Detail::Overview, Detail::Details, Detail::All] {
+        assert_eq!(
+            rendered(&with_marker, detail),
+            rendered(&plain, detail),
+            "{}",
+            detail.wire_name()
+        );
+    }
+}

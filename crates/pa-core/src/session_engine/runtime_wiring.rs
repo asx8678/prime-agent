@@ -350,6 +350,7 @@ fn convert_execute_result(
         diffs: result.diffs.unwrap_or_default(),
         sent_agent_messages: result.sent_agent_messages.unwrap_or_default(),
         bash_commands: result.bash_commands,
+        context_fold: result.context_fold,
         spilled: result.spilled,
     }
 }
@@ -381,13 +382,14 @@ mod tests {
     use crate::kernel::shared::KernelDiffDisplay;
 
     #[test]
-    fn the_converted_result_keeps_the_cell_edit_diffs() {
+    fn the_converted_result_keeps_the_cell_display_payloads() {
         let diffs = vec![KernelDiffDisplay {
             path: "/repo/a.py".to_string(),
             old_str: "a = 1".to_string(),
             new_str: "a = 2".to_string(),
             start_line: Some(3),
         }];
+        let marker = serde_json::json!({ "kind": "begin", "description": "explore" });
         let converted = convert_execute_result(crate::kernel::shared::ExecuteResult {
             stdout: String::new(),
             stderr: String::new(),
@@ -396,6 +398,7 @@ mod tests {
             attachments: None,
             sent_agent_messages: None,
             bash_commands: None,
+            context_fold: Some(marker.clone()),
             background_output: None,
             status: crate::kernel::shared::ExecuteStatus::Ok,
             error: None,
@@ -403,5 +406,6 @@ mod tests {
             spilled: crate::kernel::shared::SpilledOutputs::default(),
         });
         assert_eq!(converted.diffs, diffs);
+        assert_eq!(converted.context_fold, Some(marker));
     }
 }

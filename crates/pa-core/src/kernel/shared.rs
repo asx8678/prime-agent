@@ -65,6 +65,10 @@ pub const AGENT_MESSAGE_DISPLAY_MIME: &str = "application/vnd.prime-agent.agent-
 pub const BASH_ACTIVITY_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-activity+json";
 /// One `bash()` call's command text (capped) and non-blank line count.
 pub const BASH_COMMAND_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-command+json";
+/// MIME tag the `fold` skill emits its begin/end marker under. The kernel
+/// carries the payload raw into the cell's tool-result details
+/// (`contextFold`); the session engine decodes it.
+pub const CONTEXT_FOLD_DISPLAY_MIME: &str = "application/vnd.prime-agent.context-fold+json";
 
 pub const EXECUTE_STATUS_OK: &str = "ok";
 pub const EXECUTE_STATUS_ERROR: &str = "error";
@@ -210,6 +214,9 @@ pub struct ExecuteResult {
     pub sent_agent_messages: Option<Vec<KernelSentAgentMessage>>,
     /// The `bash()` commands this cell started, summarized for display.
     pub bash_commands: Option<KernelBashCommands>,
+    /// The [`CONTEXT_FOLD_DISPLAY_MIME`] marker this cell emitted (the last
+    /// one wins), as raw JSON.
+    pub context_fold: Option<Value>,
     /// Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes).
     pub background_output: Option<String>,
     pub status: ExecuteStatus,

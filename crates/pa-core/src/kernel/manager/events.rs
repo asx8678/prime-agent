@@ -5,8 +5,8 @@ use super::{
     append_truncated, lock, parse_attachment_display, parse_diff_display, parse_sent_agent_message,
     Arc, Event, ExecBuffers, ExecuteStatus, Guarded, Inner, KernelBashCommands, KernelError,
     StreamName, StreamSpillSlot, Value, AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME,
-    BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME, DIFF_DISPLAY_MIME,
-    MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
+    BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME, CONTEXT_FOLD_DISPLAY_MIME,
+    DIFF_DISPLAY_MIME, MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
 };
 use std::fmt::Write as _;
 
@@ -193,7 +193,8 @@ impl Inner {
         }
     }
 
-    /// display events: diffs, attachments, sent agent messages, late or live.
+    /// display events: diffs, attachments, sent agent messages, context-fold
+    /// markers, late or live.
     fn dispatch_display(&self, id: Option<&str>, data: &Value) {
         let execution = lock(&self.guarded).active_execution.clone();
         let matching = execution
@@ -261,6 +262,14 @@ impl Inner {
                 }
             }
         }
+        // The kernel carries the fold marker raw; only an object payload
+        // counts, and the cell's last one wins.
+        if let Some(marker) = data
+            .get(CONTEXT_FOLD_DISPLAY_MIME)
+            .filter(|marker| marker.is_object())
+        {
+            buffers.context_fold = Some(marker.clone());
+        }
     }
 
     /// Unattributed stream text: attached to the active cell's background
@@ -324,6 +333,47 @@ mod tests {
     use crate::kernel::shared::{BackgroundWorkSettledCallback, KernelManagerOptions};
     use crate::platform::process::Signal;
     use serde_json::json;
+
+    #[test]
+    fn a_context_fold_marker_is_buffered_on_the_running_cell() {
+        let manager = ReplKernelManager::new(KernelManagerOptions::default());
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        let execution = Arc::new(crate::kernel::manager::ActiveExecution {
+            request_id: "cell-1".to_string(),
+            code: "await fold.begin(...)".to_string(),
+            started: std::time::Instant::now(),
+            max_chars: crate::kernel::shared::DEFAULT_MAX_OUTPUT_CHARS,
+            opts: crate::kernel::shared::ExecuteOptions::default(),
+            namespace_code: true,
+            restores_namespace: false,
+            buffers: std::sync::Mutex::new(ExecBuffers::default()),
+            result_tx: std::sync::Mutex::new(Some(result_tx)),
+        });
+        lock(&manager.inner.guarded).active_execution = Some(Arc::clone(&execution));
+        let display = |id: &str, marker: Value| Event::Display {
+            id: Some(id.to_string()),
+            data: json!({ CONTEXT_FOLD_DISPLAY_MIME: marker }),
+        };
+        // Another cell's marker and a non-object payload are ignored.
+        manager
+            .inner
+            .handle_event(display("cell-0", json!({ "kind": "begin" })));
+        manager
+            .inner
+            .handle_event(display("cell-1", json!("begin")));
+        assert_eq!(lock(&execution.buffers).context_fold, None);
+        // The running cell keeps its last marker.
+        for description in ["first", "second"] {
+            manager.inner.handle_event(display(
+                "cell-1",
+                json!({ "kind": "begin", "description": description }),
+            ));
+        }
+        assert_eq!(
+            lock(&execution.buffers).context_fold,
+            Some(json!({ "kind": "begin", "description": "second" }))
+        );
+    }
 
     #[test]
     fn teardown_resets_pending_background_count() {
