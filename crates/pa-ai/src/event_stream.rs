@@ -161,6 +161,34 @@ impl Shared {
 #[derive(Clone)]
 pub struct AssistantMessageEventWriter {
     shared: Arc<Shared>,
+    /// Shared by every clone of this writer; ends the stream when the last
+    /// one drops (see [`WriterLiveness`]).
+    _liveness: Arc<WriterLiveness>,
+}
+
+/// Ends the stream when the last writer clone drops before a terminal event
+/// or `end` (a provider task that panicked or returned early). Without it
+/// the reader parks forever and the agent turn hangs; with it the reader
+/// sees the stream end, which the agent loop reports as an error.
+struct WriterLiveness {
+    shared: Arc<Shared>,
+}
+
+impl Drop for WriterLiveness {
+    fn drop(&mut self) {
+        // Runs during a panic's unwind too: never panic here.
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.done {
+            state.done = true;
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+    }
 }
 
 impl AssistantMessageEventWriter {
@@ -195,6 +223,9 @@ impl AssistantMessageEventStream {
         (
             AssistantMessageEventWriter {
                 shared: shared.clone(),
+                _liveness: Arc::new(WriterLiveness {
+                    shared: shared.clone(),
+                }),
             },
             Self { shared },
         )
@@ -382,6 +413,27 @@ mod tests {
         let resolved = stream.result().await;
         assert_eq!(resolved.stop_reason, StopReason::Error);
         assert_eq!(resolved.content, message.content);
+    }
+
+    #[tokio::test]
+    async fn the_stream_ends_when_the_last_writer_drops_without_a_terminal_event() {
+        let (writer, mut stream) = AssistantMessageEventStream::new();
+        let clone = writer.clone();
+        writer.push(AssistantMessageEvent::Start {
+            partial: sample_message(""),
+        });
+        // A clone still alive keeps the stream open.
+        drop(writer);
+        assert!(!clone.is_done());
+        // The producer task dies (a panic unwinds and drops its writer).
+        let producer = tokio::spawn(async move {
+            let _writer = clone;
+            panic!("provider task failed");
+        });
+        assert!(producer.await.is_err());
+        let first = stream.next_event().await.expect("the queued event");
+        assert_eq!(first.event_type(), "start");
+        assert!(stream.next_event().await.is_none(), "the stream ended");
     }
 
     #[tokio::test]
