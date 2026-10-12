@@ -20,12 +20,17 @@ use tokio::sync::Mutex;
 pub(crate) type EventSink = std::sync::Arc<dyn Fn(&Value) + Send + Sync>;
 
 /// Collapse whitespace, cap at 160 chars with a trailing `...` (the session-action label form).
+/// Counts characters, not bytes, so a multi-byte goal or steer text is cut on a character
+/// boundary (TS counts string length the same way).
 fn compact_rlm_text(text: &str, max_length: usize) -> String {
     let compact: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= max_length {
+    if compact.chars().count() <= max_length {
         return compact;
     }
-    let keep = max_length.saturating_sub(3).min(compact.len());
+    let keep = compact
+        .char_indices()
+        .nth(max_length.saturating_sub(3))
+        .map_or(compact.len(), |(cut, _)| cut);
     let mut head = compact[..keep].to_string();
     while head.ends_with(char::is_whitespace) {
         head.pop();
@@ -646,6 +651,21 @@ mod tests {
 
     /// One test at a time over the global faux registry.
     static FAUX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn a_long_multibyte_label_is_cut_on_a_character_boundary() {
+        // 200 three-byte characters: a 157-byte cut lands inside one.
+        let goal = "\u{76ee}".repeat(200);
+        assert_eq!(
+            compact_rlm_text(&goal, 160),
+            format!("{}...", "\u{76ee}".repeat(157))
+        );
+        assert_eq!(
+            compact_rlm_text(&"a ".repeat(100), 160),
+            format!("{}...", "a ".repeat(78) + "a")
+        );
+        assert_eq!(compact_rlm_text("short   goal", 160), "short goal");
+    }
 
     /// One captured event line (the sink's frames, in order).
     type Frames = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
