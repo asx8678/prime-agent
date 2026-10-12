@@ -589,6 +589,92 @@ async fn autonomous_continuation_turns_cross_the_boundary_arms() {
     assert!(stderr.starts_with("Autonomous run stopped before terminal evidence;"));
 }
 
+/// A held continuation whose own turn crosses the threshold again holds the
+/// next one from inside that turn; the drain must not hold the slot's lock
+/// while the turn runs.
+#[tokio::test]
+async fn a_held_continuation_that_crosses_the_threshold_again_holds_the_next_one() {
+    let _faux = FAUX_TEST_LOCK.lock().await;
+    let (built, dir, model) = faux_engine_with_settings(
+        json!({
+            "contextWindow": 20000,
+            "maxTokens": 2000,
+            // The 100k-char crossing turn stays in the kept window after each
+            // compaction, so every continuation turn crosses the threshold again.
+            "responses": [
+                {"text": "seed reply"},
+                {"text": "crossing reply"},
+                {"text": "the first summary"},
+                {"text": "first continuation reply"},
+                {"text": "the second summary"},
+                {"text": "second continuation reply"},
+                {"text": "the third summary"},
+            ]
+        }),
+        compactable_settings(),
+        None,
+    )
+    .await;
+    let engine = std::sync::Arc::new(built);
+    let mut boundary = TurnBoundary::new(false);
+    // A plain first turn, so the threshold compaction has history to cut; the
+    // autonomous run starts after it.
+    admit(&mut boundary, &engine, &model, "seed turn".to_string())
+        .await
+        .unwrap();
+    let run = std::sync::Arc::new(crate::headless_autonomous::HeadlessAutonomous::from_cli(
+        &crate::args::AutonomousConfig {
+            max_continuations: Some(2),
+            // The crossing turns are large: keep the token budget out of the way.
+            max_tokens: Some(100_000_000),
+            ..Default::default()
+        },
+        dir.path(),
+    ));
+    let _accounting = run.wire_accounting(engine.session.agent()).await;
+    let goal = std::sync::Arc::new(crate::print_goal::PrintGoalSurface::new(false));
+    crate::print_autonomous::wire_continuation_hook(
+        &engine,
+        engine.session.agent(),
+        &model,
+        &goal,
+        &run,
+    );
+    admit(
+        &mut boundary,
+        &engine,
+        &model,
+        format!("crossing turn {}", "x".repeat(100_000)),
+    )
+    .await
+    .unwrap();
+    // A deadlocked drain never returns; the bound turns that into a failure.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        run.drive_boundary(
+            &engine,
+            &mut boundary,
+            &model,
+            None,
+            std::path::PathBuf::new(),
+        ),
+    )
+    .await
+    .expect("the drain finishes: no turn waits on the held slot's lock")
+    .unwrap();
+    let users = user_texts(&engine).await;
+    assert_eq!(
+        users
+            .iter()
+            .filter(|text| text.starts_with("[autonomous-continuation]"))
+            .count(),
+        2,
+        "both held continuations ran: {users:?}"
+    );
+    let last = last_assistant(&engine).await.expect("a settled turn");
+    assert_eq!(last.stop_reason, pa_types::ai::StopReason::Stop);
+}
+
 fn capture_sink() -> (EventSink, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink: EventSink = {

@@ -146,7 +146,16 @@ impl HeadlessAutonomous {
         api_key: Option<String>,
         global_harness_dir: PathBuf,
     ) -> Result<(), String> {
-        while let Some(text) = self.held.lock().await.take() {
+        loop {
+            // Take the next held continuation in its own statement: the lock
+            // must be free while the turn runs, because a turn that crosses
+            // the threshold again holds its continuation through
+            // `hold_threshold_continuation` (a `while let` guard would live
+            // across the whole turn and deadlock it).
+            let held = self.held.lock().await.take();
+            let Some(text) = held else {
+                break;
+            };
             boundary
                 .admit_continuation(
                     engine,
