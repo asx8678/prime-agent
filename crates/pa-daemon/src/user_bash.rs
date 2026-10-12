@@ -34,8 +34,11 @@ pub(crate) struct UserBash {
     awaited: AtomicUsize,
     /// An abort was requested: the settled result reports cancelled.
     abort_requested: AtomicBool,
-    /// The in-flight process (user bash or an awaited run): `abort_bash` kills it.
-    child: Mutex<Option<tokio::process::Child>>,
+    /// The in-flight processes, one per run (a user bash and awaited runs can
+    /// overlap), keyed by [`Self::next_run`]: each run waits on its own
+    /// process, and `abort_bash` kills them all (TS aborts every controller).
+    children: Mutex<std::collections::HashMap<u64, tokio::process::Child>>,
+    next_run: std::sync::atomic::AtomicU64,
 }
 
 impl UserBash {
@@ -44,7 +47,8 @@ impl UserBash {
             running: AtomicBool::new(false),
             awaited: AtomicUsize::new(0),
             abort_requested: AtomicBool::new(false),
-            child: Mutex::new(None),
+            children: Mutex::new(std::collections::HashMap::new()),
+            next_run: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -77,12 +81,11 @@ impl UserBash {
         AwaitedRun { user_bash: self }
     }
 
-    /// Kill the in-flight process (TS `abortBash` aborts every
+    /// Kill every in-flight process (TS `abortBash` aborts every
     /// controller); the settled runs report cancelled.
     pub(crate) async fn abort(&self) {
         self.abort_requested.store(true, Ordering::SeqCst);
-        let mut child = self.child.lock().await;
-        if let Some(child) = child.as_mut() {
+        for child in self.children.lock().await.values_mut() {
             let _ = child.start_kill();
         }
     }
@@ -505,14 +508,15 @@ async fn run_bash(run: RunBash<'_>) -> BashEnd {
     };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let run_id = run.user_bash.next_run.fetch_add(1, Ordering::SeqCst);
     {
-        let mut slot = run.user_bash.child.lock().await;
+        let mut children = run.user_bash.children.lock().await;
         // A late abort that arrived before the process spawned kills it
         // immediately; the flag still settles the run cancelled.
         if run.user_bash.abort_requested.load(Ordering::SeqCst) {
             let _ = child.start_kill();
         }
-        *slot = Some(child);
+        children.insert(run_id, child);
     }
     let stream = std::sync::Arc::new(std::sync::Mutex::new(OutputStream {
         chunks: Vec::new(),
@@ -544,12 +548,9 @@ async fn run_bash(run: RunBash<'_>) -> BashEnd {
         (Some(pump), None) | (None, Some(pump)) => pump.await,
         (None, None) => {}
     }
-    // Take the child back for the exit status (abort_bash may have killed
-    // it meanwhile; a signal death reports no exit code).
-    let mut child = {
-        let mut slot = run.user_bash.child.lock().await;
-        slot.take()
-    };
+    // Take this run's child back for the exit status (abort_bash may have
+    // killed it meanwhile; a signal death reports no exit code).
+    let mut child = run.user_bash.children.lock().await.remove(&run_id);
     let exit_code = match child.as_mut() {
         Some(child) => child
             .wait()
@@ -1041,6 +1042,79 @@ mod tests {
         assert!(
             rows[0].get("exitCode").is_none(),
             "killed runs carry no exit code"
+        );
+    }
+
+    /// A user bash and an awaited run overlap: each waits on its own
+    /// process and records its own exit code.
+    #[tokio::test]
+    async fn overlapping_bash_runs_each_keep_their_own_process() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let worker = created_worker(cwd.path()).await;
+        let started = cwd.path().join("started");
+        let go = cwd.path().join("go");
+        let response = worker
+            .dispatch(
+                "execute_bash",
+                &json!({
+                    "activeSessionId": "bash-session",
+                    "command": "touch started; while [ ! -f go ]; do sleep 0.05; done; exit 3",
+                }),
+            )
+            .await;
+        assert!(response.success, "failed: {response:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first run never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let awaited = worker
+            .dispatch(
+                "execute_bash_and_wait",
+                &json!({ "activeSessionId": "bash-session", "command": "exit 5" }),
+            )
+            .await;
+        assert!(awaited.success, "failed: {awaited:?}");
+        assert_eq!(awaited.data.expect("data")["exitCode"], json!(5));
+        std::fs::write(&go, "").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let state = worker
+                .dispatch(
+                    "get_connection_state",
+                    &json!({ "activeSessionId": "bash-session" }),
+                )
+                .await;
+            if state.data.expect("data")["isBashRunning"] == json!(false) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first run never settled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let exit_codes: Vec<(String, Value)> = bash_rows(&worker)
+            .iter()
+            .map(|row| {
+                (
+                    row["command"].as_str().unwrap_or_default().to_string(),
+                    row.get("exitCode").cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        assert_eq!(
+            exit_codes,
+            vec![
+                ("exit 5".to_string(), json!(5)),
+                (
+                    "touch started; while [ ! -f go ]; do sleep 0.05; done; exit 3".to_string(),
+                    json!(3)
+                ),
+            ]
         );
     }
 
