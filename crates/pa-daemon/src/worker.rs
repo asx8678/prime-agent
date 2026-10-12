@@ -271,12 +271,33 @@ fn sender_parent_edge_is(
 }
 
 impl Worker {
+    /// [`Worker::try_new`] for the in-crate test harnesses, where the
+    /// engine's runtime always starts.
+    ///
+    /// # Panics
+    ///
+    /// When the session engine's runtime cannot start.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
+        Self::try_new(config, registration).expect("the worker's session engine starts")
+    }
+
     /// Build the worker: core, engine, and the sink/hook wiring between them.
+    ///
+    /// # Errors
+    ///
+    /// When the agent session engine cannot start (its async runtime fails
+    /// to build). The worker then fails loudly instead of serving a session
+    /// that only looks alive.
     ///
     /// # Panics
     ///
     /// The wired closures panic on a poisoned session-core mutex.
-    pub fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
+    pub fn try_new(
+        config: WorkerConfig,
+        registration: Option<RegistrationHandle>,
+    ) -> anyhow::Result<Self> {
         let events = Arc::new(EventPump::new());
         let supervisor_claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let core = SessionCore {
@@ -432,8 +453,11 @@ impl Worker {
                                 agent_engine = Some(std::sync::Arc::clone(&concrete));
                                 concrete
                             }
-                            // Runtime construction failed: degrade to the echo engine.
-                            Err(_) => std::sync::Arc::new(ScriptedEngine::default()),
+                            Err(error) => {
+                                return Err(
+                                    error.context("the worker's session engine could not start")
+                                );
+                            }
                         }
                     }
                     Some(script) => {
@@ -462,8 +486,11 @@ impl Worker {
                                 agent_engine = Some(std::sync::Arc::clone(&concrete));
                                 concrete
                             }
-                            // Runtime construction failed: degrade to the echo engine.
-                            Err(_) => std::sync::Arc::new(ScriptedEngine::default()),
+                            Err(error) => {
+                                return Err(
+                                    error.context("the worker's session engine could not start")
+                                );
+                            }
                         }
                     }
                 };
@@ -782,7 +809,7 @@ impl Worker {
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
         );
-        Worker {
+        Ok(Worker {
             config,
             bound_socket_identity: std::sync::Mutex::new(None),
             listener_close_requested: tokio::sync::Notify::new(),
@@ -820,7 +847,7 @@ impl Worker {
             herdr_generation: std::sync::Arc::clone(&herdr_generation),
             create_gate: tokio::sync::Mutex::new(()),
             replacement_gate: tokio::sync::Mutex::new(()),
-        }
+        })
     }
 
     /// The Herdr session reference the reports carry (TS
@@ -1012,7 +1039,7 @@ pub async fn run_worker() -> Result<()> {
     // Self-registration: the supervisor's roster survives its own restarts
     // because workers re-present their identity (liveness watch + backoff).
     let registration = crate::registration::start(&config);
-    let worker = Arc::new(Worker::new(config, registration));
+    let worker = Arc::new(Worker::try_new(config, registration)?);
     // The refused-registration self-heal: retire instead of remaining an
     // invisible lease-holder.
     if let Some(handle) = worker.registration.clone() {
