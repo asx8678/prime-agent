@@ -128,7 +128,7 @@ fn registered(requests: &Arc<TurnBoundaryRequests>) -> HostRequestHandlers {
     requests.register_model_info_handler(&mut handlers, model_info());
     // A tiny keep-recent budget: a short conversation has history to
     // summarize above it.
-    requests.register_compact_handlers(&mut handlers, 1);
+    requests.register_compact_handlers(&mut handlers, 1, None);
     requests.register_refine_handlers(&mut handlers);
     handlers
 }
@@ -182,6 +182,216 @@ async fn model_info_reports_the_bound_model() {
     assert_eq!(response["id"], "other-1");
     assert_eq!(response["provider"], "other");
     assert_eq!(response["input"], json!([]));
+}
+
+/// A bound, idle runtime over `session` (the carry handlers need no
+/// active turn).
+fn bound_idle(requests: &Arc<TurnBoundaryRequests>, session: Arc<Mutex<SessionManager>>) {
+    let agent = Arc::new(Agent::new(AgentOptions {
+        initial_state: AgentInitialState {
+            system_prompt: Some("s".to_string()),
+            model: Some(agent_model()),
+            thinking_level: Some(ThinkingLevel::Off),
+            tools: None,
+            messages: None,
+        },
+        stream_fn: None,
+        ..AgentOptions::default()
+    }));
+    requests.bind(TurnBoundaryRuntime {
+        agent,
+        session,
+        context_window: Some(100_000),
+        model_info: model_info(),
+    });
+}
+
+async fn carry_row_count(requests: &Arc<TurnBoundaryRequests>) -> usize {
+    let runtime = requests.bound().expect("bound");
+    let session = runtime.session.lock().await;
+    session
+        .get_entries()
+        .iter()
+        .filter(|entry| {
+            matches!(entry, pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type == crate::session_engine::compact_carry::COMPACT_CARRY_CUSTOM_TYPE)
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn compact_carry_adds_reads_and_drops_notes() {
+    let requests = Arc::new(TurnBoundaryRequests::new());
+    let handlers = registered(&requests);
+    let session = Arc::new(Mutex::new(session_with_history(false)));
+    bound_idle(&requests, session);
+    // The persistence owner's mirror: counts every durable row it is asked
+    // to write.
+    let mirrored = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mirror = Arc::clone(&mirrored);
+    requests.set_carry_row_sink(Arc::new(move |_row| {
+        mirror.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    // An empty payload reads the list.
+    let response = handler(&handlers, "compact.carry")(payload(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response["items"], json!([]));
+    // Add two notes; the answer lists them.
+    let response = handler(&handlers, "compact.carry")(payload(json!({
+        "add": ["keep the API stable", "the repro lives in tests/e2e"]
+    })))
+    .await
+    .unwrap();
+    assert_eq!(
+        response["items"],
+        json!(["keep the API stable", "the repro lives in tests/e2e"])
+    );
+    assert_eq!(carry_row_count(&requests).await, 1, "one persisted row");
+    // Status reports the carried list with the drop indexes.
+    let status = handler(&handlers, "compact.status")(payload(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        status["carry"],
+        json!(["keep the API stable", "the repro lives in tests/e2e"])
+    );
+    // An idempotent add writes no second row.
+    let response = handler(&handlers, "compact.carry")(payload(json!({
+        "add": ["keep the API stable"]
+    })))
+    .await
+    .unwrap();
+    assert_eq!(
+        response["items"],
+        json!(["keep the API stable", "the repro lives in tests/e2e"])
+    );
+    assert_eq!(carry_row_count(&requests).await, 1);
+    assert_eq!(
+        mirrored.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an unchanged list is never mirrored again"
+    );
+    // Drop by index.
+    let response = handler(&handlers, "compact.drop")(payload(json!({ "index": 1 })))
+        .await
+        .unwrap();
+    assert_eq!(response["items"], json!(["keep the API stable"]));
+    assert_eq!(carry_row_count(&requests).await, 2);
+    assert_eq!(mirrored.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // An out-of-range index names the current length.
+    let error = handler(&handlers, "compact.drop")(payload(json!({ "index": 5 })))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "compact.drop index 5 is out of range for 1 carried note(s)"
+    );
+    // The count bound rejects a 17-note add.
+    let many: Vec<String> = (0..17).map(|index| format!("n{index}")).collect();
+    let error = handler(&handlers, "compact.carry")(payload(json!({ "add": many })))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "compact.carry add exceeds 16 items");
+}
+
+#[tokio::test]
+async fn carried_notes_survive_a_rebind_from_the_log() {
+    let requests = Arc::new(TurnBoundaryRequests::new());
+    let handlers = registered(&requests);
+    let session = Arc::new(Mutex::new(session_with_history(false)));
+    bound_idle(&requests, Arc::clone(&session));
+    let response = handler(&handlers, "compact.carry")(payload(json!({
+        "add": ["keep the API stable"]
+    })))
+    .await
+    .unwrap();
+    assert_eq!(response["items"], json!(["keep the API stable"]));
+    // A restart rebinds fresh state to the same session log: the latest
+    // row answers, with no in-memory copy to lose.
+    let restarted = Arc::new(TurnBoundaryRequests::new());
+    let handlers = registered(&restarted);
+    bound_idle(&restarted, session);
+    let status = handler(&handlers, "compact.status")(payload(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(status["carry"], json!(["keep the API stable"]));
+    let response = handler(&handlers, "compact.carry")(payload(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response["items"], json!(["keep the API stable"]));
+}
+
+#[tokio::test]
+async fn compact_run_validates_preserve_items() {
+    let requests = Arc::new(TurnBoundaryRequests::new());
+    let handlers = registered(&requests);
+    let error = handler(&handlers, "compact.run")(payload(json!({ "preserve": [1] })))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "compact.run preserve must be an array of strings"
+    );
+    let many: Vec<String> = (0..17).map(|index| format!("n{index}")).collect();
+    let error = handler(&handlers, "compact.run")(payload(json!({ "preserve": many })))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "compact.run preserve: compact carry exceeds 16 items"
+    );
+    assert!(requests.take_compaction().await.is_none());
+}
+
+#[tokio::test]
+async fn compact_run_preserve_rides_the_scheduled_compaction() {
+    let requests = Arc::new(TurnBoundaryRequests::new());
+    registered(&requests);
+    let session = Arc::new(Mutex::new(session_with_history(false)));
+    let provider = Arc::new(ScriptedProvider::new(agent_model()));
+    provider.push_tool_call_turn(None, vec![("call-1", "probe", json!({}))]);
+    provider.push_text_turn("done");
+    let probe = probe_tool(
+        &requests,
+        "probe",
+        "compact.run",
+        json!({
+            "instructions": "keep the failing test names",
+            "preserve": ["the exact error text"]
+        }),
+    );
+    let agent = Arc::new(Agent::new(AgentOptions {
+        initial_state: AgentInitialState {
+            system_prompt: Some("s".to_string()),
+            model: Some(agent_model()),
+            thinking_level: Some(ThinkingLevel::Off),
+            tools: Some(vec![probe.tool.clone()]),
+            messages: None,
+        },
+        stream_fn: Some(provider.stream_fn()),
+        ..AgentOptions::default()
+    }));
+    requests.bind(TurnBoundaryRuntime {
+        agent,
+        session,
+        context_window: Some(100_000),
+        model_info: model_info(),
+    });
+    let agent = requests.bound().expect("bound").agent.clone();
+    agent.prompt("run the probe tool").await.unwrap();
+    agent.wait_for_idle().await;
+    let response = probe.result().await;
+    assert_eq!(response["scheduled"], true);
+    let pending = requests
+        .take_compaction()
+        .await
+        .expect("the scheduled request");
+    assert_eq!(
+        pending.instructions.as_deref(),
+        Some("keep the failing test names")
+    );
+    assert_eq!(pending.preserve, vec!["the exact error text".to_string()]);
 }
 
 #[tokio::test]
@@ -338,6 +548,7 @@ async fn compact_run_schedules_inside_a_tool_call_and_status_sees_it() {
     assert_eq!(
         requests.take_compaction().await,
         Some(PendingCompaction {
+            preserve: Vec::new(),
             instructions: Some("keep the failing test names".to_string())
         })
     );
@@ -558,6 +769,7 @@ async fn compact_run_merges_instructions_into_a_pending_request() {
     assert_eq!(
         requests.take_compaction().await,
         Some(PendingCompaction {
+            preserve: Vec::new(),
             instructions: Some("first".to_string())
         })
     );
@@ -652,7 +864,7 @@ fn probe_tool(
     let handler = {
         let mut handlers = HostRequestHandlers::default();
         requests.register_model_info_handler(&mut handlers, model_info());
-        requests.register_compact_handlers(&mut handlers, 1);
+        requests.register_compact_handlers(&mut handlers, 1, None);
         requests.register_refine_handlers(&mut handlers);
         handlers.get(request_type).expect("registered").clone()
     };

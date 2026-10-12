@@ -286,6 +286,7 @@ impl AgentSessionEngine {
                     .session
                     .compact(
                         custom_instructions.as_deref(),
+                        &[],
                         &model,
                         api_key,
                         Some(&signal),

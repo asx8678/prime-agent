@@ -48,6 +48,10 @@ pub struct RlmChildUsageReport {
 /// plus the durable flush. One instance per session engine.
 pub struct RlmChildUsageAttributions {
     session: std::sync::Arc<tokio::sync::Mutex<SessionManager>>,
+    /// The tree-cost ledger (PR-11): child spend counts toward the session
+    /// tree's ceiling. Installed by the kernel wiring; `None` in tests and
+    /// embeddings that never set a ceiling.
+    tree_cost: std::sync::Mutex<Option<std::sync::Arc<super::rlm_cost::RlmTreeCost>>>,
     /// The aggregate base per parent assistant row, shared by all its children;
     /// held across the durable append so batches serialize in observation order.
     bases: tokio::sync::Mutex<HashMap<String, Usage>>,
@@ -69,6 +73,7 @@ impl RlmChildUsageAttributions {
     pub fn new(session: std::sync::Arc<tokio::sync::Mutex<SessionManager>>) -> Self {
         Self {
             session,
+            tree_cost: std::sync::Mutex::new(None),
             bases: tokio::sync::Mutex::new(HashMap::new()),
             children: std::sync::Mutex::new(HashMap::new()),
             telemetry: std::sync::Mutex::new(None),
@@ -123,13 +128,32 @@ impl RlmChildUsageAttributions {
         }
     }
 
-    /// Flush one observed report: batches fold into the target row's cumulative aggregate,
-    /// one durable `child_usage_attributed` row per batch; a failed append is logged and
-    /// dropped, so attribution bookkeeping never breaks the observing path.
+    /// Attach the tree-cost ledger (PR-11): every folded child usage
+    /// adds to the session tree's spend. Installed by the kernel wiring
+    /// right after both exist; `None` (tests, embeddings) keeps the
+    /// attribution flow unchanged.
     ///
     /// # Panics
     ///
-    /// Panics if the forward, children, or telemetry state mutexes are poisoned.
+    /// Panics when the tree-cost slot's mutex is poisoned.
+    pub fn set_tree_cost(&self, tree_cost: std::sync::Arc<super::rlm_cost::RlmTreeCost>) {
+        *self.tree_cost.lock().expect("rlm usage tree cost lock") = Some(tree_cost);
+    }
+
+    /// The session the attribution rows append to (the tree-cost ledger
+    /// persists its ceiling rows there too).
+    pub(crate) fn session(&self) -> &std::sync::Arc<tokio::sync::Mutex<SessionManager>> {
+        &self.session
+    }
+
+    /// Flush one observed report: batches fold into the target row's cumulative aggregate,
+    /// one durable `child_usage_attributed` row per batch; a failed append is logged and
+    /// dropped, so attribution bookkeeping never breaks the observing path. The spend
+    /// also counts toward the session tree's cost ceiling.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the forward, children, telemetry, or tree-cost state mutexes are poisoned.
     pub async fn record_child_usage(&self, report: RlmChildUsageReport) {
         let forward = self.forward.lock().expect("rlm usage forward lock").clone();
         if let Some(forward) = forward {
@@ -186,6 +210,16 @@ impl RlmChildUsageAttributions {
             ) {
                 Ok(_) => {
                     bases.insert(target_id.clone(), aggregate);
+                    // PR-11: the folded child usage counts toward the
+                    // session tree's cost ceiling.
+                    if let Some(tree_cost) = self
+                        .tree_cost
+                        .lock()
+                        .expect("rlm usage tree cost lock")
+                        .as_ref()
+                    {
+                        tree_cost.note_spend(usage.cost.total.as_f64());
+                    }
                     if let Some(telemetry) = self
                         .telemetry
                         .lock()

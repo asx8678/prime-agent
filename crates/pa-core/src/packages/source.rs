@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::{bail, ensure, Result};
+
 /// Scope a package source belongs to: user settings, project settings, or an
 /// ephemeral resolve-only scope (temporary sources are never persisted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -210,17 +212,63 @@ fn hosted_from_url(candidate: &str) -> Option<HostedInfo> {
     None
 }
 
+/// Why a git-shaped string did not yield an installable [`GitSource`]:
+/// either it is not a git URL at all (the local-path reading may apply), or a
+/// host or repository-path component is unsafe to join into an install
+/// location and the source must be rejected outright.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitUrlParse {
+    /// Not a git URL under any accepted form.
+    NotGit,
+    /// A git-shaped string whose host or repository path could escape the
+    /// install root.
+    Unsafe,
+    Git(GitSource),
+}
+
+/// A host or repository-path segment that is safe to join into an install
+/// location: no empty, `.`, `..` or rooted segments, no embedded separators
+/// (`/`, `\`), and nothing a Windows host would read as rooted (`:` drive
+/// prefixes).
+fn installable_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.starts_with('/')
+        && !component.contains('\\')
+        && !component.contains('/')
+        && !component.contains(':')
+}
+
+/// An npm package name that is safe to join into an install location: scoped
+/// names (`@scope/pkg`) keep working; empty, `.`, `..`, rooted or backslash
+/// components do not.
+fn installable_npm_name(name: &str) -> bool {
+    !name.is_empty() && name.split('/').all(installable_component)
+}
+
 /// Generic git URL parser: scp-like, protocol, and `host/path` shorthand forms
-/// where the host contains a dot or is `localhost`.
-fn parse_generic_git_url(url: &str) -> Option<GitSource> {
+/// where the host contains a dot or is `localhost`. [`GitUrlParse::Unsafe`]
+/// marks a git-shaped URL whose host or repository path could escape an
+/// install location.
+fn parse_generic_git_url_checked(url: &str) -> GitUrlParse {
     let (repo, r) = split_ref(url);
     let repo = repo.as_str();
 
     let (host, path, clone_url) = if let Some(rest) = repo.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':')?;
+        let Some((host, path)) = rest.split_once(':') else {
+            return GitUrlParse::NotGit;
+        };
+        // scp-like repository paths are relative (`user/repo`); a rooted one
+        // is malformed and must be rejected, not silently relativized.
+        if path.starts_with('/') {
+            return GitUrlParse::Unsafe;
+        }
         (host.to_string(), path.to_string(), repo.to_string())
     } else if is_protocol_url(repo) {
-        let (prefix, path) = split_protocol_url(repo)?;
+        let Some((prefix, path)) = split_protocol_url(repo) else {
+            return GitUrlParse::NotGit;
+        };
         let authority = &prefix[prefix.find("://").expect("checked above") + 3..];
         let host = authority
             .rsplit_once('@')
@@ -232,9 +280,11 @@ fn parse_generic_git_url(url: &str) -> Option<GitSource> {
             repo.to_string(),
         )
     } else {
-        let (host, path) = repo.split_once('/')?;
+        let Some((host, path)) = repo.split_once('/') else {
+            return GitUrlParse::NotGit;
+        };
         if !host.contains('.') && host != "localhost" {
-            return None;
+            return GitUrlParse::NotGit;
         }
         (
             host.to_string(),
@@ -248,10 +298,17 @@ fn parse_generic_git_url(url: &str) -> Option<GitSource> {
         .trim_start_matches('/')
         .to_string();
     if host.is_empty() || path.is_empty() || path.split('/').count() < 2 {
-        return None;
+        return GitUrlParse::NotGit;
+    }
+    if !installable_component(&host)
+        || path
+            .split('/')
+            .any(|segment| !installable_component(segment))
+    {
+        return GitUrlParse::Unsafe;
     }
 
-    Some(GitSource {
+    GitUrlParse::Git(GitSource {
         repo: clone_url,
         host,
         path,
@@ -261,19 +318,34 @@ fn parse_generic_git_url(url: &str) -> Option<GitSource> {
 }
 
 /// Rules: with the `git:` prefix every historical shorthand form is accepted; without it only
-/// explicit protocol URLs.
+/// explicit protocol URLs. Unsafe components fold to `None` here (display
+/// and tolerant readings); install, remove and update flows must use
+/// [`parse_installable_source`] to reject them outright.
 #[must_use]
 pub fn parse_git_url(source: &str) -> Option<GitSource> {
+    match parse_git_url_checked(source) {
+        GitUrlParse::Git(git) => Some(git),
+        GitUrlParse::NotGit | GitUrlParse::Unsafe => None,
+    }
+}
+
+/// The checked git-URL parse: [`GitUrlParse::Unsafe`] marks a git-shaped
+/// source whose host or repository path could escape an install location;
+/// callers must reject it instead of falling back to the local-path reading.
+fn parse_git_url_checked(source: &str) -> GitUrlParse {
     let trimmed = source.trim();
     let has_git_prefix = trimmed.starts_with("git:");
     let url = if has_git_prefix {
-        trimmed.strip_prefix("git:")?.trim()
+        match trimmed.strip_prefix("git:") {
+            Some(rest) => rest.trim(),
+            None => return GitUrlParse::NotGit,
+        }
     } else {
         trimmed
     };
 
     if !has_git_prefix && !is_protocol_url(url) {
-        return None;
+        return GitUrlParse::NotGit;
     }
 
     let (split_repo, split_ref) = split_ref(url);
@@ -289,12 +361,20 @@ pub fn parse_git_url(source: &str) -> Option<GitSource> {
             if split_ref.is_some() && info.project.contains('@') {
                 continue;
             }
+            if !installable_component(&info.user)
+                || info
+                    .project
+                    .split('/')
+                    .any(|segment| !installable_component(segment))
+            {
+                return GitUrlParse::Unsafe;
+            }
             let https_prefixed = !split_repo.starts_with("http://")
                 && !split_repo.starts_with("https://")
                 && !split_repo.starts_with("ssh://")
                 && !split_repo.starts_with("git://")
                 && !split_repo.starts_with("git@");
-            return Some(GitSource {
+            return GitUrlParse::Git(GitSource {
                 repo: if https_prefixed {
                     format!("https://{split_repo}")
                 } else {
@@ -308,7 +388,7 @@ pub fn parse_git_url(source: &str) -> Option<GitSource> {
         }
     }
 
-    parse_generic_git_url(url)
+    parse_generic_git_url_checked(url)
 }
 
 /// `https?://`, `ssh://`, or `git://` prefix check (the TS gate for
@@ -374,6 +454,46 @@ pub fn parse_source(source: &str) -> ParsedSource {
     ParsedSource::Local(LocalSource {
         path: source.to_string(),
     })
+}
+
+/// Parse a package source for the install, remove and update flows, where a
+/// crafted source must fail loudly instead of reaching the filesystem (or
+/// being re-read as a local path): git hosts, repository-path segments and
+/// npm names are all validated against install-root escapes. Mirrors
+/// [`parse_source`] branch for branch.
+///
+/// # Errors
+///
+/// Error when an npm name or a git host/repository-path component is unsafe
+/// to join into an install location.
+pub fn parse_installable_source(source: &str) -> Result<ParsedSource> {
+    if let Some(spec) = source.strip_prefix("npm:") {
+        let spec = spec.trim();
+        let (name, version) = parse_npm_spec(spec);
+        ensure!(
+            installable_npm_name(&name),
+            "invalid npm package source {source:?}: {name:?} is not a safe package name"
+        );
+        return Ok(ParsedSource::Npm(NpmSource {
+            spec: spec.to_string(),
+            name,
+            pinned: version.is_some(),
+        }));
+    }
+    if is_local_path(source) {
+        return Ok(ParsedSource::Local(LocalSource {
+            path: source.to_string(),
+        }));
+    }
+    match parse_git_url_checked(source) {
+        GitUrlParse::Unsafe => bail!(
+            "invalid git package source {source:?}: the host or repository path would escape the install root"
+        ),
+        GitUrlParse::Git(git) => Ok(ParsedSource::Git(git)),
+        GitUrlParse::NotGit => Ok(ParsedSource::Local(LocalSource {
+            path: source.to_string(),
+        })),
+    }
 }
 
 /// Lexical absolutization (node `path.resolve`): joins onto the base and
@@ -574,5 +694,45 @@ mod tests {
         assert_eq!(lexical_resolve(base, "/abs"), PathBuf::from("/abs"));
         assert_eq!(path_relative(base, Path::new("/work")), "..");
         assert_eq!(path_relative(base, base), "");
+    }
+
+    #[test]
+    fn installable_parse_rejects_install_root_escapes() {
+        // Every crafted source must error as invalid (never parse as a local
+        // path, never reach the filesystem): traversal segments, a traversal
+        // host, and a rooted scp repository path.
+        for source in [
+            "git:https://evil.test/a/../../x",
+            "git:https://../../x/y",
+            "https://github.com/u/..",
+            "git:git@host:/abs/path",
+        ] {
+            let error = parse_installable_source(source).unwrap_err().to_string();
+            assert!(error.contains("invalid"), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn installable_parse_accepts_the_documented_forms() {
+        // The safe forms parse exactly as the tolerant reader does
+        // (whole-object comparison keeps every field honest).
+        assert_eq!(
+            parse_installable_source("git:https://github.com/user/repo").unwrap(),
+            parse_source("git:https://github.com/user/repo")
+        );
+        assert_eq!(
+            parse_installable_source("git:git@github.com:user/repo").unwrap(),
+            parse_source("git:git@github.com:user/repo")
+        );
+        assert_eq!(
+            parse_installable_source("npm:@scope/pkg@1.2.3").unwrap(),
+            parse_source("npm:@scope/pkg@1.2.3")
+        );
+        assert_eq!(
+            parse_installable_source("./relative/path").unwrap(),
+            parse_source("./relative/path")
+        );
+        // An unsafe npm name is rejected too.
+        assert!(parse_installable_source("npm:../evil").is_err());
     }
 }

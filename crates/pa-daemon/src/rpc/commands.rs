@@ -376,7 +376,7 @@ async fn compact(state: &Arc<RpcState>, payload: &Value) -> Result<ResponseData,
     state.writer.drain_within(COMPACT_FRAME_FLUSH_BUDGET).await;
     let outcome = engine
         .session
-        .compact(instructions.as_deref(), &model, api_key, None)
+        .compact(instructions.as_deref(), &[], &model, api_key, None)
         .await;
     state.compacting.fetch_sub(1, Ordering::SeqCst);
     // The parked rows deliver after the rebuild settles, never into its

@@ -160,6 +160,7 @@ impl AgentSession {
     pub async fn compact(
         &self,
         custom_instructions: Option<&str>,
+        preserve: &[String],
         model: &pa_types::ai::Model,
         api_key: Option<String>,
         abort: Option<&pa_agent::abort::AbortSignal>,
@@ -168,6 +169,7 @@ impl AgentSession {
             "compact.enter",
             &serde_json::json!({
                 "customInstructions": custom_instructions.is_some(),
+                "preserve": preserve.len(),
             }),
         );
         let started_at = std::time::Instant::now();
@@ -176,10 +178,24 @@ impl AgentSession {
             .lock()
             .expect("compaction summary sink lock")
             .clone();
+        // The carry-forward notes read from the branch at compaction start:
+        // the LLM arm appends them to its instructions; the deterministic
+        // arm folds them from the rows itself.
+        let carried = {
+            let session = self.session.lock().await;
+            let entries: Vec<pa_types::session::FileEntry> = session
+                .active_branch_entries()
+                .into_iter()
+                .cloned()
+                .collect();
+            crate::session_engine::compact_carry::latest_carry_items(&entries)
+        };
         let options = crate::session_engine::compact_session::CompactOptions {
             model: model.clone(),
             api_key,
             custom_instructions,
+            preserve: preserve.to_vec(),
+            carried,
             settings: self.compaction_settings(),
             abort,
             // Captured per attempt inside `compaction_attempts`: a
@@ -189,6 +205,11 @@ impl AgentSession {
             auxiliary: self.auxiliary_model.as_ref(),
             summary_delta,
             semantic_edges: self.semantic_edges(),
+            on_model_fallback: self.telemetry.clone().map(|telemetry| {
+                std::sync::Arc::new(move |succeeded: bool| {
+                    telemetry.note_compaction_model_fallback(succeeded);
+                }) as crate::session_engine::compaction_exec::ModelFallbackHook
+            }),
         };
         // The flight spans the attempts, the rebuilt-context replace, and
         // the kernel-state notice: every path here REPLACES the live loop
@@ -217,6 +238,12 @@ impl AgentSession {
         let loop_messages: Vec<AgentMessage> = rebuilt_loop_messages(rebuilt);
         let rebuilt_message_count = loop_messages.len();
         self.agent.set_messages(loop_messages).await;
+        // The rebuilt context replaced the warmed request's prefix (TS's
+        // `isCurrent` prefix check): stop warming the old entry; the next
+        // session request re-arms with the compacted context.
+        if let Some(warmer) = self.cache_warmer() {
+            warmer.invalidate("conversation context changed");
+        }
         compaction_trace::trace(
             "compact.rebuilt_context",
             &serde_json::json!({ "messages": rebuilt_message_count }),
@@ -275,12 +302,15 @@ impl AgentSession {
                 model: options.model.clone(),
                 api_key: options.api_key.clone(),
                 custom_instructions: options.custom_instructions,
+                preserve: options.preserve.clone(),
+                carried: options.carried.clone(),
                 settings: options.settings,
                 abort: options.abort,
                 harness_digest: digest_inputs,
                 auxiliary: options.auxiliary,
                 summary_delta: options.summary_delta.clone(),
                 semantic_edges: options.semantic_edges.clone(),
+                on_model_fallback: options.on_model_fallback.clone(),
             };
             let prepared = crate::session_engine::compact_session::summarize_attempt(
                 &attempt,

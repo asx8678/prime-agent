@@ -601,6 +601,12 @@ pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::execu
             let stream_options =
                 pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
                     api_key,
+                    // One-off gate reviews never read the prompt cache back, so
+                    // they opt out entirely (pi `completeSummarization`
+                    // parity): no cache writes, and a fresh routing id keeps the
+                    // session's cache namespace clean.
+                    cache_retention: Some(pa_types::ai::CacheRetention::None),
+                    session_id: Some(uuid::Uuid::new_v4().to_string()),
                     ..Default::default()
                 });
             Ok(pa_ai::complete_simple(&model, &context, Some(stream_options)).await?)
@@ -658,6 +664,7 @@ mod tests {
 
     fn test_model() -> Model {
         Model {
+            prompt_cache: None,
             id: "test".to_string(),
             name: "test".to_string(),
             api: "openai-completions".to_string(),
@@ -1197,5 +1204,56 @@ Reviewer instructions: record it"
         assert!(
             !global_state.entries[&crate::refinement::RefinementKind::Memory].contains_key("g1")
         );
+    }
+
+    /// The one-off refine gate opts out of prompt caching, like the compaction
+    /// summarizer: `CacheRetention::None` plus a fresh routing id, so gate
+    /// reviews never write cache entries.
+    #[tokio::test]
+    async fn default_refiner_call_opts_out_of_prompt_caching() {
+        type Captured = (Option<pa_types::ai::CacheRetention>, Option<String>);
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                    id: "gate-m".to_string(),
+                    name: Some("Gate Model".to_string()),
+                    reasoning: Some(false),
+                    input: Some(vec![pa_types::ai::ModelInput::Text]),
+                    cost: None,
+                    context_window: Some(1_000),
+                    max_tokens: Some(256),
+                }]),
+                ..Default::default()
+            });
+        let model = registration.get_model();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Captured>>> = std::sync::Arc::default();
+        let recorder = seen.clone();
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
+            std::sync::Arc::new(
+                move |_context: &pa_types::ai::Context,
+                      options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let captured = options.map_or((None, None), |options| {
+                        (options.cache_retention, options.session_id.clone())
+                    });
+                    recorder.lock().unwrap().push(captured);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        "gate reply",
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ),
+        )]);
+        let refiner = default_refiner_call(None);
+        let message = refiner(model, "review the conversation", "the prompt".to_string())
+            .await
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        let seen = seen.lock().unwrap();
+        let (retention, session_id) = seen[0].clone();
+        assert_eq!(retention, Some(pa_types::ai::CacheRetention::None));
+        assert!(session_id.is_some(), "one-off requests route on a fresh id");
+        registration.unregister();
     }
 }

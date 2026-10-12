@@ -1,0 +1,1 @@
+- When a summary routed to the `auxiliaryModel` fails on the wire, compaction and branch summaries retry once on the session model (with its own headers, and re-sized for its context window) instead of failing; an aborted run never retries. The retry is counted in session telemetry (`compaction_model_fallback_count`, `compaction_model_fallback_failed_count`).

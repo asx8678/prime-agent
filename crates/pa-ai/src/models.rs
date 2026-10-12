@@ -58,6 +58,7 @@ mod tests {
         map: Option<std::collections::BTreeMap<ModelThinkingLevel, Option<String>>>,
     ) -> Model {
         Model {
+            prompt_cache: None,
             id: "m".into(),
             name: "m".into(),
             api: "openai-completions".into(),

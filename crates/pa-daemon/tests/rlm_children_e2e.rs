@@ -234,6 +234,7 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         cell_source_code: None,
         spawned_by_request_id: None,
         decision_child: false,
+        inherited_cost_ceiling: None,
     }
 }
 
@@ -583,6 +584,7 @@ async fn a_decision_child_spawn_runs_the_decision_engine_end_to_end() {
             cell_source_code: None,
             spawned_by_request_id: None,
             decision_child: true,
+            inherited_cost_ceiling: None,
         })
         .await
         .expect("spawn the decision child");
@@ -698,6 +700,74 @@ async fn rlm_create_session_spawns_a_prompted_depth_zero_session() {
             .filter(|sessions| sessions.is_empty())
             .map(|_| ())
     });
+}
+
+/// The cost ceiling's tree scope: a spawn carrying the parent tree's
+/// remaining budget lands it on the child's durable create command as
+/// `runtimeMetadata.rlmCostCeiling`, so the child worker — and any respawn
+/// that replays the command — builds its session under the inherited cap.
+#[tokio::test]
+async fn an_inherited_cost_ceiling_rides_the_child_create() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let script = write_script(dir.path(), "child answer");
+    let children = children(&socket, &agent_dir, &script, 0);
+    let mut request = spawn_request("capped", "ship the lane");
+    request.inherited_cost_ceiling =
+        Some(pa_core::session_engine::rlm_cost::InheritedCostCeiling {
+            cost_usd: Some(1.5),
+            spawn_limit: Some(2),
+        });
+    let handle = children.spawn(request).await.expect("spawn");
+    children.notify_turn_done();
+    // The supervisor persisted the create command the worker received.
+    let creates: Vec<Value> = walk_json_files(&agent_dir)
+        .into_iter()
+        .filter_map(|value| {
+            // A worker descriptor nests the command under `createCommand`.
+            let command = value.get("createCommand").unwrap_or(&value);
+            let metadata = command.get("runtimeMetadata")?.clone();
+            (metadata["rlmChildId"] == json!(handle.rlm_child_id)).then_some(metadata)
+        })
+        .collect();
+    assert!(
+        !creates.is_empty(),
+        "the child's durable create was persisted"
+    );
+    for metadata in creates {
+        assert_eq!(
+            metadata["rlmCostCeiling"],
+            json!({ "costUsd": 1.5, "spawnLimit": 2 })
+        );
+    }
+}
+
+/// Every JSON document under `root` (the supervisor's descriptor files).
+fn walk_json_files(root: &Path) -> Vec<Value> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+                if let Some(value) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                {
+                    found.push(value);
+                }
+            }
+        }
+    }
+    found
 }
 
 #[tokio::test]

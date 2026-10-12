@@ -445,7 +445,7 @@ mod tests {
         engine: &AgentSession,
         model: &pa_types::ai::Model,
     ) -> anyhow::Result<CompactOutcome> {
-        engine.compact(None, model, None, None).await
+        engine.compact(None, &[], model, None, None).await
     }
 
     #[tokio::test]

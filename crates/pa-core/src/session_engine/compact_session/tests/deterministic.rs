@@ -16,6 +16,8 @@ fn deterministic(model: pa_types::ai::Model) -> CompactOptions<'static> {
         model,
         api_key: None,
         custom_instructions: None,
+        preserve: Vec::new(),
+        carried: Vec::new(),
         settings: super::super::compaction::CompactionSettings {
             keep_recent_tokens: 10,
             engine: CompactionEngine::Deterministic,
@@ -26,6 +28,7 @@ fn deterministic(model: pa_types::ai::Model) -> CompactOptions<'static> {
         auxiliary: None,
         summary_delta: None,
         semantic_edges: None,
+        on_model_fallback: None,
     }
 }
 

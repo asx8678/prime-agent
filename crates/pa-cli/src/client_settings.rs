@@ -24,6 +24,14 @@ impl CliClientSettings {
     }
 }
 
+/// A settings enum's serde wire name (`"streaming"`, `"llm"`, ...).
+fn wire_name<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
 macro_rules! setting {
     ($get:ident, $set:ident, $getter:ident, $setter:ident, $ty:ty) => {
         fn $get(&self) -> $ty {
@@ -193,6 +201,45 @@ impl ClientSettings for CliClientSettings {
         bool
     );
 
+    fn cache_warming_mode(&self) -> String {
+        wire_name(&self.manager().get_cache_warming_mode())
+    }
+
+    fn set_cache_warming_mode(&self, mode: &str) -> Result<()> {
+        let parsed: pa_core::settings::CacheWarmingMode = serde_json::from_value(
+            serde_json::Value::String(mode.to_string()),
+        )
+        .map_err(|error| anyhow::anyhow!("Invalid cache warming mode \"{mode}\": {error}"))?;
+        self.manager().set_cache_warming_mode(parsed)
+    }
+
+    setting!(
+        repeat_guard_enabled,
+        set_repeat_guard_enabled,
+        get_repeat_guard_enabled,
+        set_repeat_guard_enabled,
+        bool
+    );
+    setting!(
+        auto_refine_enabled,
+        set_auto_refine_enabled,
+        get_auto_refine_enabled,
+        set_auto_refine_enabled,
+        bool
+    );
+
+    fn compaction_engine(&self) -> String {
+        wire_name(&self.manager().get_compaction_engine())
+    }
+
+    fn set_compaction_engine(&self, engine: &str) -> Result<()> {
+        let parsed: pa_core::settings::CompactionEngine = serde_json::from_value(
+            serde_json::Value::String(engine.to_string()),
+        )
+        .map_err(|error| anyhow::anyhow!("Invalid compaction engine \"{engine}\": {error}"))?;
+        self.manager().set_compaction_engine(parsed)
+    }
+
     /// `updateChannel`: the settings enum's wire value; unset reads as
     /// `None`.
     fn update_channel(&self) -> Option<String> {
@@ -330,5 +377,67 @@ mod tests {
             std::fs::read_to_string(agent_dir.join("settings.json")).expect("settings file");
         let value: serde_json::Value = serde_json::from_str(&content).expect("parse");
         assert_eq!(value["factory"]["enabled"], false);
+    }
+
+    /// The `/settings` Advanced tab's rows: the defaults read through the seam, each write lands on
+    /// the exact key the session engine reads, and an unknown mode is refused before it is written.
+    #[test]
+    fn advanced_tab_settings_round_trip_through_the_settings_store() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let settings = CliClientSettings::new(dir.path().to_path_buf(), agent_dir.clone());
+
+        assert_eq!(
+            (
+                settings.cache_warming_mode(),
+                settings.repeat_guard_enabled(),
+                settings.auto_refine_enabled(),
+                settings.compaction_engine(),
+            ),
+            ("off".to_string(), true, true, "deterministic".to_string())
+        );
+
+        settings
+            .set_cache_warming_mode("idle")
+            .expect("cache warming");
+        settings
+            .set_repeat_guard_enabled(false)
+            .expect("repeat guard");
+        settings
+            .set_auto_refine_enabled(false)
+            .expect("auto refine");
+        settings
+            .set_compaction_engine("llm")
+            .expect("compaction engine");
+        assert!(settings.set_cache_warming_mode("always").is_err());
+        assert!(settings.set_compaction_engine("model").is_err());
+
+        assert_eq!(
+            (
+                settings.cache_warming_mode(),
+                settings.repeat_guard_enabled(),
+                settings.auto_refine_enabled(),
+                settings.compaction_engine(),
+            ),
+            ("idle".to_string(), false, false, "llm".to_string())
+        );
+        let content =
+            std::fs::read_to_string(agent_dir.join("settings.json")).expect("settings file");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(
+            [
+                &value["cacheWarming"],
+                &value["repeatGuard"],
+                &value["autoRefine"],
+                &value["compaction"],
+            ],
+            [
+                &serde_json::json!("idle"),
+                &serde_json::json!({ "enabled": false }),
+                &serde_json::json!({ "enabled": false }),
+                &serde_json::json!({ "engine": "llm" }),
+            ]
+        );
     }
 }

@@ -1096,6 +1096,14 @@ impl TimedRpcChild {
     /// Spawn with the reader deferred (stdout held unread until `begin_reading`).
     fn spawn_stalled(fixture: &std::path::Path, script: &Value) -> TimedRpcChild {
         let home = tempfile::TempDir::new().unwrap();
+        // The callers script the model summarizer's answers, so compaction
+        // runs the "llm" engine rather than the deterministic default.
+        std::fs::create_dir_all(home.path().join(".prime/agent")).unwrap();
+        std::fs::write(
+            home.path().join(".prime/agent/settings.json"),
+            json!({ "compaction": { "engine": "llm" } }).to_string(),
+        )
+        .unwrap();
         let bin = env!("CARGO_BIN_EXE_prime-agent");
         let mut child = Command::new(bin)
             .args(["--mode", "rpc", "--resume", fixture.to_str().unwrap()])

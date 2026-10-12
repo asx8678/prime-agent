@@ -199,6 +199,13 @@ struct GateHoldEngine {
     entered: Arc<Notify>,
     release: Arc<Notify>,
     gates: Arc<std::sync::atomic::AtomicUsize>,
+    /// The session's prompt-cache warm window (`cache_warming_active`);
+    /// off by default, so the raced arms keep today's path.
+    warming: Arc<std::sync::atomic::AtomicBool>,
+    /// Every warm-window check, counted and signalled (the deferral's
+    /// observable readiness).
+    warm_checks: Arc<std::sync::atomic::AtomicUsize>,
+    warm_checked: Arc<Notify>,
 }
 
 impl GateHoldEngine {
@@ -207,6 +214,9 @@ impl GateHoldEngine {
             entered: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
             gates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            warming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warm_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            warm_checked: Arc::new(Notify::new()),
         }
     }
 }
@@ -274,6 +284,16 @@ impl SessionEngine for GateHoldEngine {
             release.notified().await;
             true
         })
+    }
+
+    fn cache_warming_active(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let warming = self.warming.load(std::sync::atomic::Ordering::SeqCst);
+        self.warm_checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.warm_checked.notify_waiters();
+        Box::pin(std::future::ready(warming))
     }
 }
 
@@ -400,6 +420,57 @@ async fn the_unraced_fire_passes_the_gate_and_asks_the_supervisor_to_stop() {
         Some("interleave-worker-token")
     );
     assert_eq!(asks[0].get("idleMinutes").and_then(Value::as_u64), Some(1));
+}
+
+/// A live prompt-cache warm window defers the stop in place: while the
+/// window is live the fire re-checks it and sends no ask (a short
+/// `idleEvictionMinutes` must not park a worker mid-window); once the
+/// window ends, the same fire asks exactly once. Shares the positive arm's
+/// fixture, so the deferral cannot green itself by never asking.
+#[tokio::test]
+async fn a_live_warm_window_defers_the_stop_until_it_ends() {
+    let probe = StopAskProbe::spawn();
+    let gate = Arc::new(GateHoldEngine::new());
+    gate.warming
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (runner, dir) = interleave_runner(&gate, &probe);
+    let seam = drive_the_fire_to_the_gate(runner, dir, &gate).await;
+    gate.release.notify_one();
+    // The fire passed the engine gate and is re-checking the live window:
+    // at least two checks prove it waits in place rather than asking.
+    // Bounded so a missing deferral fails instead of hanging: without it
+    // the fire asks at once and never re-checks the window.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let checked = gate.warm_checked.notified();
+            if gate.warm_checks.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            checked.await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the fire never waited on the warm window: {:?}",
+            probe.asks()
+        )
+    });
+    assert!(
+        probe.asks().is_empty(),
+        "no stop ask while the cache is kept warm: {:?}",
+        probe.asks()
+    );
+    // The window ends: the deferred fire resumes and asks once.
+    gate.warming
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    seam.fired.await.expect("the fire settles");
+    let asks = probe.asks();
+    assert_eq!(asks.len(), 1, "one ask once the window ended: {asks:?}");
+    assert_eq!(
+        asks[0].get("type").and_then(Value::as_str),
+        Some("worker_idle_passivation")
+    );
 }
 
 /// A client attaching while the fire holds at the engine gate (the round-7

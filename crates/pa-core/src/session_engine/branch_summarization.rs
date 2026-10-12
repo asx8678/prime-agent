@@ -265,6 +265,9 @@ pub struct GenerateBranchSummaryOptions<'a> {
     /// When present, the summary call resolves its model through the
     /// `auxiliaryModel` setting with a context-window fit check.
     pub auxiliary: Option<&'a super::auxiliary_model::AuxiliaryModelContext>,
+    /// Adoption telemetry for the routed-model wire fallback: called once
+    /// per session-model retry with whether it succeeded.
+    pub on_model_fallback: Option<super::compaction_exec::ModelFallbackHook>,
 }
 
 /// The default reserve budget.
@@ -322,13 +325,14 @@ pub async fn generate_branch_summary(
         replace_instructions,
         reserve_tokens,
         auxiliary,
+        on_model_fallback,
     } = options;
     // The branch summary runs with its own prompt prefix, so on the session model it
     // re-reads the whole branch — route it to the auxiliary model when its known window fits.
     // The fit check estimates the request the SESSION model would issue; the
     // routed model re-slices with its own window. The resolution reads
     // settings/models/auth, so it runs on the blocking pool.
-    let (routed_model, api_key, summary_headers) = match auxiliary {
+    let (routed, session_headers) = match auxiliary {
         Some(context) => {
             let required = estimate_branch_summary_request_tokens(
                 entries,
@@ -342,75 +346,103 @@ pub async fn generate_branch_summary(
                 let session_model = model.clone();
                 let session_api_key = api_key.clone();
                 tokio::task::spawn_blocking(move || {
-                    super::auxiliary_model::resolve_auxiliary_model(
+                    let routed = super::auxiliary_model::resolve_auxiliary_model(
                         &context,
                         "branch summary",
                         &session_model,
                         session_api_key.as_deref(),
                         Some(required),
-                    )
+                    );
+                    // The wire fallback's session headers, resolved on the
+                    // same blocking hop (a registry read) and only when the
+                    // routing actually moved off the session model.
+                    let session_headers = if super::compaction_exec::is_session_model(
+                        &routed.model,
+                        &session_model,
+                    ) {
+                        None
+                    } else {
+                        super::auxiliary_model::session_fallback_with_headers(
+                            &context,
+                            &session_model,
+                            session_api_key,
+                        )
+                        .headers
+                    };
+                    (routed, session_headers)
                 })
             };
             // A JoinError (the closure panicked) degrades to the session
             // fallback, which keeps the merged headers.
-            let routed = join.await.unwrap_or_else(|_| {
-                super::auxiliary_model::session_fallback_with_headers(
-                    context,
-                    model,
-                    api_key.clone(),
+            join.await.unwrap_or_else(|_| {
+                (
+                    super::auxiliary_model::session_fallback_with_headers(
+                        context,
+                        model,
+                        api_key.clone(),
+                    ),
+                    None,
                 )
-            });
-            (routed.model, routed.api_key, routed.headers)
+            })
         }
-        None => (model.clone(), api_key.clone(), None),
+        None => (
+            super::auxiliary_model::ResolvedAuxiliaryModel {
+                model: model.clone(),
+                api_key: api_key.clone(),
+                headers: None,
+            },
+            None,
+        ),
     };
-    let model = &routed_model;
-    let context_window = if model.context_window > 0 {
-        model.context_window
-    } else {
-        128_000
-    };
-    let token_budget = context_window.saturating_sub(reserve_tokens);
-    let (request_messages, preparation) = build_branch_summary_request(
+    let request = BranchSummaryRequest {
         entries,
-        token_budget,
+        reserve_tokens,
         custom_instructions,
         replace_instructions,
-    );
-    if request_messages.is_empty() {
-        let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
-        return BranchSummaryResult {
-            summary: Some("No content to summarize".to_string()),
-            read_files,
-            modified_files,
-            ..Default::default()
-        };
-    }
-    let context = pa_types::ai::Context {
-        system_prompt: Some(super::compaction_utils::SUMMARIZATION_SYSTEM_PROMPT.to_string()),
-        messages: convert_to_llm(&request_messages)
-            .into_iter()
-            .filter_map(|message| match message {
-                AgentMessage::User(user) => {
-                    Some(pa_types::ai::Message::User(pa_types::ai::UserMessage {
-                        content: user.content,
-                        timestamp: user.timestamp,
-                        rest: user.rest,
-                    }))
-                }
-                _ => None,
-            })
-            .collect(),
-        tools: None,
     };
-    let stream_options =
-        pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
-            max_tokens: Some(BRANCH_SUMMARY_MAX_TOKENS),
-            api_key,
-            headers: summary_headers.map(|headers| headers.into_iter().collect()),
-            ..Default::default()
-        });
-    let response = match pa_ai::complete_simple(model, &context, Some(stream_options)).await {
+    let (routed_result, routed_preparation) = match request
+        .call(
+            &routed.model,
+            routed.api_key.clone(),
+            routed.headers.clone(),
+        )
+        .await
+    {
+        BranchSummaryCall::Empty(preparation) => return no_content_summary(&preparation),
+        BranchSummaryCall::Sent(result, preparation) => (result, preparation),
+    };
+    let routed_failed = !matches!(
+        routed_result.as_ref(),
+        Ok(response) if response.stop_reason != pa_types::ai::StopReason::Error
+    );
+    // The routed call failed: retry once on the session model when the
+    // routing actually moved (codex `compact_model_fallback.rs`). The retry
+    // re-slices the branch for the session model's own window — the routed
+    // request was sized for the routed model's.
+    let (result, preparation, served_by) = if routed_failed
+        && !super::compaction_exec::is_session_model(&routed.model, model)
+    {
+        eprintln!(
+                "Warning: auxiliary model \"{}/{}\" failed for the branch summary; using the session model.",
+                routed.model.provider,
+                routed.model.id
+            );
+        match request.call(model, api_key, session_headers).await {
+            BranchSummaryCall::Empty(preparation) => return no_content_summary(&preparation),
+            BranchSummaryCall::Sent(result, preparation) => {
+                if let Some(on_fallback) = &on_model_fallback {
+                    on_fallback(matches!(
+                        result.as_ref(),
+                        Ok(response) if response.stop_reason != pa_types::ai::StopReason::Error
+                    ));
+                }
+                (result, preparation, model)
+            }
+        }
+    } else {
+        (routed_result, routed_preparation, &routed.model)
+    };
+    let response = match *result {
         Ok(response) => response,
         Err(error) => {
             return BranchSummaryResult {
@@ -446,8 +478,99 @@ pub async fn generate_branch_summary(
         .join("\n");
     let mut result = finalize_branch_summary(&response_text, &preparation);
     result.usage = (response.usage.total_tokens > 0).then_some(response.usage);
-    result.model = Some((model.provider.clone(), model.id.clone()));
+    result.model = Some((served_by.provider.clone(), served_by.id.clone()));
     result
+}
+
+/// The inputs of one branch-summary wire call, shared by the routed call and
+/// its session-model fallback.
+struct BranchSummaryRequest<'a> {
+    entries: &'a [FileEntry],
+    reserve_tokens: u64,
+    custom_instructions: Option<&'a str>,
+    replace_instructions: bool,
+}
+
+/// One branch-summary call's outcome, with the preparation its request was
+/// built from (the file lists fold from it).
+enum BranchSummaryCall {
+    /// Nothing to summarize under this model's window: no request was sent.
+    Empty(BranchPreparation),
+    /// The call's outcome, boxed: an assistant message dwarfs the empty
+    /// arm.
+    Sent(
+        Box<Result<pa_types::ai::AssistantMessage, pa_ai::ProviderError>>,
+        BranchPreparation,
+    ),
+}
+
+impl BranchSummaryRequest<'_> {
+    /// Slice the branch for `model`'s own window and send the summary
+    /// request. One-off branch summaries never read the prompt cache back,
+    /// so they opt out entirely (pi `completeSummarization` parity): no cache
+    /// writes, and a fresh routing id keeps the session's cache namespace
+    /// clean.
+    async fn call(
+        &self,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        headers: Option<std::collections::BTreeMap<String, String>>,
+    ) -> BranchSummaryCall {
+        let context_window = if model.context_window > 0 {
+            model.context_window
+        } else {
+            128_000
+        };
+        let token_budget = context_window.saturating_sub(self.reserve_tokens);
+        let (request_messages, preparation) = build_branch_summary_request(
+            self.entries,
+            token_budget,
+            self.custom_instructions,
+            self.replace_instructions,
+        );
+        if request_messages.is_empty() {
+            return BranchSummaryCall::Empty(preparation);
+        }
+        let context = pa_types::ai::Context {
+            system_prompt: Some(super::compaction_utils::SUMMARIZATION_SYSTEM_PROMPT.to_string()),
+            messages: convert_to_llm(&request_messages)
+                .into_iter()
+                .filter_map(|message| match message {
+                    AgentMessage::User(user) => {
+                        Some(pa_types::ai::Message::User(pa_types::ai::UserMessage {
+                            content: user.content,
+                            timestamp: user.timestamp,
+                            rest: user.rest,
+                        }))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            tools: None,
+        };
+        let stream_options =
+            pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+                max_tokens: Some(BRANCH_SUMMARY_MAX_TOKENS),
+                api_key,
+                headers: headers.map(|headers| headers.into_iter().collect()),
+                cache_retention: Some(pa_types::ai::CacheRetention::None),
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            });
+        let result = pa_ai::complete_simple(model, &context, Some(stream_options)).await;
+        BranchSummaryCall::Sent(Box::new(result), preparation)
+    }
+}
+
+/// The result for a branch with nothing to summarize.
+fn no_content_summary(preparation: &BranchPreparation) -> BranchSummaryResult {
+    let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
+    BranchSummaryResult {
+        summary: Some("No content to summarize".to_string()),
+        read_files,
+        modified_files,
+        ..Default::default()
+    }
 }
 
 /// The presentation message users see for a branch summary.
@@ -598,6 +721,7 @@ mod tests {
                 replace_instructions: false,
                 reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                 auxiliary: None,
+                on_model_fallback: None,
             },
         )
         .await;
@@ -630,6 +754,7 @@ mod tests {
                 replace_instructions: false,
                 reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                 auxiliary: None,
+                on_model_fallback: None,
             },
         )
         .await;
@@ -693,6 +818,7 @@ mod tests {
                     replace_instructions: false,
                     reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                     auxiliary: Some(&aux),
+                    on_model_fallback: None,
                 },
             )
             .await;
@@ -748,5 +874,185 @@ mod tests {
         let small_window =
             estimate_branch_summary_request_tokens(&wide, 100_000, 16_384, None, false);
         assert!(big_window > small_window);
+    }
+
+    /// A routed auxiliary model that fails on the wire falls back to the
+    /// session model, and the retry re-slices the branch for the session
+    /// model's own (smaller) window instead of resending the routed request.
+    #[tokio::test]
+    async fn branch_summary_wire_failure_retries_on_the_session_model_resliced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{ "auxiliaryModel": "testaux/aux-model" }"#,
+        )
+        .unwrap();
+        // The auxiliary provider listens nowhere (port 9): its call fails on
+        // the wire.
+        std::fs::write(
+            dir.path().join("models.json"),
+            r#"{ "providers": { "testaux": {
+                "baseUrl": "http://127.0.0.1:9", "apiKey": "aux-key",
+                "api": "openai-completions",
+                "models": [ { "id": "aux-model", "name": "Aux", "contextWindow": 128000 } ]
+            } } }"#,
+        )
+        .unwrap();
+        let auxiliary = super::super::auxiliary_model::AuxiliaryModelContext {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().to_path_buf(),
+        };
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                    id: "branch-session-m".to_string(),
+                    name: Some("Branch Session Model".to_string()),
+                    reasoning: Some(false),
+                    input: Some(vec![pa_types::ai::ModelInput::Text]),
+                    cost: None,
+                    context_window: Some(1_500),
+                    max_tokens: Some(256),
+                }]),
+                ..Default::default()
+            });
+        let model = registration.get_model();
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let recorder = prompts.clone();
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
+            std::sync::Arc::new(
+                move |context: &pa_types::ai::Context,
+                      _options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let text = context
+                        .messages
+                        .iter()
+                        .map(|message| match message {
+                            pa_types::ai::Message::User(user) => user.content.text(),
+                            _ => String::new(),
+                        })
+                        .collect::<String>();
+                    recorder.lock().unwrap().push(text);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        "## Goal\nthe fallback summary",
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ),
+        )]);
+        // Twelve ~1,000-char turns: the routed 128k window takes them all,
+        // the session's 1,500-token window only the newest few.
+        let mut entries = Vec::new();
+        for index in 0..12 {
+            let parent = (index > 0).then(|| format!("u{}", index - 1));
+            entries.push(entry(
+                &format!("u{index}"),
+                parent.as_deref(),
+                user(&format!("turn-marker-{index:02} {}", "x".repeat(1_000))),
+            ));
+        }
+        let reported: std::sync::Arc<std::sync::Mutex<Vec<bool>>> = std::sync::Arc::default();
+        let report = reported.clone();
+        let result = generate_branch_summary(
+            &entries,
+            GenerateBranchSummaryOptions {
+                model: &model,
+                api_key: None,
+                custom_instructions: None,
+                replace_instructions: false,
+                reserve_tokens: 500,
+                auxiliary: Some(&auxiliary),
+                on_model_fallback: Some(std::sync::Arc::new(move |succeeded| {
+                    report.lock().unwrap().push(succeeded);
+                })),
+            },
+        )
+        .await;
+        assert_eq!(result.error, None);
+        assert!(result
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("the fallback summary")));
+        assert_eq!(
+            result.model,
+            Some((model.provider.clone(), model.id.clone())),
+            "the session model served the summary"
+        );
+        assert_eq!(reported.lock().unwrap().as_slice(), [true]);
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "one session-model call");
+        assert!(
+            prompts[0].contains("turn-marker-11"),
+            "the newest turn is kept"
+        );
+        assert!(
+            !prompts[0].contains("turn-marker-00"),
+            "the retry was re-sliced for the session window"
+        );
+        registration.unregister();
+    }
+
+    /// The one-off branch summary opts out of prompt caching, like the
+    /// compaction summarizer: `CacheRetention::None` plus a fresh routing id.
+    #[tokio::test]
+    async fn branch_summary_opts_out_of_prompt_caching() {
+        type Captured = (Option<pa_types::ai::CacheRetention>, Option<String>);
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                    id: "branch-m".to_string(),
+                    name: Some("Branch Model".to_string()),
+                    reasoning: Some(false),
+                    input: Some(vec![pa_types::ai::ModelInput::Text]),
+                    cost: None,
+                    context_window: Some(1_000),
+                    max_tokens: Some(256),
+                }]),
+                ..Default::default()
+            });
+        let model = registration.get_model();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Captured>>> = std::sync::Arc::default();
+        let recorder = seen.clone();
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
+            std::sync::Arc::new(
+                move |_context: &pa_types::ai::Context,
+                      options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let captured = options.map_or((None, None), |options| {
+                        (options.cache_retention, options.session_id.clone())
+                    });
+                    recorder.lock().unwrap().push(captured);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        "the branch summary",
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ),
+        )]);
+        let entries = vec![
+            entry("u1", None, user("start")),
+            entry("a1", Some("u1"), user("assistant turn")),
+            entry("u2", Some("a1"), user("the old leaf")),
+        ];
+        let result = generate_branch_summary(
+            &entries,
+            GenerateBranchSummaryOptions {
+                model: &model,
+                api_key: None,
+                custom_instructions: None,
+                replace_instructions: false,
+                reserve_tokens: 100,
+                auxiliary: None,
+                on_model_fallback: None,
+            },
+        )
+        .await;
+        assert!(result.summary.is_some());
+        let seen = seen.lock().unwrap();
+        let (retention, session_id) = seen[0].clone();
+        assert_eq!(retention, Some(pa_types::ai::CacheRetention::None));
+        assert!(session_id.is_some(), "one-off requests route on a fresh id");
+        registration.unregister();
     }
 }

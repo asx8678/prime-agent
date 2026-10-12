@@ -179,6 +179,28 @@ impl Worker {
                 }
                 _ => (None, None, None, None),
             };
+        // The cost budget inherited from the parent's tree (any child kind);
+        // a malformed value fails the create rather than uncapping the child.
+        let inherited_cost_ceiling = match payload
+            .get("runtimeMetadata")
+            .and_then(|metadata| metadata.get("rlmCostCeiling"))
+        {
+            None | Some(Value::Null) => None,
+            Some(value) => match serde_json::from_value::<
+                pa_core::session_engine::rlm_cost::InheritedCostCeiling,
+            >(value.clone())
+            {
+                Ok(ceiling) => Some(ceiling),
+                Err(error) => {
+                    return response_failure(
+                        None,
+                        "create",
+                        &format!("invalid runtimeMetadata.rlmCostCeiling: {error}"),
+                        None,
+                    )
+                }
+            },
+        };
         let thinking = payload
             .get("thinking")
             .and_then(Value::as_str)
@@ -593,6 +615,7 @@ impl Worker {
             thinking,
             child_script: child_script.clone(),
             semantic_spawn,
+            inherited_cost_ceiling,
         }) {
             return response_failure(None, "create", &error.to_string(), None);
         }

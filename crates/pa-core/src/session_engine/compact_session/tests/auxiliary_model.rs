@@ -53,6 +53,8 @@ async fn compaction_auxiliary_selector_equal_to_the_session_model_runs_on_the_se
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -63,6 +65,7 @@ async fn compaction_auxiliary_selector_equal_to_the_session_model_runs_on_the_se
             auxiliary: Some(&aux),
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -103,6 +106,8 @@ async fn compaction_auxiliary_selector_unusable_falls_back_to_the_session_model(
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -113,6 +118,7 @@ async fn compaction_auxiliary_selector_unusable_falls_back_to_the_session_model(
             auxiliary: Some(&aux),
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await

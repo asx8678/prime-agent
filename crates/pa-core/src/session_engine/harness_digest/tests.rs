@@ -429,7 +429,7 @@ async fn spawn_compact(
 ) -> tokio::task::JoinHandle<anyhow::Result<crate::session_engine::compact_session::CompactOutcome>>
 {
     let model = model.clone();
-    let handle = tokio::spawn(async move { engine.compact(None, &model, None, None).await });
+    let handle = tokio::spawn(async move { engine.compact(None, &[], &model, None, None).await });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while registration.call_count() == 0 {
         assert!(

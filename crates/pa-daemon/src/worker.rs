@@ -575,6 +575,38 @@ impl Worker {
                         );
                     });
                     concrete.set_goal_admission(probe, sink, queue_purge);
+                    // The custom-row mirror: the worker owns the session
+                    // file, so kernel carry and cost-ceiling rows persist
+                    // through its store (the engine's manager is
+                    // non-persisted here).
+                    let custom_core = Arc::clone(&core);
+                    concrete.set_custom_row_sink(std::sync::Arc::new(move |row| {
+                        let mut core = custom_core.lock().unwrap();
+                        if let Some(store) = core.store.as_mut() {
+                            let _ = store.persist_entry("custom_message", row);
+                        }
+                    }));
+                    // The warm-usage mirror (the same ownership rule): a
+                    // successful cache refresh appends the TS `type:
+                    // "usage"` row (`kind: "cache_warm"`) through the
+                    // worker's durable store.
+                    let warm_core = Arc::clone(&core);
+                    concrete.set_warm_usage_sink(std::sync::Arc::new(
+                        move |usage: pa_core::session_engine::cache_warmer::WarmUsage| {
+                            let mut core = warm_core.lock().unwrap();
+                            if let Some(store) = core.store.as_mut() {
+                                let _ = store.persist_entry(
+                                    "usage",
+                                    serde_json::json!({
+                                        "kind": "cache_warm",
+                                        "provider": usage.provider,
+                                        "model": usage.model,
+                                        "usage": usage.usage,
+                                    }),
+                                );
+                            }
+                        },
+                    ));
                     let late_core = Arc::clone(&core);
                     let late_events = Arc::clone(&events);
                     concrete.set_late_agent_message_sink(std::sync::Arc::new(

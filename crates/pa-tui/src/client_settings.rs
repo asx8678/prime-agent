@@ -171,6 +171,38 @@ pub trait ClientSettings: Send + Sync {
     ///
     /// Returns `Err` when the settings store fails.
     fn set_warnings_anthropic_extra_usage(&self, enabled: bool) -> Result<()>;
+    /// `cacheWarming` (`off`/`streaming`/`idle`; global scope only, default off).
+    fn cache_warming_mode(&self) -> String;
+    /// Persists `cacheWarming` to the global scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for an unknown mode or when the settings store fails.
+    fn set_cache_warming_mode(&self, mode: &str) -> Result<()>;
+    /// `repeatGuard.enabled` (default true).
+    fn repeat_guard_enabled(&self) -> bool;
+    /// Persists `repeatGuard.enabled` to the global scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the settings store fails.
+    fn set_repeat_guard_enabled(&self, enabled: bool) -> Result<()>;
+    /// `autoRefine.enabled` (default true).
+    fn auto_refine_enabled(&self) -> bool;
+    /// Persists `autoRefine.enabled` to the global scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the settings store fails.
+    fn set_auto_refine_enabled(&self, enabled: bool) -> Result<()>;
+    /// `compaction.engine` (`deterministic`/`llm`; default deterministic).
+    fn compaction_engine(&self) -> String;
+    /// Persists `compaction.engine` to the global scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for an unknown engine or when the settings store fails.
+    fn set_compaction_engine(&self, engine: &str) -> Result<()>;
     /// `updateChannel` (`stable`/`nightly`; unset infers the channel from
     /// the running version).
     fn update_channel(&self) -> Option<String>;

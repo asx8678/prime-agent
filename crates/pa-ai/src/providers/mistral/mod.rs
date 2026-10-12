@@ -257,6 +257,7 @@ mod tests {
     #[test]
     fn reasoning_effort_uses_thinking_level_map() {
         let model = Model {
+            prompt_cache: None,
             id: "mistral-small-2603".into(),
             name: "mistral-small".into(),
             api: "mistral-conversations".into(),

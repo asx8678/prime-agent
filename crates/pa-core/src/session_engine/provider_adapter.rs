@@ -118,22 +118,28 @@ pub fn switchable_stream_fn(target: Arc<std::sync::RwLock<Option<ProviderTarget>
     )
 }
 
-/// Stream one completion against `model` with `api_key` and the auth-resolved
-/// request `headers`: the per-request tail the switchable seams and the CLI's
-/// route-authoritative variant share.
-///
-/// # Errors
-///
-/// Returns the provider stream's error when the request fails (the
-/// per-attempt failures the retry driver classifies).
-pub fn stream_once(
+/// The converted pa-ai request a loop-level stream sends: the target model,
+/// the context after the crate-boundary round-trip, and the resolved
+/// per-request options. The cache-warmer capture shares this shape, so a
+/// warm replay repeats the request exactly as it was sent.
+pub struct SessionRequestParts {
+    pub model: Model,
+    pub context: pa_types::ai::Context,
+    pub options: pa_ai::types::SimpleStreamOptions,
+}
+
+/// Build [`SessionRequestParts`] for one request against `model`, wiring the
+/// turn's abort `cancel` into the transport options.
+#[must_use]
+pub fn build_session_request_parts(
     model: &Model,
     api_key: Option<String>,
     service_tier: Option<pa_types::ai::ServiceTier>,
     headers: Option<std::collections::BTreeMap<String, String>>,
     context: LlmContext,
     options: StreamRequestOptions,
-) -> anyhow::Result<Box<dyn ModelStream>> {
+    cancel: tokio_util::sync::CancellationToken,
+) -> SessionRequestParts {
     let messages: Vec<pa_types::ai::Message> = context
         .messages
         .iter()
@@ -145,14 +151,13 @@ pub fn stream_once(
         messages,
         tools: Some(tools),
     };
-    // The turn's abort signal reaches the transport: the in-flight request races this
-    // token; the loop's abort paths fire it through [`ModelStream::close`] or the drop.
-    let cancel = tokio_util::sync::CancellationToken::new();
     let stream_options = pa_ai::types::SimpleStreamOptions {
         base: pa_ai::types::StreamOptions {
             temperature: options.temperature,
             max_tokens: options.max_tokens,
-            signal: Some(cancel.clone()),
+            // The turn's abort signal reaches the transport: the in-flight request races this
+            // token; the loop's abort paths fire it through [`ModelStream::close`] or the drop.
+            signal: Some(cancel),
             api_key,
             transport: None,
             service_tier,
@@ -182,7 +187,53 @@ pub fn stream_once(
         reasoning: Some(model_thinking_level(options.reasoning)),
         thinking_budgets: None,
     };
-    let stream = pa_ai::stream_simple(model, &ai_context, Some(stream_options))
+    SessionRequestParts {
+        model: model.clone(),
+        context: ai_context,
+        options: stream_options,
+    }
+}
+
+/// Stream one completion against `model` with `api_key` and the auth-resolved
+/// request `headers`: the per-request tail the switchable seams and the CLI's
+/// route-authoritative variant share.
+///
+/// # Errors
+///
+/// Returns the provider stream's error when the request fails (the
+/// per-attempt failures the retry driver classifies).
+pub fn stream_once(
+    model: &Model,
+    api_key: Option<String>,
+    service_tier: Option<pa_types::ai::ServiceTier>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+    context: LlmContext,
+    options: StreamRequestOptions,
+) -> anyhow::Result<Box<dyn ModelStream>> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let parts = build_session_request_parts(
+        model,
+        api_key,
+        service_tier,
+        headers,
+        context,
+        options,
+        cancel.clone(),
+    );
+    stream_parts(parts, cancel)
+}
+
+/// Stream the converted request `parts` and pump pa-ai events into the
+/// loop's event stream, verbatim.
+///
+/// # Errors
+///
+/// Returns the provider stream's error when the request fails.
+pub fn stream_parts(
+    parts: SessionRequestParts,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Box<dyn ModelStream>> {
+    let stream = pa_ai::stream_simple(&parts.model, &parts.context, Some(parts.options))
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     // Pump pa-ai events into the loop's event stream, verbatim.
     let (handle, consumer) = pa_agent::stream::event_stream();
@@ -203,6 +254,63 @@ pub fn stream_once(
     // Keep the pump task alive as long as the stream lives.
     let (forwarder, consumer) = (forwarder, consumer);
     Ok(consumer_pump(forwarder, consumer, cancel))
+}
+
+/// The cache-warmer arm callback: the exact converted request of one
+/// session stream, handed over before the request streams.
+pub type WarmArm =
+    std::sync::Arc<dyn Fn(crate::session_engine::cache_warmer::WarmRequest) + Send + Sync>;
+
+/// The switchable target stream plus the cache-warmer arm: every session
+/// request — matched by routing id, exactly TS `streamFn`'s
+/// `cacheWarmer.start` gate — hands its request to `arm` before streaming
+/// (compaction and summaries route on fresh ids, so they never arm).
+///
+/// # Panics
+///
+/// Panics when the provider target lock is poisoned, or when the target
+/// slot was never set before the first stream.
+pub fn warming_stream_fn(
+    target: Arc<std::sync::RwLock<Option<ProviderTarget>>>,
+    session_id: String,
+    arm: WarmArm,
+) -> StreamFn {
+    Arc::new(
+        move |_requested: AgentModel, context: LlmContext, options: StreamRequestOptions| {
+            let ProviderTarget {
+                api_key,
+                model,
+                service_tier,
+                headers,
+            } = target
+                .read()
+                .expect("provider target lock")
+                .clone()
+                .expect("provider target set before the first stream");
+            let arm = Arc::clone(&arm);
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let parts = build_session_request_parts(
+                    &model,
+                    api_key,
+                    service_tier,
+                    headers,
+                    context,
+                    options,
+                    cancel.clone(),
+                );
+                if parts.options.base.session_id.as_deref() == Some(session_id.as_str()) {
+                    arm(crate::session_engine::cache_warmer::WarmRequest {
+                        model: parts.model.clone(),
+                        context: parts.context.clone(),
+                        options: parts.options.clone(),
+                    });
+                }
+                stream_parts(parts, cancel)
+            })
+        },
+    )
 }
 
 /// A stream adapter pinned to one target (headless runtimes resolve
@@ -428,6 +536,59 @@ mod tests {
                 (model.id.clone(), Some(pa_types::ai::ServiceTier::Priority)),
                 (model.id, None),
             ]
+        );
+        registration.unregister();
+    }
+
+    /// The warming gate (TS `streamFn`'s `cacheWarmer.start` rule): only a
+    /// request routing on the session's own id arms warming — aux requests
+    /// (compaction, summaries) route on fresh ids, and id-less requests
+    /// never arm.
+    #[tokio::test]
+    async fn warming_arms_only_the_sessions_own_requests() {
+        type ArmedRequests = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                api: Some("warming-gate-test".to_owned()),
+                ..Default::default()
+            });
+        let factory = pa_ai::faux::FauxResponseStep::Factory(Arc::new(|_, _, _, _| {
+            Ok(pa_ai::faux::faux_assistant_text_message(
+                "ok",
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ))
+        }));
+        registration.set_responses(vec![factory; 3]);
+        let model = registration.get_model();
+        let target = Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
+            api_key: None,
+            model: model.clone(),
+            service_tier: None,
+            headers: None,
+        })));
+        let armed: ArmedRequests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let armed_for_fn = Arc::clone(&armed);
+        let arm: WarmArm = Arc::new(move |request| {
+            armed_for_fn
+                .lock()
+                .unwrap()
+                .push((request.model.id.clone(), request.options.base.session_id));
+        });
+        let stream_fn = warming_stream_fn(target, "session-1".to_string(), arm);
+        for session_id in [Some("session-1"), Some("aux-uuid"), None] {
+            let options = StreamRequestOptions {
+                session_id: session_id.map(str::to_string),
+                ..StreamRequestOptions::default()
+            };
+            let mut stream = stream_fn(AgentModel::unknown(), LlmContext::default(), options)
+                .await
+                .unwrap();
+            stream.result().await.unwrap();
+        }
+        assert_eq!(
+            *armed.lock().unwrap(),
+            vec![(model.id.clone(), Some("session-1".to_string()))],
+            "only the session's own routing id arms the warmer"
         );
         registration.unregister();
     }

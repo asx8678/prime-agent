@@ -4,7 +4,7 @@
 use super::{
     append_truncated, lock, parse_attachment_display, parse_diff_display, parse_sent_agent_message,
     Arc, Event, ExecBuffers, ExecuteStatus, Guarded, Inner, KernelBashCommands, KernelError,
-    StreamName, Value, AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME,
+    StreamName, StreamSpillSlot, Value, AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME,
     BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME, DIFF_DISPLAY_MIME,
     MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
 };
@@ -162,9 +162,11 @@ impl Inner {
             stdout,
             stdout_chars,
             stdout_truncated,
+            stdout_spill,
             stderr,
             stderr_chars,
             stderr_truncated,
+            stderr_spill,
             ..
         } = &mut *buffers;
         match stream {
@@ -174,6 +176,7 @@ impl Inner {
                 stdout_chars,
                 text,
                 execution.max_chars,
+                StreamSpillSlot::Spilling(stdout_spill),
             ),
             StreamName::Stderr => append_truncated(
                 stderr,
@@ -181,6 +184,7 @@ impl Inner {
                 stderr_chars,
                 text,
                 execution.max_chars,
+                StreamSpillSlot::Spilling(stderr_spill),
             ),
         }
         drop(buffers);
@@ -284,6 +288,7 @@ impl Inner {
                 background_output_chars,
                 text,
                 MAX_BACKGROUND_OUTPUT_CHARS,
+                StreamSpillSlot::Fixed,
             );
             return;
         }
@@ -304,6 +309,7 @@ impl Inner {
             pending_background_output_chars,
             text,
             MAX_BACKGROUND_OUTPUT_CHARS,
+            StreamSpillSlot::Fixed,
         );
     }
 }

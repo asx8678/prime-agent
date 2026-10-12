@@ -123,13 +123,20 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
                 let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
-                let runtime_metadata = json!({
+                let mut runtime_metadata = json!({
                     "kind": if request.decision_child { "decision" } else { "subagent" },
                     "rlmChildId": child_id,
                     "parentActiveSessionId": this.parent_active_session_id,
                     "rlmDepth": identity.rlm_depth + 1,
                     "createdAt": now_ms(),
                 });
+                // The budget the child inherits from this tree's cost
+                // ceilings (Rust-only, optional: a TS reader drops unknown
+                // runtime-metadata keys). The durable create replays it, so a
+                // respawned child keeps its cap.
+                if let Some(ceiling) = request.inherited_cost_ceiling {
+                    runtime_metadata["rlmCostCeiling"] = serde_json::to_value(ceiling)?;
+                }
                 let created = this
                     .create_child(
                         &child_id,

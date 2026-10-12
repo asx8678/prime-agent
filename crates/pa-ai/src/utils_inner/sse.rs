@@ -1,7 +1,8 @@
 //! Server-sent event decoding shared by streaming providers.
 //!
 //! Mirrors the TS SSE decoder: \n, \r\n and \r line breaks, comment lines, `event:`/`data:` fields
-//! and multi-line data, blank-line/EOF flush.
+//! and multi-line data, blank-line/EOF flush. A `\r\n` split across chunk
+//! boundaries counts as one line break, wherever the transport splits it.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSentEvent {
@@ -63,6 +64,9 @@ impl DecoderState {
 pub struct SseDecoder {
     state: DecoderState,
     buffer: String,
+    /// The previous chunk ended in a lone `\r`: a leading `\n` in the next
+    /// chunk is the second half of that `\r\n`, not another line break.
+    pending_cr: bool,
 }
 
 impl SseDecoder {
@@ -77,6 +81,17 @@ impl SseDecoder {
         let mut events = Vec::new();
         let mut line_start = 0;
         let bytes = self.buffer.as_bytes();
+        // A `\r\n` split across the chunk boundary is one line break: the
+        // trailing `\r` already ended the previous line (the buffer is
+        // empty when the flag is set), so a leading `\n` here is consumed
+        // as its second half.
+        if self.pending_cr && !text.is_empty() {
+            self.pending_cr = false;
+            if bytes[0] == b'\n' {
+                index = 1;
+                line_start = 1;
+            }
+        }
         while index < bytes.len() {
             let break_len = match bytes[index] {
                 b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
@@ -88,6 +103,11 @@ impl SseDecoder {
             };
             if let Some(event) = self.state.decode_line(&self.buffer[line_start..index]) {
                 events.push(event);
+            }
+            // A lone `\r` as the chunk's final byte may be the first half
+            // of a `\r\n` split across the boundary.
+            if bytes[index] == b'\r' && break_len == 1 && index + 1 == bytes.len() {
+                self.pending_cr = true;
             }
             index += break_len;
             line_start = index;
@@ -178,20 +198,18 @@ mod tests {
     fn preserves_fragmented_line_breaks_and_raw_lines() {
         let mut decoder = SseDecoder::new();
         assert!(decoder.push_text("data: first\r").is_empty());
-        assert_eq!(
-            decoder.push_text("\n"),
-            vec![ServerSentEvent {
-                event: None,
-                data: "first".into(),
-                raw: vec!["data: first".into()],
-            }]
-        );
+        // The split CRLF completes the line; no event until a blank line.
+        assert!(decoder.push_text("\n").is_empty());
         assert_eq!(
             decoder.push_text("event: update\rdata: next\n\n"),
             vec![ServerSentEvent {
                 event: Some("update".into()),
-                data: "next".into(),
-                raw: vec!["event: update".into(), "data: next".into()],
+                data: "first\nnext".into(),
+                raw: vec![
+                    "data: first".into(),
+                    "event: update".into(),
+                    "data: next".into()
+                ],
             }]
         );
         assert!(decoder.push_text("data: final").is_empty());
@@ -201,6 +219,24 @@ mod tests {
                 event: None,
                 data: "final".into(),
                 raw: vec!["data: final".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn crlf_split_across_chunks_is_one_line_break() {
+        // A `\r` ending one chunk and the `\n` opening the next are one
+        // `\r\n`: the stream must decode identically to the unsplit bytes
+        // ("data: a\r\ndata: b\r\n\r\n" → one event, "a\nb").
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push_text("data: a\r").is_empty());
+        assert!(decoder.push_text("\ndata: b\r").is_empty());
+        assert_eq!(
+            decoder.push_text("\n\r\n"),
+            vec![ServerSentEvent {
+                event: None,
+                data: "a\nb".into(),
+                raw: vec!["data: a".into(), "data: b".into()],
             }]
         );
     }

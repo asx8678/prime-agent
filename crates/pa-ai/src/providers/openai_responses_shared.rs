@@ -389,6 +389,7 @@ mod tests {
 
     fn codex_model() -> Model {
         Model {
+            prompt_cache: None,
             id: "gpt-5.1-codex".into(),
             name: "gpt-5.1-codex".into(),
             api: "openai-codex-responses".into(),

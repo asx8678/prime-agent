@@ -144,6 +144,12 @@ struct Harness {
 }
 
 fn setup(name: &str) -> Harness {
+    setup_with_responses(name, &json!([{ "text": "scripted reply" }]))
+}
+
+/// The harness over a script the test controls (a cell turn first, then
+/// whatever later prompts repeat).
+fn setup_with_responses(name: &str, responses: &Value) -> Harness {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");
     let session_dir = agent_dir.join("sessions");
@@ -155,7 +161,7 @@ fn setup(name: &str) -> Harness {
         json!({
             "engine": "faux",
             "repeatLastResponse": true,
-            "responses": [{ "text": "scripted reply" }],
+            "responses": responses.clone(),
         })
         .to_string(),
     )
@@ -299,6 +305,56 @@ impl Harness {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// A carried note, pinned through the kernel bridge in a cell, renders in
+/// every deterministic summary — including the one a restarted worker folds
+/// from the saved state, and with the note's own durable row on the branch.
+#[test]
+fn carried_notes_render_in_every_summary_across_a_restart() {
+    let cell = "from rlm import host_request\n\
+import json\n\
+result = await host_request(\"compact.carry\", {\"add\": [\"the public API must stay stable\"]})\n\
+print(json.dumps(result))";
+    let mut harness = setup_with_responses(
+        "deterministic-carry",
+        &json!([
+            { "content": [
+                { "type": "toolCall", "name": "ipython", "arguments": { "code": cell } },
+            ] },
+            { "text": "carried the constraint" },
+        ]),
+    );
+    // The cell turn pins the note; the prompts give the fold rows to
+    // summarize.
+    harness.prompt("p1", "first request alpha");
+    harness.prompt("p2", "second request bravo");
+    harness.prompt("p3", "third request charlie");
+    let carry_rows = harness
+        .rows()
+        .into_iter()
+        .filter(|row| row["type"] == "custom_message" && row["customType"] == "compaction_carry")
+        .count();
+    assert_eq!(carry_rows, 1, "the pinned note persisted as one row");
+    let compacted = harness.compact("cp1");
+    let first_summary = compacted["data"]["summary"].as_str().unwrap_or_default();
+    assert!(
+        first_summary.contains("[Carried notes]\n\n- the public API must stay stable [carry:0]"),
+        "the first summary carries the note: {first_summary}"
+    );
+
+    harness.restart_worker();
+    harness.prompt("p4", "fourth request delta");
+    harness.prompt("p5", "fifth request echo");
+    // The `/compact` prompt: the turn path's durable re-pin.
+    harness.prompt("p6", "/compact");
+    let compactions = harness.compactions();
+    assert_eq!(compactions.len(), 2, "{compactions:?}");
+    let second_summary = compactions[1]["summary"].as_str().unwrap_or_default();
+    assert!(
+        second_summary.contains("- the public API must stay stable [carry:0]"),
+        "the restarted worker's summary carries the note from the saved state: {second_summary}"
+    );
 }
 
 /// The second compaction runs in a worker that never saw the first: it reads

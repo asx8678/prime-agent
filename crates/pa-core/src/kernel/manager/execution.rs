@@ -8,6 +8,9 @@ use super::{
     KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE, KERNEL_BUSY_INTERRUPT_INTERVAL_MS,
     KERNEL_BUSY_REUSE_WAIT_MS, MAX_BACKGROUND_OUTPUT_CHARS, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
 };
+use crate::tools::output_budget::{bound_model_output, write_output_artifact};
+
+use super::finish_stream_with_spill;
 use std::fmt::Write as _;
 
 impl Inner {
@@ -170,38 +173,34 @@ impl Inner {
             buffers.stdout_chars = 0;
             let mut stderr = std::mem::take(&mut buffers.stderr);
             buffers.stderr_chars = 0;
+            let stdout_spill = buffers.stdout_spill.take();
+            let stderr_spill = buffers.stderr_spill.take();
             let mut result = buffers.result.take();
             let mut status = buffers.status;
+            let mut spilled = crate::kernel::shared::SpilledOutputs {
+                stdout: stdout_spill.as_ref().map(|spill| spill.path().to_string()),
+                stderr: stderr_spill.as_ref().map(|spill| spill.path().to_string()),
+                result: None,
+            };
             if buffers.stdout_truncated {
-                let _ = write!(
-                    stdout,
-                    "\n[... output truncated at {} chars ...]",
-                    execution.max_chars
-                );
+                // A capped stream keeps its head and its tail, with the
+                // full stream spilled to a linked artifact (fabric
+                // `output-budget.ts`); the fallback marker only appears
+                // when the artifact never got created (a full disk).
+                stdout = finish_stream_with_spill(stdout, stdout_spill, execution.max_chars);
             }
             if buffers.stderr_truncated {
-                let _ = write!(
-                    stderr,
-                    "\n[... output truncated at {} chars ...]",
-                    execution.max_chars
-                );
+                stderr = finish_stream_with_spill(stderr, stderr_spill, execution.max_chars);
             }
             if let Some(text) = &result {
                 if text.chars().count() > execution.max_chars {
-                    // The budget counts characters (the stream paths count
-                    // chars too): cut at the byte index of the max_chars-th
-                    // character.
-                    let end = text
-                        .char_indices()
-                        .nth(execution.max_chars)
-                        .map_or(text.len(), |(i, _)| i);
-                    let mut clipped = text[..end].to_string();
-                    let _ = write!(
-                        clipped,
-                        "\n[... output truncated at {} chars ...]",
-                        execution.max_chars
-                    );
-                    result = Some(clipped);
+                    // The result payload arrives whole, so the full text
+                    // is in memory: bound it head+tail with a linked
+                    // artifact (fabric `boundModelOutput`).
+                    let bounded =
+                        bound_model_output(text, execution.max_chars, text, write_output_artifact);
+                    spilled.result = bounded.artifact_path;
+                    result = Some(bounded.text);
                 }
             }
             if execution
@@ -235,6 +234,7 @@ impl Inner {
                 status,
                 error: buffers.error.take(),
                 duration_ms: execution.started.elapsed().as_millis() as u64,
+                spilled,
             };
             drop(buffers);
             if let Some(tx) = lock(&execution.result_tx).take() {

@@ -125,7 +125,11 @@ impl TurnBoundary {
                         CompactionOutcomeReason::Threshold.wire(),
                         None,
                     ));
-                    match engine.session.compact(None, model, api_key, None).await {
+                    match engine
+                        .session
+                        .compact(None, &[], model, api_key, None)
+                        .await
+                    {
                         Ok(CompactOutcome::Ran(run)) => {
                             if let Some(telemetry) = engine.telemetry.as_ref() {
                                 telemetry.note_compaction(Some(run.duration_ms));
@@ -249,7 +253,7 @@ impl TurnBoundary {
         // the run.
         let outcome = engine
             .session
-            .compact(custom_instructions.as_deref(), model, api_key, None)
+            .compact(custom_instructions.as_deref(), &[], model, api_key, None)
             .await;
         match outcome {
             Ok(CompactOutcome::Ran(run)) => {

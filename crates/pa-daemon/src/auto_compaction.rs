@@ -94,7 +94,7 @@ impl AgentSessionEngine {
             let compact = async {
                 engine
                     .session
-                    .compact(None, &model, api_key, Some(&signal))
+                    .compact(None, &[], &model, api_key, Some(&signal))
                     .await
             };
             let outcome = self

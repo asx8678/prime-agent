@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex};
 
 use pa_agent::agent::Subscription;
 use pa_agent::types::{AgentEvent, AssistantMessage, StopReason, Usage};
+
+use super::cache_miss::{self, CacheMissReason, PreviousRequest, RequestFacts};
 use pa_telemetry::{
     base_properties, Properties, RunTrigger, TelemetryClient, TelemetryClientConfig, ToolCategory,
 };
@@ -141,6 +143,16 @@ pub(crate) struct TelemetryState {
     /// never re-reads and re-parses the settings file.
     recording: bool,
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The fingerprint of the prefix the requests are served with (model,
+    /// tools, system prompt — a hash, never content): set by the engine
+    /// at build and on a live model switch, read by the cache-miss
+    /// classification.
+    prefix_fingerprint: u64,
+    /// The idle gap past which a cache miss classifies as `ttl_gap`.
+    cache_ttl_ms: u64,
+    /// The previous request's cache-relevant facts: the baseline the next
+    /// request's cache read is classified against.
+    prev_request: Option<PreviousRequest>,
 }
 
 /// Is recording on right now? `None` (tests, one-shot paths) is always
@@ -188,6 +200,30 @@ struct SessionTotals {
     failover_count: u64,
     model_error_count: u64,
     usage: UsageTotals,
+    /// Cache-miss attribution (why the cache read dropped): one count per
+    /// reason, plus the re-billed tokens of the above-floor misses.
+    cache_miss_ttl_gap_count: u64,
+    cache_miss_prefix_changed_count: u64,
+    cache_miss_noise_count: u64,
+    cache_miss_unattributed_count: u64,
+    cache_missed_tokens: u64,
+}
+
+impl SessionTotals {
+    /// Count one classified drop. Noise is breakpoint granularity: it
+    /// counts as a reason but adds no missed tokens (TS `cache-stats`
+    /// excludes sub-floor drops from the waste totals).
+    fn count_cache_miss(&mut self, reason: CacheMissReason, missed_tokens: u64) {
+        match reason {
+            CacheMissReason::TtlGap => self.cache_miss_ttl_gap_count += 1,
+            CacheMissReason::PrefixChanged => self.cache_miss_prefix_changed_count += 1,
+            CacheMissReason::Noise => self.cache_miss_noise_count += 1,
+            CacheMissReason::Unattributed => self.cache_miss_unattributed_count += 1,
+        }
+        if reason != CacheMissReason::Noise {
+            self.cache_missed_tokens += missed_tokens;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -320,10 +356,27 @@ struct CounterValues {
     skill_use_count: u64,
     mcp_connector_use_count: u64,
     compaction_deterministic_count: u64,
+    /// A routed auxiliary-model summary call that failed on the wire and
+    /// was retried on the session model, and how many of those retries
+    /// failed too (the wire-fallback adoption signal; counts only).
+    compaction_model_fallback_count: u64,
+    compaction_model_fallback_failed_count: u64,
     kernel_bootstrap_count: u64,
     kernel_bootstrap_cold_count: u64,
     kernel_bootstrap_failed_count: u64,
     kernel_bootstrap_max_ms: u64,
+    repeat_guard_warn_count: u64,
+    repeat_guard_block_count: u64,
+    repeat_guard_max_run: u64,
+    cell_failure_note_count: u64,
+    /// One failed cell whose combined text was bounded with its full
+    /// output spilled to a linked artifact (the output-budget adoption
+    /// signal). Output content never uploads; only the count.
+    output_budget_spill_count: u64,
+    /// One successful prompt-cache warm refresh (the cache-warming
+    /// adoption signal). Refresh content never uploads; only the count.
+    cache_warm_refresh_count: u64,
+    compact_carry_used_count: u64,
     rlm_child_usage_count: u64,
     rlm_child_input_tokens: u64,
     rlm_child_output_tokens: u64,
@@ -366,6 +419,50 @@ impl SessionCounters {
         self.with(|values| values.mcp_connector_use_count += 1);
     }
 
+    /// One repeat-guard intervention (the ipython circuit breaker): the
+    /// first warn of a degenerate run (the count crossing `warnAt`) or one
+    /// blocked attempt (every block is one wasted model turn avoided), plus
+    /// the longest identical run seen. The caller fires only on crossings
+    /// and blocks, so each degenerate run counts once per threshold.
+    pub fn note_repeat_guard(&self, blocked: bool, count: u64) {
+        self.with(|values| {
+            if blocked {
+                values.repeat_guard_block_count += 1;
+            } else {
+                values.repeat_guard_warn_count += 1;
+            }
+            values.repeat_guard_max_run = values.repeat_guard_max_run.max(count);
+        });
+    }
+
+    /// One failure-progress note appended to a failed cell that already
+    /// changed the workspace (edits or bash commands): the adoption signal
+    /// for the inspect-before-repeating guidance. Paths and commands stay
+    /// local; only the count uploads.
+    pub fn note_cell_failure_note(&self) {
+        self.with(|values| values.cell_failure_note_count += 1);
+    }
+
+    /// One output-budget spill: a failed cell's text was bounded and its
+    /// full output saved to a linked artifact. Content never uploads.
+    pub fn note_output_budget_spill(&self) {
+        self.with(|values| values.output_budget_spill_count += 1);
+    }
+
+    /// One carry list update persisted to the session log (kernel
+    /// `compact.carry`/`compact.drop`): the adoption signal for the
+    /// carry-forward feature. Note text never uploads; only the count.
+    pub fn note_compact_carry(&self) {
+        self.with(|values| values.compact_carry_used_count += 1);
+    }
+
+    /// One successful cache-warm refresh: the adoption signal for prompt
+    /// warming. The refreshed prompt's content never uploads; only the
+    /// count.
+    pub fn note_cache_warm_refresh(&self) {
+        self.with(|values| values.cache_warm_refresh_count += 1);
+    }
+
     /// One kernel boot: cold or revived, its outcome, its duration.
     pub fn note_kernel_bootstrap(&self, cold: bool, succeeded: bool, duration_ms: u64) {
         self.with(|values| {
@@ -385,6 +482,14 @@ impl SessionCounters {
                     "compaction_deterministic_count",
                     values.compaction_deterministic_count,
                 ),
+                (
+                    "compaction_model_fallback_count",
+                    values.compaction_model_fallback_count,
+                ),
+                (
+                    "compaction_model_fallback_failed_count",
+                    values.compaction_model_fallback_failed_count,
+                ),
                 ("kernel_bootstrap_count", values.kernel_bootstrap_count),
                 (
                     "kernel_bootstrap_cold_count",
@@ -395,6 +500,16 @@ impl SessionCounters {
                     values.kernel_bootstrap_failed_count,
                 ),
                 ("kernel_bootstrap_max_ms", values.kernel_bootstrap_max_ms),
+                ("repeat_guard_warn_count", values.repeat_guard_warn_count),
+                ("repeat_guard_block_count", values.repeat_guard_block_count),
+                ("repeat_guard_max_run", values.repeat_guard_max_run),
+                ("cell_failure_note_count", values.cell_failure_note_count),
+                (
+                    "output_budget_spill_count",
+                    values.output_budget_spill_count,
+                ),
+                ("cache_warm_refresh_count", values.cache_warm_refresh_count),
+                ("compact_carry_used_count", values.compact_carry_used_count),
                 ("rlm_child_usage_count", values.rlm_child_usage_count),
                 ("rlm_child_input_tokens", values.rlm_child_input_tokens),
                 ("rlm_child_output_tokens", values.rlm_child_output_tokens),
@@ -455,6 +570,9 @@ pub async fn install_session_telemetry(
         telemetry_enabled: wiring.telemetry_enabled.clone(),
         recording: true,
         now,
+        prefix_fingerprint: 0,
+        cache_ttl_ms: cache_miss::CACHE_TTL_MS,
+        prev_request: None,
     }));
     // The counters arrive already gated: the engine installs the same
     // live switch on them at creation (the MCP and kernel seams count
@@ -500,6 +618,68 @@ pub async fn install_session_telemetry(
 }
 
 impl SessionTelemetry {
+    /// The fingerprint of the prefix requests are served with (model,
+    /// tools, system prompt — a hash, never content): the engine sets it
+    /// at build and refreshes it on a live model switch, before the next
+    /// request classifies against it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the telemetry state mutex is poisoned.
+    pub fn set_prefix_fingerprint(&self, fingerprint: u64) {
+        self.state
+            .lock()
+            .expect("telemetry state poisoned")
+            .prefix_fingerprint = fingerprint;
+    }
+
+    /// One session request is about to stream: record the prefix identity
+    /// and cache lifetime of the request actually sent (model, tool roster,
+    /// system prompt — hashed, never content; the request's own retention),
+    /// so a mid-session MCP connect or skill reload classifies as
+    /// `prefix_changed` and a long-retention request is measured against
+    /// its long lifetime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the telemetry state mutex is poisoned.
+    pub fn note_session_request(&self, request: &super::cache_warmer::WarmRequest) {
+        let tools: Vec<&str> = request
+            .context
+            .tools
+            .iter()
+            .flatten()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let fingerprint = cache_miss::request_prefix_fingerprint(
+            &format!("{}/{}", request.model.provider, request.model.id),
+            cache_miss::static_prefix_fingerprint(
+                &tools,
+                request.context.system_prompt.as_deref().unwrap_or_default(),
+            ),
+        );
+        let ttl_ms =
+            cache_miss::cache_ttl_ms_for(&request.model, request.options.base.cache_retention);
+        let mut state = self.state.lock().expect("telemetry state poisoned");
+        state.prefix_fingerprint = fingerprint;
+        state.cache_ttl_ms = ttl_ms;
+    }
+
+    /// The lifetime of the cache entries requests write (the idle gap past
+    /// which a miss classifies as `ttl_gap`): set at build from the session
+    /// model and refreshed from each session request's own model and
+    /// retention.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the telemetry state mutex is poisoned.
+    pub fn set_cache_ttl_ms(&self, ttl_ms: u64) {
+        self.state
+            .lock()
+            .expect("telemetry state poisoned")
+            .cache_ttl_ms = ttl_ms;
+    }
+
     /// A compaction completed (feed from the compaction seams; TS
     /// `compaction_end` handling). Counts toward the active run when one
     /// exists, exactly like the TS subscriber — compactions outside a run
@@ -512,6 +692,10 @@ impl SessionTelemetry {
     /// Panics if the telemetry state mutex is poisoned.
     pub fn note_compaction(&self, duration_ms: Option<u64>) {
         let mut state = self.state.lock().expect("telemetry state poisoned");
+        // The context legitimately changed: the next request's prompt is
+        // new content, not re-billed content, so the cache-miss baseline
+        // resets (TS `cache-stats` skips the turn after a compaction).
+        state.prev_request = None;
         if !state.recording {
             sever_off_period_run(&mut state);
             return;
@@ -637,6 +821,26 @@ impl SessionTelemetry {
             properties.set("retry_count", Value::from(totals.retry_count));
             properties.set("failover_count", Value::from(totals.failover_count));
             properties.set("model_error_count", Value::from(totals.model_error_count));
+            properties.set(
+                "cache_miss_ttl_gap_count",
+                Value::from(totals.cache_miss_ttl_gap_count),
+            );
+            properties.set(
+                "cache_miss_prefix_changed_count",
+                Value::from(totals.cache_miss_prefix_changed_count),
+            );
+            properties.set(
+                "cache_miss_noise_count",
+                Value::from(totals.cache_miss_noise_count),
+            );
+            properties.set(
+                "cache_miss_unattributed_count",
+                Value::from(totals.cache_miss_unattributed_count),
+            );
+            properties.set(
+                "cache_missed_tokens",
+                Value::from(totals.cache_missed_tokens),
+            );
         }
         self.counters.write_into(&mut properties);
         self.client.track("agent session ended", properties);
@@ -675,6 +879,17 @@ impl SessionTelemetry {
     pub fn note_deterministic_compaction(&self) {
         self.counters
             .with(|values| values.compaction_deterministic_count += 1);
+    }
+
+    /// One session-model retry after a routed auxiliary summary call failed
+    /// on the wire (compaction or branch summary), counted as
+    /// `compaction_model_fallback_count`, plus
+    /// `compaction_model_fallback_failed_count` when the retry failed too.
+    pub fn note_compaction_model_fallback(&self, succeeded: bool) {
+        self.counters.with(|values| {
+            values.compaction_model_fallback_count += 1;
+            values.compaction_model_fallback_failed_count += u64::from(!succeeded);
+        });
     }
 
     /// One durable child-usage attribution row landed in the parent
@@ -882,6 +1097,22 @@ fn handle_event(
                             .copied()
                     });
                 let cost_total = assistant.usage.cost.total;
+                // Cache-miss attribution: classify this request's cache
+                // read against the previous request (fingerprints and
+                // counts only, never content).
+                let facts =
+                    RequestFacts::from_usage(&assistant.usage, now, state.prefix_fingerprint);
+                if let Some(miss) =
+                    cache_miss::classify(state.prev_request.as_ref(), &facts, state.cache_ttl_ms)
+                {
+                    state
+                        .totals
+                        .count_cache_miss(miss.reason, miss.missed_tokens);
+                }
+                let sticky = state
+                    .prev_request
+                    .is_some_and(|previous| previous.reported_cache());
+                state.prev_request = PreviousRequest::from(&facts, sticky).or(state.prev_request);
                 if let Some(run) = state.active_run.as_mut() {
                     run.usage.add(&assistant.usage);
                     run.last_assistant = Some(assistant);

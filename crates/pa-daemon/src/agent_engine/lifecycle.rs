@@ -3,12 +3,11 @@
 //! expansion and session-command funnels, and the kernel host wiring.
 use super::{
     execute_session_command, json_round_trip, map_thinking_level,
-    register_agent_message_host_handlers, register_agent_observe_host_handlers,
-    switchable_stream_fn, AgentEngineConfig, AgentSessionEngine, Arc, CoreSessionEngine,
-    EngineModelSelection, HostRequestHandlers, LinkAgentMessageController,
-    LinkAgentObserveController, Model, OverflowRecovery, ProducerUsageSink, ProviderTarget,
-    QuotaParkState, SessionCommandExecution, SessionCommandParams, SessionEngineConfig,
-    SupervisorChildSessions, Value,
+    register_agent_message_host_handlers, register_agent_observe_host_handlers, warming_stream_fn,
+    AgentEngineConfig, AgentSessionEngine, Arc, CoreSessionEngine, EngineModelSelection,
+    HostRequestHandlers, LinkAgentMessageController, LinkAgentObserveController, Model,
+    OverflowRecovery, ProducerUsageSink, ProviderTarget, QuotaParkState, SessionCommandExecution,
+    SessionCommandParams, SessionEngineConfig, SupervisorChildSessions, Value,
 };
 
 /// The instruction the floor appends to a bare skill invocation: ask what
@@ -131,6 +130,8 @@ impl AgentSessionEngine {
             mcp,
             published_goal: std::sync::Mutex::new(None),
             late_agent_message_sink: std::sync::Mutex::new(None),
+            custom_row_sink: std::sync::Mutex::new(None),
+            warm_usage_row_sink: std::sync::Mutex::new(None),
             goal_runtime: std::sync::Mutex::new(None),
             pending_goal_continuation: std::sync::Mutex::new(None),
             goal_budget_crossed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -180,6 +181,7 @@ impl AgentSessionEngine {
             cwd,
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
+            inherited_cost_ceiling: std::sync::Mutex::new(None),
             pending_max_depth: std::sync::Mutex::new(None),
             reloaded_goal_update: std::sync::Mutex::new(None),
             faux_model: std::sync::OnceLock::new(),
@@ -257,6 +259,32 @@ impl AgentSessionEngine {
         Ok(())
     }
 
+    /// Subscribe the worker's custom-row mirror: every built session adopts
+    /// it, so kernel `compact.carry`/`compact.drop` and RLM cost-ceiling rows
+    /// persist through the worker's session store (the engine's manager is
+    /// non-persisted here).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the sink slot's mutex is poisoned.
+    pub fn set_custom_row_sink(&self, sink: pa_core::session_engine::compact_carry::CarryRowSink) {
+        *self.custom_row_sink.lock().expect("custom row sink lock") = Some(sink);
+    }
+
+    /// Subscribe the worker's warm-usage mirror: every built session's
+    /// warmer adopts it, so successful cache refreshes append the TS
+    /// `type: "usage"` row through the worker's durable store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the sink slot's mutex is poisoned.
+    pub fn set_warm_usage_sink(&self, sink: pa_core::session_engine::cache_warmer::WarmUsageSink) {
+        *self
+            .warm_usage_row_sink
+            .lock()
+            .expect("warm usage row sink lock") = Some(sink);
+    }
+
     /// Install the worker's live compaction summary-delta sink: every built session adopts it.
     ///
     /// # Panics
@@ -314,6 +342,27 @@ impl AgentSessionEngine {
             .clone()
         {
             built.session.set_compaction_summary_sink(sink);
+        }
+        if let Some(sink) = self
+            .custom_row_sink
+            .lock()
+            .expect("custom row sink lock")
+            .clone()
+        {
+            built
+                .rlm_tree_cost
+                .set_row_sink(std::sync::Arc::clone(&sink));
+            built.turn_boundary.set_carry_row_sink(sink);
+        }
+        if let Some(sink) = self
+            .warm_usage_row_sink
+            .lock()
+            .expect("warm usage row sink lock")
+            .clone()
+        {
+            if let Some(warmer) = built.session.cache_warmer() {
+                warmer.set_usage_sink(sink);
+            }
         }
         // The in-run consult's mirror: the session mutex is held across
         // compaction turns, and the consult runs inside one.
@@ -863,8 +912,23 @@ impl AgentSessionEngine {
 
         // The session's stream reads its target from the live slot:
         // `set_model` swaps it so the built session follows without a
-        // rebuild.
-        let stream_fn = switchable_stream_fn(std::sync::Arc::clone(&self.provider_target));
+        // rebuild. The cache-warming wrapper arms the warmer from every
+        // session request (matched by routing id) through the arm slot
+        // the engine fills once it builds the warmer — TS `streamFn`'s
+        // `cacheWarmer.start` call.
+        let warm_arm = std::sync::Arc::new(std::sync::Mutex::new(
+            None::<pa_core::session_engine::provider_adapter::WarmArm>,
+        ));
+        let warm_arm_reader = {
+            let slot = std::sync::Arc::clone(&warm_arm);
+            std::sync::Arc::new(
+                move |request: pa_core::session_engine::cache_warmer::WarmRequest| {
+                    if let Some(arm) = slot.lock().expect("cache warm arm slot").as_ref() {
+                        arm(request);
+                    }
+                },
+            ) as pa_core::session_engine::provider_adapter::WarmArm
+        };
         {
             let (api_key, headers) = self.resolve_request_key_and_headers(model);
             let mut target = self.provider_target.write().expect("provider target lock");
@@ -901,6 +965,11 @@ impl AgentSessionEngine {
             }
             None => pa_core::session::manager::SessionManager::in_memory(&cwd),
         };
+        let stream_fn = warming_stream_fn(
+            std::sync::Arc::clone(&self.provider_target),
+            session_manager.get_session_id().to_string(),
+            warm_arm_reader,
+        );
 
         if let Some(children) = &self.children {
             children.set_model(format!("{}/{}", model.provider, model.id));
@@ -962,10 +1031,17 @@ impl AgentSessionEngine {
             .lock()
             .expect("late agent message sink lock")
             .clone();
+        // Bound before the awaited build: a guard must not live across it.
+        let inherited_cost_ceiling = *self
+            .inherited_cost_ceiling
+            .lock()
+            .expect("inherited cost ceiling lock");
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
             on_late_sent_agent_message,
             semantic_edges,
             telemetry,
+            cache_warm_arm: Some(warm_arm),
+            inherited_cost_ceiling,
             cwd,
             // TS settings.imageModel routing: the daemon owns the routing;
             // the headless surfaces pass `None` to keep their own.

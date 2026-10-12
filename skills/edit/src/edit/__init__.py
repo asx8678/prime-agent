@@ -33,27 +33,57 @@ async def run(path: str, old_str: str, new_str: str) -> str:
     # Read without newline translation so untouched bytes round-trip exactly.
     with open(filepath, encoding="utf-8", newline="") as handle:
         raw = handle.read()
-    content, raw_offsets = _lf_view(raw)
     needle = _to_lf(old_str)
-    count = content.count(needle)
-    if count == 0:
+    new_lf = _to_lf(new_str)
+    if "\r" in raw:
+        content = _to_lf(raw)
+    else:
+        # Fast path: no CR means the LF view is the raw text itself, so no
+        # per-file CR bookkeeping runs on the (possibly huge) content.
+        content = raw
+    first = content.find(needle)
+    if first < 0:
         raise ValueError(f"string not found in {path}")
-    if count > 1:
+    if content.find(needle, first + 1) >= 0:
+        # str.count misses overlapping occurrences ("aa" in "aaa" reads as
+        # unique); count the way find() sees them instead.
+        occurrences = 1
+        position = first + 1
+        while (next_match := content.find(needle, position)) >= 0:
+            occurrences += 1
+            position = next_match + 1
         raise ValueError(
-            f"found {count} occurrences in {path}, need exactly 1 — "
+            f"found {occurrences} occurrences in {path}, need exactly 1 — "
             "widen the snippet to make it unique"
         )
-    match_index = content.index(needle)
-    start_line = content.count("\n", 0, match_index) + 1
-    raw_start = raw_offsets[match_index]
-    raw_end = raw_offsets[match_index + len(needle)]
-    replacement = _to_lf(new_str).replace("\n", _dominant_newline(raw))
-    if raw[raw_start:raw_end] != replacement:
-        # In-place write keeps the file's mode, symlinks and hard links.
-        with open(filepath, "w", encoding="utf-8", newline="") as handle:
-            handle.write(raw[:raw_start] + replacement + raw[raw_end:])
+    start_line = content.count("\n", 0, first) + 1
+    match_end = first + len(needle)
+    if content is raw:
+        raw_start, raw_end = first, match_end
+    else:
+        raw_start, raw_end = _raw_offset(raw, first), _raw_offset(raw, match_end)
+    if new_lf != needle:
+        dominant = _dominant_newline(raw)
+        replacement = new_lf.replace("\n", dominant)
+        if dominant == "\n":
+            # A prefix ending in a lone CR fuses with a bare LF into one
+            # CRLF — one break lost; a lone CR keeps both breaks.
+            if raw_start > 0 and raw[raw_start - 1] == "\r" and replacement.startswith("\n"):
+                replacement = "\r" + replacement[1:]
+        elif dominant == "\r":
+            # A trailing lone CR fuses with a suffix starting LF the same
+            # way; a bare LF keeps both breaks.
+            if raw_end < len(raw) and raw[raw_end] == "\n" and replacement.endswith("\r"):
+                replacement = replacement[:-1] + "\n"
+        # Encode before opening: a lone surrogate in new_str must fail
+        # here, while the file is still untouched (open("w") would
+        # truncate first). Writing bytes keeps the write in-place (mode,
+        # symlinks, hard links) and free of newline translation.
+        data = (raw[:raw_start] + replacement + raw[raw_end:]).encode("utf-8")
+        with open(filepath, "wb") as handle:
+            handle.write(data)
     resolved_path = str(filepath.resolve())
-    _emit_diff(resolved_path, old_str, new_str, start_line)
+    _emit_diff(resolved_path, needle, new_lf, start_line)
     return f"Edited {resolved_path}"
 
 
@@ -61,25 +91,24 @@ def _to_lf(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _lf_view(raw: str) -> tuple[str, list[int]]:
-    """Return ``raw`` with CRLF/CR as LF, plus each LF-view offset's raw offset.
+def _raw_offset(raw: str, lf_index: int) -> int:
+    """Raw offset of the LF-view offset ``lf_index`` (a character boundary).
 
-    The offset list has one extra trailing entry so a match end maps too.
+    Only the two offsets a match needs are ever computed, by counting
+    CRLF pairs before the target instead of building a per-file offset
+    list (the list is what made large files slow and memory-hungry).
     """
-    chars: list[str] = []
-    offsets: list[int] = []
-    index = 0
-    while index < len(raw):
-        offsets.append(index)
-        char = raw[index]
-        if char == "\r":
-            chars.append("\n")
-            index += 2 if raw.startswith("\r\n", index) else 1
-        else:
-            chars.append(char)
-            index += 1
-    offsets.append(len(raw))
-    return "".join(chars), offsets
+    offset = lf_index
+    while True:
+        pairs = raw.count("\r\n", 0, offset + 1)
+        if offset - pairs == lf_index:
+            break
+        offset = lf_index + pairs
+    # The fixed point can land on the LF half of a CRLF; the character
+    # begins at its CR.
+    if raw[offset - 1 : offset + 1] == "\r\n":
+        offset -= 1
+    return offset
 
 
 def _dominant_newline(raw: str) -> str:

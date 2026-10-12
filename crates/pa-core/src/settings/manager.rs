@@ -9,7 +9,8 @@ use super::load::from_value_lenient;
 use super::merge::{deep_merge, migrate};
 use super::storage::{SettingsScope, SettingsStorage};
 use super::types::{
-    QueueModeSetting, Settings, ThinkingLevelSetting, TransportSetting, UpdateChannel,
+    CacheWarmingMode, CompactionEngine, QueueModeSetting, Settings, ThinkingLevelSetting,
+    TransportSetting, UpdateChannel,
 };
 
 pub const RECENT_MODELS_LIMIT: usize = 20;
@@ -408,6 +409,87 @@ impl SettingsManager {
             .as_ref()
             .and_then(|compaction| compaction.enabled)
             .unwrap_or(true)
+    }
+
+    /// The cache-warming profile, read from global settings only because
+    /// warming spends money (pi `getCacheWarmingMode`'s rule); unset means
+    /// `off`. Warming is a Rust-only feature the TS product does not have,
+    /// so it stays opt-in until it is signed off
+    /// (`next-steps/09-rust-divergence-signoff.md`).
+    #[must_use]
+    pub fn get_cache_warming_mode(&self) -> CacheWarmingMode {
+        self.global.cache_warming.unwrap_or(CacheWarmingMode::Off)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings file cannot be written.
+    pub fn set_cache_warming_mode(&mut self, mode: CacheWarmingMode) -> Result<()> {
+        self.global.cache_warming = Some(mode);
+        self.save_global()
+    }
+
+    /// `repeatGuard.enabled`: unset means on (the ipython repeat guard's default).
+    #[must_use]
+    pub fn get_repeat_guard_enabled(&self) -> bool {
+        self.merged
+            .repeat_guard
+            .as_ref()
+            .and_then(|guard| guard.enabled)
+            .unwrap_or(true)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings file cannot be written.
+    pub fn set_repeat_guard_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.global
+            .repeat_guard
+            .get_or_insert_with(Default::default)
+            .enabled = Some(enabled);
+        self.save_global()
+    }
+
+    /// `autoRefine.enabled`: unset means on (the auto-refine gates' default).
+    #[must_use]
+    pub fn get_auto_refine_enabled(&self) -> bool {
+        self.merged
+            .auto_refine
+            .as_ref()
+            .and_then(|refine| refine.enabled)
+            .unwrap_or(true)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings file cannot be written.
+    pub fn set_auto_refine_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.global
+            .auto_refine
+            .get_or_insert_with(Default::default)
+            .enabled = Some(enabled);
+        self.save_global()
+    }
+
+    /// `compaction.engine`: unset means the deterministic summarizer.
+    #[must_use]
+    pub fn get_compaction_engine(&self) -> CompactionEngine {
+        self.merged
+            .compaction
+            .as_ref()
+            .and_then(|compaction| compaction.engine)
+            .unwrap_or_default()
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings file cannot be written.
+    pub fn set_compaction_engine(&mut self, engine: CompactionEngine) -> Result<()> {
+        self.global
+            .compaction
+            .get_or_insert_with(Default::default)
+            .engine = Some(engine);
+        self.save_global()
     }
 
     /// `agentTraces.enabled`: unset means OFF — trace sharing is opt-in, exactly the TS default.
@@ -1037,6 +1119,42 @@ mod tests {
             .set_factory_enabled(false)
             .expect("set factory disabled");
         assert!(!manager.get_factory_enabled());
+    }
+
+    /// `cacheWarming` reads the global scope only — warming spends money,
+    /// so a project document can never switch it on for a user (pi
+    /// `getCacheWarmingMode`'s rule) — and unset means `off`: warming is
+    /// opt-in.
+    #[test]
+    fn cache_warming_reads_global_only_and_defaults_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            cwd.join(".prime/agent/settings.json"),
+            r#"{ "cacheWarming": "idle" }"#,
+        )
+        .unwrap();
+
+        let mut manager = SettingsManager::create(&cwd, &agent_dir);
+        assert_eq!(
+            manager.get_cache_warming_mode(),
+            CacheWarmingMode::Off,
+            "unset global settings mean off; a project value never applies"
+        );
+
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{ "cacheWarming": "streaming" }"#,
+        )
+        .unwrap();
+        manager.reload().unwrap();
+        assert_eq!(
+            manager.get_cache_warming_mode(),
+            CacheWarmingMode::Streaming
+        );
     }
 
     #[test]

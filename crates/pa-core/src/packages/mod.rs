@@ -23,7 +23,10 @@ pub use resolve::{
     MetadataSource, MissingSourceAction, PathMetadata, ResolvedPaths, ResolvedResource,
     ResourceOrigin, ResourceType,
 };
-pub use source::{parse_git_url, GitSource, LocalSource, NpmSource, ParsedSource, SourceScope};
+pub use source::{
+    parse_git_url, parse_installable_source, GitSource, LocalSource, NpmSource, ParsedSource,
+    SourceScope,
+};
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -126,6 +129,13 @@ pub(crate) fn get_bundled_skills_dir() -> PathBuf {
     packaged
 }
 
+/// The trusted parent of every [`temporary_dir`]: the containment root for
+/// resolve-only installs, whose prefix and suffix below it come from
+/// unvalidated package sources.
+pub(crate) fn temporary_root() -> PathBuf {
+    std::env::temp_dir().join("pi-extensions")
+}
+
 /// Stable temporary directory for resolve-only package installs (the hash
 /// keys on prefix+suffix so the same source always maps to one checkout).
 pub(crate) fn temporary_dir(prefix: &str, suffix: Option<&str>) -> PathBuf {
@@ -138,8 +148,7 @@ pub(crate) fn temporary_dir(prefix: &str, suffix: Option<&str>) -> PathBuf {
         let _ = write!(output, "{byte:02x}");
         output
     });
-    std::env::temp_dir()
-        .join("pi-extensions")
+    temporary_root()
         .join(prefix)
         .join(&hash)
         .join(suffix.unwrap_or_default())

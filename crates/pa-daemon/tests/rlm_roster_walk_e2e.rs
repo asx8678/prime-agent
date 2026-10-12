@@ -360,6 +360,7 @@ async fn subscribe_after_spawn_then_shutdown_seeds_the_passive_child() {
             decision_child: false,
             cell_source_code: None,
             spawned_by_request_id: None,
+            inherited_cost_ceiling: None,
         })
         .await
         .expect("spawn child");

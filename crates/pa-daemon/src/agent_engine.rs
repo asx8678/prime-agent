@@ -18,7 +18,7 @@ use pa_core::session_engine::agent_messaging::{
 };
 use pa_core::session_engine::engine::{SessionEngine as CoreSessionEngine, SessionEngineConfig};
 use pa_core::session_engine::provider_adapter::{
-    json_round_trip, map_thinking_level, switchable_stream_fn, ProviderTarget,
+    json_round_trip, map_thinking_level, warming_stream_fn, ProviderTarget,
 };
 use pa_core::session_engine::session_commands::{
     execute_session_command, SessionCommandExecution, SessionCommandParams,
@@ -113,6 +113,18 @@ pub struct AgentSessionEngine {
     pub(crate) published_goal: std::sync::Mutex<Option<pa_core::goals::GoalState>>,
     pub(crate) late_agent_message_sink:
         std::sync::Mutex<Option<pa_core::LateSentAgentMessageHandler>>,
+    /// The persistence mirror for the kernel's custom rows: the daemon
+    /// worker owns the session file, so a `compact.carry`/`compact.drop` or
+    /// RLM cost-ceiling row reaches it through this sink, not the engine's
+    /// non-persisted manager.
+    pub(crate) custom_row_sink:
+        std::sync::Mutex<Option<pa_core::session_engine::compact_carry::CarryRowSink>>,
+    /// The persistence mirror for cache-warm usage rows (the same
+    /// ownership rule): every built session's warmer adopts it, so
+    /// successful refreshes append the TS `type: "usage"` row through
+    /// the worker's durable store.
+    pub(crate) warm_usage_row_sink:
+        std::sync::Mutex<Option<pa_core::session_engine::cache_warmer::WarmUsageSink>>,
     /// The session's goal driver and session-manager handles, mirrored from
     /// the core session at build time: the core session's own mutex is held
     /// across a turn's admission, so goal checks inside emit callbacks
@@ -264,6 +276,10 @@ pub struct AgentSessionEngine {
     /// The depth bound's source stamp (`default` | `env` | `global` |
     /// `inherited` | `chat`).
     rlm_max_depth_source: std::sync::Mutex<&'static str>,
+    /// The cost budget inherited from the parent's tree (the create's
+    /// `runtimeMetadata.rlmCostCeiling`), handed to every session build.
+    pub(crate) inherited_cost_ceiling:
+        std::sync::Mutex<Option<pa_core::session_engine::rlm_cost::InheritedCostCeiling>>,
     /// A `set_rlm_max_depth` that landed before the first turn: the durable
     /// entry parks here and flushes at build.
     pending_max_depth: std::sync::Mutex<Option<u64>>,

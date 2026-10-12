@@ -20,6 +20,8 @@ async fn execute_compaction_with_pre_aborted_signal_never_runs_the_summarizer() 
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -30,6 +32,7 @@ async fn execute_compaction_with_pre_aborted_signal_never_runs_the_summarizer() 
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -74,6 +77,8 @@ async fn execute_compaction_with_late_abort_cancels_before_the_commit() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -84,6 +89,7 @@ async fn execute_compaction_with_late_abort_cancels_before_the_commit() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -112,12 +118,15 @@ async fn execute_compaction_skips_short_sessions() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings::default(),
             abort: None,
             harness_digest: None,
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -153,6 +162,8 @@ async fn execute_compaction_skips_when_already_compacted() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 200,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -163,6 +174,7 @@ async fn execute_compaction_skips_when_already_compacted() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await

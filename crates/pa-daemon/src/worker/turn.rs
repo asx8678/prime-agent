@@ -11,6 +11,14 @@ use super::{
 
 use std::sync::{Arc, Mutex};
 
+/// How often a deferred idle passivation re-checks the session's
+/// prompt-cache warm window (`cache_warming_active`). Tests use a short
+/// interval so the deferral is observable without real waits.
+#[cfg(not(test))]
+const WARM_WINDOW_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const WARM_WINDOW_RECHECK: std::time::Duration = std::time::Duration::from_millis(20);
+
 pub(super) struct TurnRunner {
     pub(crate) core: Arc<Mutex<SessionCore>>,
     pub(super) input_pauses: crate::session_input_pause::InputPauseTable,
@@ -217,6 +225,12 @@ impl TurnRunner {
 
     /// Re-check the gates on a fresh snapshot, then ask the supervisor
     /// for the graceful stop. A failed request leaves the worker resident.
+    /// While the session's prompt-cache warm window is live the stop waits
+    /// in place — re-checking the window, never re-stamping the idle clock
+    /// — so a short `idleEvictionMinutes` cannot park the worker mid-window
+    /// (the refreshes already paid for would be wasted and the cache cold
+    /// on wake); work arriving meanwhile cancels the stop, and the
+    /// post-await revalidation below still runs once the window ends.
     pub(super) async fn maybe_request_idle_passivation(&self) {
         let (attached, compacting, shutdown, queued, last_activity, cwd) = {
             let core = self.core.lock().unwrap();
@@ -255,6 +269,19 @@ impl TurnRunner {
         // (`SessionEngine::can_passivate_worker`); a failing worker stays resident.
         if !self.engine.can_passivate_worker().await {
             return;
+        }
+        let mut deferred = false;
+        while self.engine.cache_warming_active().await {
+            if !deferred {
+                deferred = true;
+                eprintln!(
+                    "pa-daemon: idle passivation deferred while the prompt cache is kept warm (idleEvictionMinutes={minutes})"
+                );
+            }
+            tokio::select! {
+                () = self.work_notify.notified() => return,
+                () = tokio::time::sleep(WARM_WINDOW_RECHECK) => {}
+            }
         }
         // The post-await revalidation (the fresh bots' race findings):
         // the engine gate's await opened a window - a bash admitted, a

@@ -805,6 +805,7 @@ mod tests {
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
                     on_late_sent_agent_message: None,
+                    cache_warm_arm: None,
                     semantic_edges: None,
                     cron_store: None,
                     telemetry: None,
@@ -835,6 +836,7 @@ mod tests {
                     image_model_router: None,
                     steering_mode: None,
                     follow_up_mode: None,
+                    inherited_cost_ceiling: None,
                 },
             )
             .await
@@ -1417,6 +1419,7 @@ mod tests {
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
                     on_late_sent_agent_message: None,
+                    cache_warm_arm: None,
                     semantic_edges: None,
                     cron_store: None,
                     telemetry: None,
@@ -1447,6 +1450,7 @@ mod tests {
                     image_model_router: None,
                     steering_mode: None,
                     follow_up_mode: None,
+                    inherited_cost_ceiling: None,
                 },
             )
             .await

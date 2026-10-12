@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,14 @@ from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, 
 _NOT_CALLABLE_MESSAGE = "'rlm' is not callable; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
 _RENAMED_RUN_MESSAGE = "rlm.run was renamed; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
 
+# Schemas registered by `rlm.spawn(schema=...)`, keyed by child id. Applied
+# at `collect` time in the parent kernel (every selector form — handle,
+# subagent row, or name string — resolves through this registry). Never
+# sent to the host, so hosts of any version stay compatible. Cleared by
+# `delete_subagent`; a kernel restart drops it with the rest of the Python
+# state (and with it every handle, so nothing outlives the registry).
+_spawn_schemas: dict[str, dict[str, Any]] = {}
+
 
 @dataclass(frozen=True)
 class RLMSpawnHandle:
@@ -30,6 +40,10 @@ class RLMSpawnHandle:
     name: str
     session_dir: Path
     model: str
+    schema: dict[str, Any] | None = None
+    """The JSON Schema dict this child's collected result validates
+    against, when `rlm.spawn` was called with `schema=`; `None` for
+    unvalidated spawns (never sent to the host)."""
 
 
 @dataclass(frozen=True)
@@ -103,6 +117,15 @@ class RLMChildResult:
     duration_ms: int | None = None
     tool_use_count: int | None = None
     replied_since_task: bool | None = None
+    """Schema validation (a spawn with ``schema=``): ``True``/``False``
+    when the settled answer was validated, ``None`` when the child
+    spawned without a schema."""
+
+    schema_valid: bool | None = None
+    """The first validation errors, one per entry; ``None`` on success or
+    when no schema was registered."""
+
+    schema_errors: list[str] | None = None
 
 
 def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
@@ -183,6 +206,7 @@ async def spawn(
     model: str | None = None,
     thinking: str | None = None,
     kind: str | None = None,
+    schema: dict[str, Any] | None = None,
 ) -> RLMSpawnHandle:
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
@@ -192,11 +216,36 @@ async def spawn(
     defaults to the parent level; levels invalid for the resolved model fail the spawn.
     ``kind`` selects a dedicated child kind; ``"decision"`` spawns the Decision API
     child (the model comes from the decisionApi.systemOneModel setting).
+    ``schema`` is a JSON Schema dict the child's collected result must satisfy
+    (a TypeBox schema is a JSON Schema object at runtime and carries over
+    unchanged). ``rlm.collect`` validates the child's settled answer against
+    it — the first 5 errors surface on the collected result
+    (``schema_valid``/``schema_errors``); there is never a hidden retry. The
+    schema stays in the parent kernel and does not cross to the host. A
+    schema that is not a valid JSON Schema raises ``ValueError`` before
+    the child starts.
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
     if kind is not None and kind != "decision":
         raise TypeError(f"kind must be 'decision' or None, got {kind!r}")
+    if schema is not None and not isinstance(schema, dict):
+        raise TypeError(f"schema must be a JSON Schema dict or None, got {type(schema).__name__}")
+    if schema is not None:
+        # Validate before the child starts: a malformed schema fails the
+        # spawn itself instead of surfacing at collect time after the
+        # child already ran. The collect-time guard stays as defense in
+        # depth.
+        try:
+            import jsonschema
+        except ImportError as error:  # pragma: no cover - the kernel venv ships it
+            raise RuntimeError(
+                "jsonschema is required for schema-validated child results but is not installed"
+            ) from error
+        try:
+            jsonschema.Draft202012Validator.check_schema(schema)
+        except jsonschema.SchemaError as error:
+            raise ValueError(f"schema is not a valid JSON Schema: {error.message}") from error
     kwargs: dict[str, Any] = {"name": name}
     if model is not None:
         kwargs["model"] = model
@@ -206,7 +255,14 @@ async def spawn(
         kwargs["kind"] = kind
     # Wire type stays "rlm.run" so kernels and hosts of different versions stay compatible.
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
-    return _spawn_handle_from_payload(payload)
+    handle = _spawn_handle_from_payload(payload)
+    if schema is not None:
+        # Parent-kernel state only: every selector form (handle, subagent
+        # row, name string) resolves the schema at collect time through
+        # the registry; the host never sees it.
+        _spawn_schemas[handle.rlm_child_id] = schema
+        handle = replace(handle, schema=schema)
+    return handle
 
 
 def _model_from_payload(payload: Any) -> RLMModel:
@@ -413,6 +469,160 @@ def _child_result_from_payload(payload: Any) -> RLMChildResult:
     )
 
 
+_RESULT_SCHEMA_ERROR_LIMIT = 5
+
+# Mirrors ANSWER_TEXT_MAX_CHARS in crates/pa-daemon/src/rlm_child_model.rs:
+# the host caps a child's answer_text at this many characters, so an answer
+# at the cap may have lost its trailing JSON to truncation.
+_ANSWER_TEXT_MAX_CHARS = 65_536
+
+_FENCED_JSON_PATTERN = re.compile(r"```(?:json)?[ \t]*\r?\n(.*?)```", re.DOTALL)
+
+
+def _balanced_json_values(text: str) -> Any:
+    """Yield each top-level balanced ``{...}``/``[...]`` span's parsed value.
+
+    One stack-based pass (linear; the old scan restarted after every
+    unbalanced opener, quadratic on answers with many stray ``{``/``[``).
+    Openers push their start, any closer pops the top opener and completes
+    a span — counting, like the old scan, so a span nested inside a
+    bracket-mismatched region is skipped exactly as before (its enclosing
+    span still completes by counting and swallows it). A completed span
+    is a candidate only when the opener directly enclosing it never
+    closes (openers still on the stack at end of text): those are the
+    spans the old scan dug out from under stray openers, they never
+    nest, and only they reach json.loads. Unparseable candidates
+    (including bracket-mismatched ones) are tried and skipped, so the
+    last parseable span still wins with callers.
+    """
+    stack: list[int] = []  # start indices of open, unclosed `{`/`[`
+    # (start, end, start of the directly enclosing opener or None)
+    spans: list[tuple[int, int, int | None]] = []
+    in_string = False
+    escaped = False
+    for index, current in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif current == "\\":
+                escaped = True
+            elif current == '"':
+                in_string = False
+        elif current == '"':
+            in_string = True
+        elif current in "{[":
+            stack.append(index)
+        elif current in "}]":
+            if stack:
+                start = stack.pop()
+                spans.append((start, index + 1, stack[-1] if stack else None))
+            # A closer with nothing open closes nothing; no span can reach
+            # across it, matching the old scan's restart past it.
+    unclosed = set(stack)
+    for start, end, enclosing in spans:
+        if enclosing is not None and enclosing not in unclosed:
+            continue
+        try:
+            yield json.loads(text[start:end])
+        except ValueError:
+            pass
+
+
+def _extract_result_json(answer_text: str) -> tuple[Any, str | None]:
+    """Best-effort extraction of the JSON value a child's answer carries.
+
+    The whole answer wins; the last fenced ```json block is next; the last
+    balanced ``{...}``/``[...]`` span that parses is last. Returns
+    ``(value, None)`` or ``(None, reason)`` — the reason is the schema
+    error the collected result reports.
+    """
+    try:
+        return json.loads(answer_text), None
+    except ValueError:
+        pass
+    for fenced in reversed(_FENCED_JSON_PATTERN.findall(answer_text)):
+        try:
+            return json.loads(fenced), None
+        except ValueError:
+            continue
+    value = None
+    for candidate in _balanced_json_values(answer_text):
+        value = candidate
+    if value is None:
+        if len(answer_text) >= _ANSWER_TEXT_MAX_CHARS:
+            return None, (
+                "the child's answer was truncated at the host's "
+                f"{_ANSWER_TEXT_MAX_CHARS:,}-character cap, so the JSON could not be parsed"
+            )
+        return None, "the child's answer contains no JSON to validate against the schema"
+    return value, None
+
+
+def _format_schema_error(error: Any) -> str:
+    path = "/".join(str(part) for part in error.absolute_path) or "<root>"
+    return f"{path}: {error.message}"
+
+
+def _validate_child_result(
+    schema: dict[str, Any], answer_text: str
+) -> tuple[bool, list[str] | None]:
+    """Validate one child's answer against its spawn schema.
+
+    Returns ``(valid, errors)``; ``errors`` is ``None`` on success. Only
+    the first [`_RESULT_SCHEMA_ERROR_LIMIT`] errors surface. A schema
+    ``jsonschema`` itself rejects is reported as an invalid schema instead
+    of raising — the parent sees its own spawn's mistake without a
+    crashed collect.
+    """
+    value, extract_error = _extract_result_json(answer_text)
+    if extract_error is not None:
+        return False, [extract_error]
+    try:
+        import jsonschema
+    except ImportError as error:  # pragma: no cover - the kernel venv ships it
+        raise RuntimeError(
+            "jsonschema is required for schema-validated child results but is not installed"
+        ) from error
+    try:
+        # The validator constructor does not check the schema itself; a
+        # malformed schema (e.g. {"type": 17}) would otherwise raise
+        # TypeError from iter_errors in the middle of collect.
+        jsonschema.Draft202012Validator.check_schema(schema)
+        validator = jsonschema.Draft202012Validator(schema)
+    except jsonschema.SchemaError as error:
+        return False, [f"invalid schema: {error.message}"]
+    errors: list[str] = []
+    for schema_error in validator.iter_errors(value):
+        errors.append(_format_schema_error(schema_error))
+        if len(errors) >= _RESULT_SCHEMA_ERROR_LIMIT:
+            break
+    if errors:
+        return False, errors
+    return True, None
+
+
+def _apply_result_schemas(results: list[RLMChildResult]) -> list[RLMChildResult]:
+    """Attach schema validation to collected results (`rlm.spawn`'s ``schema=``).
+
+    The parent kernel validates here, on collect — never inside the child
+    (its REPL never sees the final reply the host assembles). No hidden
+    retry: an invalid result carries its errors and the parent decides what
+    to do. Results without a registered schema, or without a settled
+    answer, keep ``schema_valid``/``schema_errors`` unset.
+    """
+    if not _spawn_schemas:
+        return results
+    validated: list[RLMChildResult] = []
+    for result in results:
+        schema = _spawn_schemas.get(result.rlm_child_id)
+        if schema is None or not result.settled or result.answer_text is None:
+            validated.append(result)
+            continue
+        valid, errors = _validate_child_result(schema, result.answer_text)
+        validated.append(replace(result, schema_valid=valid, schema_errors=errors))
+    return validated
+
+
 async def collect(
     targets: Any = None,
     *,
@@ -447,7 +657,57 @@ async def collect(
     results = payload.get("results")
     if not isinstance(results, list):
         raise RuntimeError("rlm.collect returned an invalid results list")
-    return [_child_result_from_payload(entry) for entry in results]
+    collected = [_child_result_from_payload(entry) for entry in results]
+    return _apply_result_schemas(collected)
+
+
+async def set_cost_ceiling(
+    cost_usd: float | None = None,
+    *,
+    spawn_limit: int | None = None,
+) -> dict[str, Any]:
+    """Set this session tree's cost ceiling (opt-in; the RLM cost gate).
+
+    The scope is the whole tree under the root session — children outlive
+    the cell and the turn that started them, so a per-cell budget would
+    reset while they keep spending. A dimension left ``None`` stays
+    uncapped (today's behavior); passing both ``None`` clears the ceilings.
+
+    ``cost_usd`` caps the tree's total spend, the parent's own usage
+    included, and — while set — refuses to spawn children on models the
+    catalog has no price for (an unpriced model's spend would never trip
+    the ceiling). Parallel spawns in one cell can overshoot: every
+    in-flight spawn passed the check together, so the overshoot is bounded
+    only by the children already running.
+
+    ``spawn_limit`` caps spawn admissions in the tree (the hard backstop).
+    The ceilings and the admission count persist in the session log, so a
+    restart or reattach restores them; the spend ledger rebuilds from the
+    session's recorded usage. The cap covers the whole tree: each child
+    inherits what is left of it at spawn time (and hands what is left of
+    that to its own children); a child's ``set_cost_ceiling`` can tighten
+    its inherited budget but never loosen it. The snapshot's
+    ``inherited`` field shows the budget this session inherited, if any.
+
+    Returns the ledger snapshot ``{"cost_usd": spent, "spawns_admitted": n,
+    "ceiling_usd": ..., "spawn_limit": ...}``. A refused spawn raises
+    ``RuntimeError`` from ``rlm.spawn`` before the child starts — the
+    parent can catch it and decide.
+    """
+    if cost_usd is not None and (
+        not isinstance(cost_usd, (int, float)) or isinstance(cost_usd, bool)
+    ):
+        raise TypeError(f"cost_usd must be a non-negative number or None, got {type(cost_usd).__name__}")
+    if cost_usd is not None and cost_usd < 0:
+        raise ValueError("cost_usd must be a non-negative number or None")
+    if spawn_limit is not None and (
+        not isinstance(spawn_limit, int) or isinstance(spawn_limit, bool) or spawn_limit < 1
+    ):
+        raise ValueError("spawn_limit must be a positive int or None")
+    return await host_request(
+        "rlm.set_cost_ceiling",
+        {"cost_usd": cost_usd, "spawn_limit": spawn_limit},
+    )
 
 
 RLM_PROGRESS_NOTE_MAX_LENGTH = 512
@@ -501,7 +761,9 @@ async def delete_subagent(target: str | RLMSubagent | RLMSpawnHandle) -> RLMSuba
             f"target must be RLMSpawnHandle, RLMSubagent, or str, got {type(target).__name__}"
         )
     payload = await host_request("rlm.delete_subagent", {"target": selector})
-    return _subagent_from_payload(payload.get("subagent"), "rlm.delete_subagent")
+    row = _subagent_from_payload(payload.get("subagent"), "rlm.delete_subagent")
+    _spawn_schemas.pop(row.rlm_child_id, None)
+    return row
 
 
 async def rename(new_name: str, *, session_id: str | RLMSpawnHandle | RLMSubagent | None = None) -> str:
@@ -647,8 +909,11 @@ class _RLMNamespace:
         model: str | None = None,
         thinking: str | None = None,
         kind: str | None = None,
+        schema: dict[str, Any] | None = None,
     ) -> RLMSpawnHandle:
-        return await spawn(prompt, name=name, model=model, thinking=thinking, kind=kind)
+        return await spawn(
+            prompt, name=name, model=model, thinking=thinking, kind=kind, schema=schema
+        )
 
     async def create_session(
         self,
@@ -682,6 +947,14 @@ class _RLMNamespace:
 
     async def collect(self, targets: Any = None, *, timeout_ms: int = 0) -> list[RLMChildResult]:
         return await collect(targets, timeout_ms=timeout_ms)
+
+    async def set_cost_ceiling(
+        self,
+        cost_usd: float | None = None,
+        *,
+        spawn_limit: int | None = None,
+    ) -> dict[str, Any]:
+        return await set_cost_ceiling(cost_usd, spawn_limit=spawn_limit)
 
     factory = _RLMFactoryNamespace()
 

@@ -1,0 +1,1 @@
+- A failed `ipython` cell that already edited files or ran `bash()` commands now says so in its result (up to 8 edited paths and the command count), so the model inspects the workspace before repeating mutations.

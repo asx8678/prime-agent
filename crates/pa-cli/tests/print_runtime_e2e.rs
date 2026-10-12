@@ -807,11 +807,14 @@ fn print_mode_json_streams_the_threshold_compaction_pair() {
             "compaction": { "engine": "llm", "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
     );
-    // A small context window: the ~8.1k seed turn stays below the 15_808
-    // ceiling (24k - 4_096 output - 4_096 headroom), and the ~12k-token
-    // crossing turn pushes past it.
+    // A small context window: the seed turn stays below the 21_808
+    // ceiling (30k - 4_096 output - 4_096 headroom), and the ~12k-token
+    // crossing turn pushes past it. Session requests carry the session's
+    // routing id, so the faux provider's prompt cache is on and its usage
+    // counts the cache write on top of the input (TS faux parity): the
+    // ~8.1k-token seed reports ~17.9k, the crossing turn ~33k.
     let script = serde_json::json!({
-        "contextWindow": 24000,
+        "contextWindow": 30000,
         "responses": [
             {"text": "seed reply"},
             {"text": "crossing reply"},

@@ -591,6 +591,7 @@ mod subscription_identity_tests {
     // what the API's model gates require (the opus-5.5 family rejects anything below 2.280).
     fn test_model() -> Model {
         Model {
+            prompt_cache: None,
             id: "claude-opus-5-5".into(),
             name: "Claude Opus 5.5".into(),
             api: "anthropic-messages".into(),

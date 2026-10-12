@@ -533,6 +533,7 @@ mod tests {
 
     fn model(provider: &str, input: f64, output: f64) -> Model {
         Model {
+            prompt_cache: None,
             id: "m".into(),
             name: "m".into(),
             api: "openai-completions".into(),

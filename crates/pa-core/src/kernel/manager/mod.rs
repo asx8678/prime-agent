@@ -92,6 +92,11 @@ struct ExecBuffers {
     stderr_chars: usize,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    /// The full-stream artifacts for capped streams (fabric
+    /// `output-budget.ts`): created lazily on first overflow, linked by
+    /// the settle path.
+    stdout_spill: Option<StreamSpill>,
+    stderr_spill: Option<StreamSpill>,
     result: Option<String>,
     diffs: Vec<KernelDiffDisplay>,
     attachments: Vec<KernelAttachment>,
@@ -143,6 +148,7 @@ impl InternalExecuteResult {
                 status: ExecuteStatus::Aborted,
                 error: None,
                 duration_ms: started.elapsed().as_millis() as u64,
+                spilled: crate::kernel::shared::SpilledOutputs::default(),
             },
             done_fields: None,
         }
@@ -419,7 +425,10 @@ mod snapshot;
 mod startup;
 mod teardown;
 
-use requests::{append_truncated, describe_failure, Signal};
+pub(crate) use requests::{
+    append_truncated, describe_failure, finish_stream_with_spill, Signal, StreamSpill,
+    StreamSpillSlot,
+};
 
 // Public API
 

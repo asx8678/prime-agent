@@ -7,6 +7,9 @@ pub mod auto_refine_trigger;
 pub mod auto_retry;
 pub mod auxiliary_model;
 pub mod branch_summarization;
+pub mod cache_miss;
+pub mod cache_warmer;
+pub mod compact_carry;
 pub mod compact_session;
 pub mod compaction;
 pub mod compaction_exec;
@@ -30,6 +33,7 @@ pub mod provider_park;
 pub mod provider_retry;
 pub mod refine;
 pub mod request_timing;
+pub mod rlm_cost;
 pub mod rlm_host;
 pub mod rlm_notices;
 pub mod rlm_usage;
@@ -184,6 +188,12 @@ pub struct AgentSession {
     /// resolves it (verification harnesses building the session directly
     /// keep `None`, which reads as the fail-closed disabled default).
     agent_dir: Option<std::path::PathBuf>,
+    /// The session's prompt-cache warmer (TS `CacheWarmer`): `None` until
+    /// the engine wiring resolves it — hosts that pass no arm slot build
+    /// sessions without warming. The compaction paths invalidate it when
+    /// the live context is replaced; the agent-event subscription (held
+    /// by the warmer itself) feeds prompt sizes and run settles.
+    cache_warmer: Option<std::sync::Arc<cache_warmer::CacheWarmer>>,
 }
 
 impl AgentSession {
@@ -251,6 +261,7 @@ impl AgentSession {
             semantic_edges: std::sync::Mutex::new(None),
             side_question_stream_fn: std::sync::Mutex::new(None),
             agent_dir: None,
+            cache_warmer: None,
             compaction_flight: tokio::sync::Mutex::new(()),
         };
         this.ensure_harness_digest_context().await?;

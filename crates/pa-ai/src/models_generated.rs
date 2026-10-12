@@ -4409,6 +4409,7 @@ fn model_from_raw(raw: &RawModel) -> Model {
             .collect()
     });
     Model {
+        prompt_cache: None,
         id: raw.id.to_string(),
         name: raw.name.to_string(),
         api: raw.api.to_string(),

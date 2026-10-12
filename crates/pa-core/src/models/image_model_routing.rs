@@ -104,6 +104,7 @@ mod tests {
 
     fn model(id: &str, image: bool) -> Model {
         Model {
+            prompt_cache: None,
             id: id.to_string(),
             name: id.to_string(),
             api: "anthropic-messages".to_string(),

@@ -426,6 +426,7 @@ async fn rlm_children_key_the_roster_by_parent_path_and_child_id() {
             decision_child: false,
             cell_source_code: None,
             spawned_by_request_id: None,
+            inherited_cost_ceiling: None,
         })
         .await
         .expect("spawn child");

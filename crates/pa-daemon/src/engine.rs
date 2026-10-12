@@ -93,6 +93,17 @@ pub trait SessionEngine: Send + Sync {
         Box::pin(std::future::ready(false))
     }
 
+    /// Whether the session's prompt-cache warm window is live: the worker
+    /// defers its own idle passivation while it is, so a short
+    /// `idleEvictionMinutes` never parks a worker mid-window (the refreshes
+    /// already paid for would be wasted and the cache cold on wake). The
+    /// default `false` keeps engines without a warmer on today's path.
+    fn cache_warming_active(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(std::future::ready(false))
+    }
+
     /// Mint the owed post-compaction goal continuation; `None` when the
     /// engine mints nothing. The worker owns the queue and admits the turn.
     fn mint_post_compaction_goal_continuation(&self) -> Option<GoalContinuation> {
@@ -254,6 +265,13 @@ pub trait SessionEngine: Send + Sync {
     /// conversation-log path and the session-local harness dir).
     fn set_session_file(&self, path: std::path::PathBuf) {
         let _ = path;
+    }
+
+    /// Subscribe the worker's persistence mirror for the kernel's custom
+    /// rows (`compact.carry`/`compact.drop` and the RLM cost ceiling; the
+    /// scripted engine keeps no session file and never subscribes).
+    fn set_custom_row_sink(&self, sink: pa_core::session_engine::compact_carry::CarryRowSink) {
+        let _ = sink;
     }
 
     /// A session being revived restores the model its file pins before the

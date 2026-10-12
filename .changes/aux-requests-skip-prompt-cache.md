@@ -1,0 +1,1 @@
+- One-off requests (compaction summaries, branch summaries, refine gate reviews) no longer write prompt-cache entries: they send no `cache_control` markers and no `prompt_cache_key`, and route on their own id, so they never pay cache-write prices or disturb the session's cache.

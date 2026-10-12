@@ -162,6 +162,7 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         cell_source_code: None,
         spawned_by_request_id: None,
         decision_child: false,
+        inherited_cost_ceiling: None,
     }
 }
 

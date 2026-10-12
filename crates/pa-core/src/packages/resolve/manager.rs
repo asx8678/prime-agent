@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::super::source::{parse_source, GitSource, NpmSource, ParsedSource, SourceScope};
+use super::super::source::{
+    parse_installable_source, parse_source, GitSource, NpmSource, ParsedSource, SourceScope,
+};
 use super::super::PackageManager;
 use super::super::{git, npm};
 use std::collections::HashMap;
@@ -288,7 +290,7 @@ impl PackageManager {
                 MissingSourceAction::Install => {}
             }
         }
-        let parsed = parse_source(source);
+        let parsed = parse_installable_source(source)?;
         match &parsed {
             ParsedSource::Npm(npm_source) => {
                 let temporary = scope == SourceScope::Temporary;

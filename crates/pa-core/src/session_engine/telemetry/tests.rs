@@ -110,6 +110,9 @@ fn fixture_with_clock(clock: TestClock) -> Fixture {
         telemetry_enabled: None,
         recording: true,
         now,
+        prefix_fingerprint: 0,
+        prev_request: None,
+        cache_ttl_ms: crate::session_engine::cache_miss::CACHE_TTL_MS,
     }));
     Fixture {
         client,
@@ -504,6 +507,186 @@ async fn tool_calls_fold_into_run_aggregates() {
 
 /// Skills, RLM child usage, MCP connector use, kernel boots, and feature
 /// outcomes count into `agent session ended` instead of their own events.
+/// One assistant request with the given usage buckets.
+fn assistant_with_cache(input: u64, cache_read: u64, cache_write: u64) -> AssistantMessage {
+    let mut message = assistant_message();
+    message.usage = Usage {
+        input,
+        output: 20,
+        cache_read,
+        cache_write,
+        total_tokens: input + 20 + cache_read + cache_write,
+        cost: pa_agent::types::UsageCost::default(),
+    };
+    message
+}
+
+#[tokio::test]
+async fn cache_misses_classify_and_ride_session_ended() {
+    let clock = TestClock::default();
+    let fixture = fixture_with_clock(clock.clone());
+    let telemetry = SessionTelemetry::detached(
+        fixture.client.clone(),
+        fixture.state.clone(),
+        "interactive".to_string(),
+    );
+    let prefix_one = 101;
+    let prefix_two = 102;
+    fixture.state.lock().unwrap().prefix_fingerprint = prefix_one;
+
+    // A warm baseline: the whole prompt read from cache.
+    clock.set(0);
+    emit(
+        &fixture,
+        message_end_event(assistant_with_cache(0, 100_000, 0)),
+    );
+    // A small drop below the noise floor: noise, no missed tokens.
+    clock.set(30_000);
+    emit(
+        &fixture,
+        message_end_event(assistant_with_cache(800, 99_200, 0)),
+    );
+    // The prefix changes (a model switch): the definite cause.
+    fixture.state.lock().unwrap().prefix_fingerprint = prefix_two;
+    clock.set(31_000);
+    emit(
+        &fixture,
+        message_end_event(assistant_with_cache(10_000, 0, 0)),
+    );
+    // Same prefix, ten idle minutes: the TTL gap.
+    clock.set(31_000 + 10 * 60 * 1_000);
+    emit(
+        &fixture,
+        message_end_event(assistant_with_cache(5_000, 0, 0)),
+    );
+    // Same prefix, a short gap, a real drop with no observable cause.
+    clock.set(31_000 + 10 * 60 * 1_000 + 5_000);
+    emit(
+        &fixture,
+        message_end_event(assistant_with_cache(5_000, 0, 0)),
+    );
+    // A compaction legitimately changes the context: the next request's
+    // prompt is new content and classifies nothing, and re-arms the
+    // baseline for the one after it.
+    telemetry.note_compaction(None);
+    clock.set(31_000 + 10 * 60 * 1_000 + 10_000);
+    emit(
+        &fixture,
+        message_end_event(assistant_with_cache(0, 90_000, 0)),
+    );
+
+    telemetry.end().await.unwrap();
+    let ended = &event_properties(&fixture.mock, "agent session ended").await[0];
+    assert_eq!(ended["cache_miss_noise_count"], serde_json::json!(1));
+    assert_eq!(
+        ended["cache_miss_prefix_changed_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(ended["cache_miss_ttl_gap_count"], serde_json::json!(1));
+    assert_eq!(ended["cache_miss_unattributed_count"], serde_json::json!(1));
+    // The noise drop adds no tokens; the others re-billed the tokens
+    // their own prompts actually re-sent (the min with the current
+    // prompt, TS `cache-stats`).
+    assert_eq!(
+        ended["cache_missed_tokens"],
+        serde_json::json!(
+            // prefix_changed: min(100_000, 10_000) - 0
+            10_000
+                // ttl_gap: min(10_000, 5_000) - 0
+                + 5_000
+                // unattributed: min(5_000, 5_000) - 0
+                + 5_000
+        )
+    );
+}
+
+/// Each session request refreshes the cache-miss facts from the request
+/// actually sent: a changed system prompt or tool roster changes the
+/// prefix fingerprint, an unchanged request keeps it, and the request's
+/// own retention picks the TTL.
+#[tokio::test]
+async fn session_requests_refresh_the_cache_prefix_and_ttl() {
+    let fixture = fixture();
+    let telemetry = SessionTelemetry::detached(
+        fixture.client.clone(),
+        fixture.state.clone(),
+        "interactive".to_string(),
+    );
+    let model: pa_types::ai::Model = serde_json::from_value(serde_json::json!({
+        "id": "m", "name": "m", "api": "test-api", "provider": "test",
+        "baseUrl": "http://localhost", "reasoning": false, "input": ["text"],
+        "cost": {"input": 1, "output": 1, "cacheRead": 0.1, "cacheWrite": 1.25},
+        "contextWindow": 1000, "maxTokens": 100
+    }))
+    .unwrap();
+    let request = |system: &str, tools: &[&str], retention| {
+        crate::session_engine::cache_warmer::WarmRequest {
+            model: model.clone(),
+            context: pa_types::ai::Context {
+                system_prompt: Some(system.to_string()),
+                messages: Vec::new(),
+                tools: Some(
+                    tools
+                        .iter()
+                        .map(|name| pa_types::ai::Tool {
+                            name: (*name).to_string(),
+                            description: String::new(),
+                            parameters: serde_json::json!({}),
+                        })
+                        .collect(),
+                ),
+            },
+            options: pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+                cache_retention: Some(retention),
+                ..Default::default()
+            }),
+        }
+    };
+    let facts = || {
+        let state = fixture.state.lock().unwrap();
+        (state.prefix_fingerprint, state.cache_ttl_ms)
+    };
+    telemetry.note_session_request(&request(
+        "prompt v1",
+        &["bash", "ipython"],
+        pa_types::ai::CacheRetention::Short,
+    ));
+    let first = facts();
+    assert_eq!(first.1, crate::session_engine::cache_miss::CACHE_TTL_MS);
+    telemetry.note_session_request(&request(
+        "prompt v1",
+        &["ipython", "bash"],
+        pa_types::ai::CacheRetention::Short,
+    ));
+    assert_eq!(
+        facts(),
+        first,
+        "the same prefix (tool order aside) keeps its fingerprint"
+    );
+    telemetry.note_session_request(&request(
+        "prompt v2",
+        &["bash", "ipython"],
+        pa_types::ai::CacheRetention::Short,
+    ));
+    assert_ne!(
+        facts().0,
+        first.0,
+        "a changed system prompt is a new prefix"
+    );
+    telemetry.note_session_request(&request(
+        "prompt v1",
+        &["bash", "ipython", "mcp_tool"],
+        pa_types::ai::CacheRetention::Long,
+    ));
+    let long = facts();
+    assert_ne!(long.0, first.0, "a changed tool roster is a new prefix");
+    assert_eq!(
+        long.1,
+        60 * 60 * 1_000,
+        "long retention measures the long lifetime"
+    );
+}
+
 #[tokio::test]
 async fn session_counters_ride_session_ended() {
     let fixture = fixture();
@@ -520,15 +703,33 @@ async fn session_counters_ride_session_ended() {
     counters.note_mcp_connector_use();
     counters.note_kernel_bootstrap(true, true, 1_200);
     counters.note_kernel_bootstrap(false, false, 300);
+    counters.note_repeat_guard(false, 3);
+    counters.note_repeat_guard(true, 6);
+    counters.note_repeat_guard(true, 7);
+    counters.note_cell_failure_note();
+    counters.note_output_budget_spill();
+    counters.note_compact_carry();
+    counters.note_cache_warm_refresh();
+    counters.note_cache_warm_refresh();
     telemetry.note_feature_outcome("goal", "completed", Some("create"));
     telemetry.note_feature_outcome("not-a-feature", "completed", None);
     telemetry.note_deterministic_compaction();
+    telemetry.note_compaction_model_fallback(true);
+    telemetry.note_compaction_model_fallback(false);
     telemetry.end().await.unwrap();
     assert_eq!(fixture.mock.event_names(), ["agent session ended"]);
     let ended = &event_properties(&fixture.mock, "agent session ended").await[0];
     assert_eq!(ended["skill_use_count"], serde_json::json!(2));
     assert_eq!(
         ended["compaction_deterministic_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        ended["compaction_model_fallback_count"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        ended["compaction_model_fallback_failed_count"],
         serde_json::json!(1)
     );
     assert_eq!(ended["rlm_child_usage_count"], serde_json::json!(1));
@@ -540,6 +741,13 @@ async fn session_counters_ride_session_ended() {
     assert_eq!(ended["kernel_bootstrap_cold_count"], serde_json::json!(1));
     assert_eq!(ended["kernel_bootstrap_failed_count"], serde_json::json!(1));
     assert_eq!(ended["kernel_bootstrap_max_ms"], serde_json::json!(1_200));
+    assert_eq!(ended["repeat_guard_warn_count"], serde_json::json!(1));
+    assert_eq!(ended["repeat_guard_block_count"], serde_json::json!(2));
+    assert_eq!(ended["repeat_guard_max_run"], serde_json::json!(7));
+    assert_eq!(ended["cell_failure_note_count"], serde_json::json!(1));
+    assert_eq!(ended["output_budget_spill_count"], serde_json::json!(1));
+    assert_eq!(ended["cache_warm_refresh_count"], serde_json::json!(2));
+    assert_eq!(ended["compact_carry_used_count"], serde_json::json!(1));
     assert_eq!(ended["feature_goal_completed_count"], serde_json::json!(1));
 }
 
@@ -1179,6 +1387,9 @@ fn fixture_with_switch(telemetry_enabled: Arc<dyn Fn() -> bool + Send + Sync>) -
         telemetry_enabled: Some(RecordingSwitch::test(telemetry_enabled)),
         recording: true,
         now,
+        prefix_fingerprint: 0,
+        prev_request: None,
+        cache_ttl_ms: crate::session_engine::cache_miss::CACHE_TTL_MS,
     }));
     Fixture {
         client,

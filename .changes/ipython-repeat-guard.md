@@ -1,0 +1,1 @@
+- The `ipython` tool warns after 3 consecutive runs of identical code that produced identical output, and blocks the 6th such run without executing it; a cell whose output changes (polling `rlm.collect()` while children work) never trips it. Configure with `repeatGuard` (`enabled`, `warnAt`, `blockAt`; invalid thresholds fall back to 3/6).

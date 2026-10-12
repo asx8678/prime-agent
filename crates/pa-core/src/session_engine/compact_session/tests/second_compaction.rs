@@ -59,12 +59,15 @@ async fn second_compaction_updates_the_prior_summary_over_new_history() {
             model: model.clone(),
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings,
             abort: None,
             harness_digest: None,
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -87,12 +90,15 @@ async fn second_compaction_updates_the_prior_summary_over_new_history() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings,
             abort: None,
             harness_digest: None,
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -213,6 +219,8 @@ async fn second_compaction_request_carries_the_anchor_and_strips_file_blocks() {
             model: model.clone(),
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 2,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -223,6 +231,7 @@ async fn second_compaction_request_carries_the_anchor_and_strips_file_blocks() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -274,6 +283,8 @@ async fn second_compaction_request_carries_the_anchor_and_strips_file_blocks() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -284,6 +295,7 @@ async fn second_compaction_request_carries_the_anchor_and_strips_file_blocks() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -385,12 +397,15 @@ async fn second_compaction_split_turn_history_updates_prefix_does_not() {
             model: model.clone(),
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings,
             abort: None,
             harness_digest: None,
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -415,6 +430,8 @@ async fn second_compaction_split_turn_history_updates_prefix_does_not() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -425,6 +442,7 @@ async fn second_compaction_split_turn_history_updates_prefix_does_not() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await

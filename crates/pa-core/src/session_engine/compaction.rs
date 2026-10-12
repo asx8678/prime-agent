@@ -82,9 +82,14 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
             pa_types::ai::UserContent::Blocks(blocks) => div4(
                 blocks
                     .iter()
-                    .filter_map(|block| match block {
-                        pa_types::ai::UserContentBlock::Text(text) => Some(chars(&text.text)),
-                        _ => None,
+                    .map(|block| match block {
+                        pa_types::ai::UserContentBlock::Text(text) => chars(&text.text),
+                        // The same per-image estimate as the `Custom` and
+                        // `ToolResult` arms below.
+                        pa_types::ai::UserContentBlock::Image(_) => 4_800, // ~1200 tokens
+                        // Un-modeled blocks have no modeled size; TS sizes
+                        // only typed blocks, so estimate zero.
+                        pa_types::ai::UserContentBlock::Raw(_) => 0,
                     })
                     .sum(),
             ),
@@ -145,11 +150,15 @@ fn div4(chars: u64) -> u64 {
 
 /// The effective compaction threshold: the earlier of two ceilings.
 /// PERCENTAGE: `context_window * COMPACT_THRESHOLD_RATIO` (estimate drift on
-/// large windows). COMBINED-LIMIT: `context_window - max_output_tokens -
-/// max(reserve_tokens, COMBINED_LIMIT_HEADROOM_FLOOR)`: the output budget
-/// must still fit. TS checks only `contextWindow - reserveTokens`; reserving
-/// the output budget is a deliberate Rust-side fix. A non-positive threshold
-/// disables the trigger.
+/// large windows). COMBINED-LIMIT: `context_window -
+/// min(max_output_tokens, W/2) - min(max(reserve_tokens,
+/// COMBINED_LIMIT_HEADROOM_FLOOR), W/4)`: the output budget must still fit,
+/// and both reservations are window-capped so small windows keep a positive
+/// threshold (shipped 8192-token catalog rows with `max_tokens` equal to the
+/// window would otherwise disable the trigger). TS checks only
+/// `contextWindow - reserveTokens`; reserving the output budget is a
+/// deliberate Rust-side fix. A non-positive threshold still disables the
+/// trigger.
 #[must_use]
 pub fn compaction_threshold(
     context_window: u64,
@@ -157,9 +166,16 @@ pub fn compaction_threshold(
     settings: &CompactionSettings,
 ) -> u64 {
     let percentage = (context_window as f64 * COMPACT_THRESHOLD_RATIO) as u64;
-    let headroom = settings.reserve_tokens.max(COMBINED_LIMIT_HEADROOM_FLOOR);
+    // Both reservations are capped relative to the window: an output budget
+    // equal to the window plus the default reserve would otherwise saturate
+    // the combined term to zero and disable the trigger entirely (small
+    // windows would compact only through the overflow recovery).
+    let headroom = settings
+        .reserve_tokens
+        .max(COMBINED_LIMIT_HEADROOM_FLOOR)
+        .min(context_window / 4);
     let combined = context_window
-        .saturating_sub(max_output_tokens)
+        .saturating_sub(max_output_tokens.min(context_window / 2))
         .saturating_sub(headroom);
     percentage.min(combined)
 }
@@ -597,8 +613,9 @@ mod tests {
 
     #[test]
     fn threshold_crosses_the_reserve_headroom() {
-        // 126_010 tokens on a 128k window with a 127_500 reserve leaves
-        // a 500-token combined ceiling — the crossing fires.
+        // 126_010 tokens on a 128k window cross the combined ceiling: the
+        // 127_500 reserve caps at a quarter window (32_000), so the
+        // crossing fires at 96_000.
         let settings = CompactionSettings {
             enabled: true,
             reserve_tokens: 127_500,
@@ -692,18 +709,35 @@ mod tests {
             ..CompactionSettings::default()
         };
         assert_eq!(compaction_threshold(131_072, 32_768, &settings), 94_208);
-        // An output budget that cannot fit any context disables the
-        // trigger.
+        // An output budget that would swallow the window caps at half of
+        // it, so the trigger stays alive: 128_000 - 64_000 - 16_384 = 47_616.
         assert_eq!(
             compaction_threshold(128_000, 124_000, &CompactionSettings::default()),
-            0
+            47_616
         );
-        assert!(!should_compact(
+        assert!(should_compact(
             126_000,
             128_000,
             124_000,
             &CompactionSettings::default()
         ));
+        assert!(!should_compact(
+            40_000,
+            128_000,
+            124_000,
+            &CompactionSettings::default()
+        ));
+    }
+
+    #[test]
+    fn threshold_stays_positive_on_window_sized_output_budgets() {
+        // Shipped catalog rows with context_window == max_tokens (8192):
+        // the uncapped reservations saturated the combined term to zero and
+        // auto-compaction never fired — those sessions rode to overflow.
+        let settings = CompactionSettings::default();
+        assert_eq!(compaction_threshold(8_192, 8_192, &settings), 2_048);
+        assert!(should_compact(7_400, 8_192, 8_192, &settings));
+        assert!(!should_compact(2_000, 8_192, 8_192, &settings));
     }
 
     #[test]
@@ -745,6 +779,30 @@ mod tests {
             cost: pa_types::ai::UsageCost::default(),
         };
         assert_eq!(calculate_context_tokens(&usage), 100);
+    }
+
+    #[test]
+    fn estimate_tokens_counts_user_message_images() {
+        // The per-image estimate (~1,200 tokens) applies to plain user
+        // messages too, matching custom rows and tool results.
+        let user = AgentMessage::User(pa_types::ai::UserMessage {
+            content: pa_types::ai::UserContent::Blocks(vec![
+                pa_types::ai::UserContentBlock::Text(pa_types::ai::TextContent {
+                    text: "look".to_string(),
+                    text_signature: None,
+                    rest: serde_json::Map::default(),
+                }),
+                pa_types::ai::UserContentBlock::Image(pa_types::ai::ImageContent {
+                    data: "aGk=".to_string(),
+                    mime_type: "image/png".to_string(),
+                    rest: serde_json::Map::default(),
+                }),
+            ]),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        });
+        // 4 text chars + 4_800 image chars, divided by 4.
+        assert_eq!(estimate_tokens(&user), 1_201);
     }
 
     #[test]

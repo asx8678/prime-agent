@@ -340,6 +340,30 @@ impl pa_tui::client_settings::ClientSettings for RecordingSettings {
     fn set_tree_filter_mode(&self, _mode: &str) -> Result<()> {
         Ok(())
     }
+    fn cache_warming_mode(&self) -> String {
+        "off".to_string()
+    }
+    fn set_cache_warming_mode(&self, mode: &str) -> Result<()> {
+        self.record(&format!("cache-warming={mode}"))
+    }
+    fn repeat_guard_enabled(&self) -> bool {
+        true
+    }
+    fn set_repeat_guard_enabled(&self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+    fn auto_refine_enabled(&self) -> bool {
+        true
+    }
+    fn set_auto_refine_enabled(&self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+    fn compaction_engine(&self) -> String {
+        "deterministic".to_string()
+    }
+    fn set_compaction_engine(&self, _engine: &str) -> Result<()> {
+        Ok(())
+    }
     fn default_service_tier(&self) -> String {
         "default".to_string()
     }
@@ -499,7 +523,8 @@ fn the_settings_page_renders_the_spacing_and_the_new_keys() {
         .position(|row| row.starts_with("  1 General"))
         .expect("the tab strip renders");
     assert_eq!(
-        rows[strip_index], "  1 General    2 Models    3 Display    4 Editor    5 Agents",
+        rows[strip_index],
+        "  1 General    2 Models    3 Display    4 Editor    5 Agents    6 Advanced",
         "the tabs sit four spaces apart (the spacing pass)"
     );
     // A blank row rides between the search field's bottom rule and the strip, and between the strip
@@ -532,7 +557,7 @@ fn the_settings_page_renders_the_spacing_and_the_new_keys() {
     );
     assert!(
         rows[hint_index].starts_with(
-            "  Type to search · Tab/1-5 tabs · \u{2190}/\u{2192}/Enter/Space change · Esc close"
+            "  Type to search · Tab/1-6 tabs · \u{2190}/\u{2192}/Enter/Space change · Esc close"
         ),
         "the hint names the Tab/number tab keys and the arrow value keys: {:?}",
         rows[hint_index]
@@ -589,6 +614,34 @@ fn the_arrows_cycle_values_and_the_writes_persist() {
         ],
         "every arrow cycle persisted through the settings seam"
     );
+}
+
+/// The Advanced tab (6) lists the Rust-only runtime rows; Right cycles Cache warming off ->
+/// streaming and the write persists through the settings seam.
+#[test]
+fn the_advanced_tab_cycles_cache_warming_and_persists_it() {
+    let mut steps = open_settings();
+    steps.push(HeadlessStep::Key(key(KeyCode::Char('6'))));
+    steps.push(HeadlessStep::WaitRender {
+        needle: "Cache warming".to_string(),
+        timeout_ms: 5000,
+    });
+    steps.push(HeadlessStep::Key(key(KeyCode::Right)));
+    steps.push(HeadlessStep::WaitMs(150));
+    let (frames, settings) = run_plan(steps);
+    let rows = frame_with(&frames, "Cache warming");
+    let row = rows
+        .iter()
+        .find(|row| row.contains("Cache warming"))
+        .expect("the cache-warming row renders");
+    assert!(row.contains("streaming"), "the cycled value shows: {row}");
+    for label in ["Compaction engine", "Auto-refine", "Repeat guard"] {
+        assert!(
+            rows.iter().any(|row| row.contains(label)),
+            "the Advanced tab lists {label}"
+        );
+    }
+    assert_eq!(settings.log(), vec!["cache-warming=streaming"]);
 }
 
 #[test]

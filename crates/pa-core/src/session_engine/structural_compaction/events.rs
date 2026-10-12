@@ -13,6 +13,7 @@ use crate::autonomous::{AUTONOMOUS_CONTINUATION_LABEL, AUTONOMOUS_STATUS_CUSTOM_
 use crate::goals::GOAL_CONTEXT_CUSTOM_TYPE;
 use crate::prompts::model_prompts::MODEL_PROMPT_ERROR_CUSTOM_TYPE;
 use crate::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE;
+use crate::session_engine::compact_carry::COMPACT_CARRY_CUSTOM_TYPE;
 use crate::session_engine::headless::HARNESS_DIGEST_CUSTOM_TYPE;
 use crate::session_engine::ipython_state::IPYTHON_STATE_CUSTOM_TYPE;
 use crate::session_engine::messages::{
@@ -81,6 +82,10 @@ pub(crate) enum Event {
     Notice { kind: NoticeKind, text: String },
     /// Any other model-visible custom row.
     Custom { custom_type: String, text: String },
+    /// The compaction carry-forward list replaced: the latest carry row on
+    /// the branch wins, so one event carries the whole list. A malformed
+    /// row decodes as an empty list (fail closed), never an older one.
+    CarryItems { items: Vec<String> },
     /// A summary written once at a branch boundary (`/tree`).
     BranchSummary { text: String },
 }
@@ -107,8 +112,9 @@ pub(crate) enum BashOutcome {
     Exited(i64),
     /// The command was cancelled before finishing.
     Cancelled,
-    /// The command never started (a spawn failure).
-    Failed,
+    /// The run ended without an exit status: a spawn failure, or a signal
+    /// death (an OOM kill or SIGKILL, where `status.code()` is `None`).
+    NoExitCode,
 }
 
 /// The typed outcome of one Python cell (`details` of an `ipython` result).
@@ -196,7 +202,7 @@ fn push_message(message: &AgentMessage, events: &mut Vec<Event>) {
                     outcome: match (bash.cancelled, bash.exit_code) {
                         (true, _) => BashOutcome::Cancelled,
                         (false, Some(code)) => BashOutcome::Exited(code),
-                        (false, None) => BashOutcome::Failed,
+                        (false, None) => BashOutcome::NoExitCode,
                     },
                 });
             }
@@ -394,7 +400,7 @@ fn push_custom(
             outcome: details
                 .get("exitCode")
                 .and_then(Value::as_i64)
-                .map_or(BashOutcome::Failed, BashOutcome::Exited),
+                .map_or(BashOutcome::NoExitCode, BashOutcome::Exited),
         },
         RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE => Event::ChildEnded {
             name: child_name(details),
@@ -410,6 +416,9 @@ fn push_custom(
         },
         HEARTBEAT_PROMPT_CUSTOM_TYPE => notice(NoticeKind::Heartbeat, text),
         GOAL_CONTEXT_CUSTOM_TYPE => notice(NoticeKind::Goal, text),
+        COMPACT_CARRY_CUSTOM_TYPE => Event::CarryItems {
+            items: crate::session_engine::compact_carry::decode_carry_details(Some(details)),
+        },
         REFINEMENT_NOTICE_CUSTOM_TYPE => notice(NoticeKind::Refinement, text),
         AUTONOMOUS_STATUS_CUSTOM_TYPE => notice(NoticeKind::Autonomous, text),
         // Re-sent after every compaction, or never shown to the model.

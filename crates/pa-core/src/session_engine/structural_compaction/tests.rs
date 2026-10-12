@@ -24,6 +24,99 @@ fn text(text: &str) -> String {
 }
 
 #[test]
+fn preserve_items_render_once_inside_the_request_block() {
+    let rows = entries(concat!(
+        "{\"type\":\"message\",\"id\":\"e1\",\"role\":\"user\",\"content\":\"fix the parser\"}\n",
+        "{\"type\":\"custom_message\",\"id\":\"e2\",\"customType\":\"compaction_carry\",\"content\":\"[compact carry]\",\"display\":false,\"details\":{\"version\":1,\"items\":[\"keep the API stable\"]}}\n",
+    ));
+    let fold = super::Fold::new(None, None, &rows);
+    let (first, saved) = fold.summarize(
+        Some("focus on the goal"),
+        &["the exact error text".to_string()],
+        200_000,
+    );
+    assert_eq!(
+        first
+            .matches(
+                "[Compaction Request]\n\nfocus on the goal\n\n- the exact error text [preserve:0]"
+            )
+            .count(),
+        1,
+        "preserve rides the request block: {first}"
+    );
+    // One-shot: the saved state never keeps preserve, so the next
+    // compaction drops it, while carried notes stay.
+    let refold = super::Fold::new(Some(&saved), None, Vec::<&FileEntry>::new());
+    let (second, _) = refold.summarize(None, &[], 200_000);
+    assert!(
+        !second.contains("[preserve:"),
+        "preserve renders in exactly one summary: {second}"
+    );
+    assert!(
+        second.contains("- keep the API stable [carry:0]"),
+        "carried notes survive: {second}"
+    );
+}
+
+#[test]
+fn carried_notes_render_as_their_own_protected_block() {
+    let mut state = State::new();
+    state.carried = vec![
+        text("keep the public API stable"),
+        text("the repro lives in tests/e2e"),
+    ];
+    let summary = render(&state, None, &[], DEFAULT_MAX_BYTES);
+    let block = "[Carried notes]\n\n- keep the public API stable [carry:0]\n\n- the repro lives in tests/e2e [carry:1]";
+    assert_eq!(
+        summary.matches(block).count(),
+        1,
+        "the carried block renders once, with the drop indexes:\n{summary}"
+    );
+}
+
+#[test]
+fn a_carry_row_folds_into_state_and_survives_two_summaries() {
+    let log = concat!(
+        "{\"type\":\"message\",\"id\":\"e1\",\"role\":\"user\",\"content\":\"fix the parser\"}\n",
+        "{\"type\":\"custom_message\",\"id\":\"e2\",\"customType\":\"compaction_carry\",\"content\":\"[compact carry]\",\"display\":false,\"details\":{\"version\":1,\"items\":[\"keep the API stable\"]}}\n",
+    );
+    let rows = entries(log);
+    let fold = super::Fold::new(None, None, &rows);
+    let (first_summary, saved) = fold.summarize(None, &[], 200_000);
+    assert!(
+        first_summary.contains("[Carried notes]\n\n- keep the API stable [carry:0]"),
+        "the folded row renders its note: {first_summary}"
+    );
+    // The saved state carries the list, so the next compaction — folding no
+    // new rows at all — still renders it.
+    let refold = super::Fold::new(Some(&saved), None, Vec::<&FileEntry>::new());
+    let (second_summary, _) = refold.summarize(None, &[], 200_000);
+    assert!(
+        second_summary.contains("- keep the API stable [carry:0]"),
+        "carried notes survive the compaction boundary: {second_summary}"
+    );
+}
+
+#[test]
+fn the_summary_stays_within_its_byte_budget_with_many_notes() {
+    let mut state = State::new();
+    state.carried = (0..16)
+        .map(|index| format!("note {index}: {}", "x".repeat(2_048 - 8)))
+        .collect::<Vec<_>>();
+    let summary = render(&state, None, &[], DEFAULT_MAX_BYTES);
+    assert!(
+        summary.len() <= DEFAULT_MAX_BYTES,
+        "16 maximal notes keep the summary inside {DEFAULT_MAX_BYTES} bytes; got {}",
+        summary.len()
+    );
+    assert!(summary.contains("[Carried notes]"));
+    assert!(
+        summary.contains("note 15:"),
+        "every line keeps its head under the block's excerpting\n{summary}"
+    );
+}
+
+#[test]
 fn every_fixture_line_is_a_known_entry() {
     let unknown: Vec<usize> = entries(SESSION)
         .iter()
@@ -160,6 +253,7 @@ fn the_session_summary_matches_its_golden_file() {
         render(
             &state,
             Some("Keep the reviewer's nit in view."),
+            &[],
             DEFAULT_MAX_BYTES
         ),
         SESSION_SUMMARY
@@ -169,7 +263,7 @@ fn the_session_summary_matches_its_golden_file() {
 #[test]
 fn switching_engines_keeps_a_labeled_excerpt_of_the_earlier_summary() {
     let state = State::from_summary("## Goal\nShip the parser fix.");
-    let summary = render(&state, None, DEFAULT_MAX_BYTES);
+    let summary = render(&state, None, &[], DEFAULT_MAX_BYTES);
     assert!(
         summary.contains(
             "Earlier compaction summary, model-written [u0]:\n## Goal\nShip the parser fix."
@@ -186,7 +280,7 @@ fn a_carried_deterministic_summary_is_not_labeled_model_written() {
     let state = State::from_summary(&format!(
         "{HEADER}\n\n[Current Status]\nOpen turn [u1]: \"Ship the parser fix.\""
     ));
-    let summary = render(&state, None, DEFAULT_MAX_BYTES);
+    let summary = render(&state, None, &[], DEFAULT_MAX_BYTES);
     assert!(
         summary.contains("Earlier compaction summary, deterministic [u0]:"),
         "got: {summary}"
@@ -242,7 +336,7 @@ fn autonomous_continuations_do_not_displace_user_directions() {
     lines.extend((2..7).map(|id| user(&format!("e{id}"), &continuation)));
     let mut state = State::new();
     state.fold(&normalize(&entries(&lines.join("\n"))));
-    let summary = render(&state, None, DEFAULT_MAX_BYTES);
+    let summary = render(&state, None, &[], DEFAULT_MAX_BYTES);
     assert!(
         summary.contains("User instruction [u1]:\nShip the parser fix."),
         "got: {summary}"
@@ -276,13 +370,13 @@ fn starting_a_command_does_not_resolve_its_exit_failure() {
             },
         },
     ]);
-    let started = render(&state, None, DEFAULT_MAX_BYTES);
+    let started = render(&state, None, &[], DEFAULT_MAX_BYTES);
     assert!(
         started.contains("- bash: cargo build --release: exit 101 [u0]\n"),
         "got: {started}"
     );
     state.fold(&[build(0)]);
-    let finished = render(&state, None, DEFAULT_MAX_BYTES);
+    let finished = render(&state, None, &[], DEFAULT_MAX_BYTES);
     assert!(
         finished.contains("- bash: cargo build --release: exit 101 [resolved] [u0]"),
         "got: {finished}"
@@ -290,10 +384,11 @@ fn starting_a_command_does_not_resolve_its_exit_failure() {
 }
 
 #[test]
-fn a_bash_run_that_never_started_is_not_cancelled() {
-    // A spawn failure records no exit code and never cancels the run: the
-    // fold must read it as a failure to start, not as a cancellation.
-    let spawn_failure = serde_json::json!({
+fn a_bash_row_without_an_exit_code_renders_a_neutral_label() {
+    // No exit code covers both a spawn failure and a signal death (an OOM
+    // kill or SIGKILL: `status.code()` is `None`): the fold must not claim
+    // the run was cancelled or that it failed to start.
+    let no_exit_code = serde_json::json!({
         "type": "message", "id": "e1", "parentId": null, "timestamp": "2026-10-01T09:00:00.000Z",
         "message": {
             "role": "bashExecution",
@@ -305,11 +400,15 @@ fn a_bash_run_that_never_started_is_not_cancelled() {
         },
     });
     let mut state = State::new();
-    state.fold(&normalize(&entries(&spawn_failure.to_string())));
-    let summary = render(&state, None, DEFAULT_MAX_BYTES);
-    assert!(
-        summary.contains("- bash: cargo build --release: failed to start [u0]"),
-        "got: {summary}"
+    state.fold(&normalize(&entries(&no_exit_code.to_string())));
+    let summary = render(&state, None, &[], DEFAULT_MAX_BYTES);
+    let line = summary
+        .lines()
+        .find(|line| line.contains("cargo build --release"))
+        .unwrap_or_default();
+    assert_eq!(
+        line,
+        "- bash: cargo build --release: ended without an exit code [u0]"
     );
 }
 
@@ -325,7 +424,7 @@ fn a_long_dialogue_keeps_the_user_words() {
         Event::User { text: long('e') },
         Event::AssistantText { text: long('f') },
     ]);
-    let summary = render(&state, None, DEFAULT_MAX_BYTES);
+    let summary = render(&state, None, &[], DEFAULT_MAX_BYTES);
     let dialogue = summary
         .split("\n\n[")
         .find(|block| block.starts_with("Recent user directions"))
@@ -399,7 +498,7 @@ fn event() -> impl Strategy<Value = Event> {
             prop_oneof![
                 (-1i64..3).prop_map(BashOutcome::Exited),
                 Just(BashOutcome::Cancelled),
-                Just(BashOutcome::Failed),
+                Just(BashOutcome::NoExitCode),
             ]
         )
             .prop_map(|(command, outcome)| Event::BashDone {
@@ -460,11 +559,20 @@ proptest! {
         events in prop::collection::vec(event(), 0..200),
         budget in prop_oneof![0usize..64, 2_048usize..40_000],
         request in prop::option::of(words()),
+        carried in prop::collection::vec(words(), 0..16),
+        preserve in prop::collection::vec(words(), 0..16),
     ) {
         let mut state = State::new();
         state.fold(&events);
-        let summary = render(&state, request.as_deref(), budget);
-        prop_assert!(summary.len() <= budget, "{} bytes over a {budget}-byte budget", summary.len());
+        // Carried notes and preserve items are protected blocks, but their
+        // own ceilings keep the whole summary inside the budget.
+        state.carried = carried;
+        let summary = render(&state, request.as_deref(), &preserve, budget);
+        prop_assert!(
+            summary.len() <= budget,
+            "{} bytes over a {budget}-byte budget",
+            summary.len()
+        );
         prop_assert!(!summary.contains("</summary>"));
     }
 }

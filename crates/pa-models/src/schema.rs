@@ -50,6 +50,8 @@ struct CatalogModelSchema {
     max_tokens: u64,
     #[serde(default)]
     featured: Option<bool>,
+    #[serde(default, rename = "promptCache")]
+    prompt_cache: Option<pa_types::ai::ModelPromptCache>,
     #[serde(default)]
     compat: Option<serde_json::Map<String, serde_json::Value>>,
 }
@@ -156,6 +158,7 @@ fn parse_entry(candidate: &serde_json::Value) -> Result<Model, String> {
         max_tokens: entry.max_tokens,
         max_tokens_explicit: false,
         featured: entry.featured,
+        prompt_cache: entry.prompt_cache,
         headers: None,
         compat: entry.compat.map(|raw| ModelCompat { raw }),
     })
@@ -252,6 +255,41 @@ mod tests {
         assert_eq!(parsed.models.len(), 1);
         assert_eq!(parsed.models[0].id, "model-a");
         assert_eq!(parsed.models[0].cost.cache_write.as_f64(), 1.25);
+        assert_eq!(parsed.models[0].prompt_cache, None);
+    }
+
+    #[test]
+    fn prompt_cache_tiers_round_trip_from_the_wire() {
+        let parsed = parse_model_catalog(
+            &catalog(vec![entry(&json!({
+                "promptCache": {"short": 300, "long": 3600}
+            }))]),
+            InvalidEntries::Reject,
+        )
+        .expect("valid");
+        assert_eq!(
+            parsed.models[0].prompt_cache,
+            Some(pa_types::ai::ModelPromptCache {
+                short: Some(300),
+                long: Some(3600),
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_cache_accepts_a_partial_tier_map() {
+        let parsed = parse_model_catalog(
+            &catalog(vec![entry(&json!({"promptCache": {"short": 300}}))]),
+            InvalidEntries::Reject,
+        )
+        .expect("valid");
+        assert_eq!(
+            parsed.models[0].prompt_cache,
+            Some(pa_types::ai::ModelPromptCache {
+                short: Some(300),
+                long: None,
+            })
+        );
     }
 
     #[test]

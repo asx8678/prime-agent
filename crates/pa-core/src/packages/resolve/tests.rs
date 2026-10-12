@@ -219,7 +219,9 @@ fn auto_discovers_project_prompts_with_overrides() {
 #[test]
 fn resolves_symlinked_user_and_project_resources_once() {
     use std::os::unix::fs::symlink;
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous_home = std::env::var("HOME").ok();
     let mut fixture = Fixture::new();
     std::env::set_var("HOME", &fixture.temp_dir);
@@ -334,7 +336,9 @@ fn agents_skills_ignores_root_markdown_files() {
 
 #[test]
 fn home_agents_skills_stays_user_scoped_when_cwd_is_under_home() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous_home = std::env::var("HOME").ok();
     let fixture = Fixture::new();
     std::env::set_var("HOME", &fixture.temp_dir);
@@ -374,7 +378,9 @@ fn home_agents_skills_stays_user_scoped_when_cwd_is_under_home() {
 #[test]
 fn user_skill_entries_dedupe_when_agent_skills_symlinks_agents_skills() {
     use std::os::unix::fs::symlink;
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous_home = std::env::var("HOME").ok();
     let mut fixture = Fixture::new();
     std::env::set_var("HOME", &fixture.temp_dir);
@@ -825,7 +831,9 @@ fn different_packages_in_both_scopes_both_resolve() {
 
 #[test]
 fn offline_mode_skips_installing_missing_sources() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous = std::env::var("PI_OFFLINE").ok();
     std::env::set_var("PI_OFFLINE", "1");
     let mut fixture = Fixture::new();
@@ -855,7 +863,9 @@ fn offline_mode_skips_installing_missing_sources() {
 
 #[test]
 fn on_missing_error_fails_resolution() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut fixture = Fixture::new();
     fixture.set_user_packages(serde_json::json!(["npm:missing-package"]));
 
@@ -871,7 +881,9 @@ fn on_missing_error_fails_resolution() {
 
 #[test]
 fn on_missing_skip_leaves_the_source_out() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut fixture = Fixture::new();
     fixture.set_user_packages(serde_json::json!(["npm:missing-package"]));
 

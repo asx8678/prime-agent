@@ -286,6 +286,9 @@ pub struct RlmSessionIdentity {
     /// file is a top-level runtime and spawns no edge, and a replacement
     /// runtime has none.
     pub semantic_spawn: Option<SemanticSpawnOrigin>,
+    /// The cost budget inherited from the parent's tree
+    /// (`runtimeMetadata.rlmCostCeiling` on a spawned child's create).
+    pub inherited_cost_ceiling: Option<pa_core::session_engine::rlm_cost::InheritedCostCeiling>,
 }
 
 /// A created session's semantic-edge provenance (TS

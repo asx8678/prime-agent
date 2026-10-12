@@ -17,6 +17,7 @@ pub(crate) mod ipython;
 pub(crate) mod ipython_cell_code;
 pub(crate) mod jsdiff;
 pub(crate) mod output_accumulator;
+pub(crate) mod output_budget;
 #[allow(dead_code)] // util module; every fn exercised by unit + golden tests
 pub(crate) mod path_utils;
 #[allow(dead_code)] // render helpers; consumed by the TUI-side renderer (parity-ported here)

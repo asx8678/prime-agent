@@ -103,9 +103,13 @@ pub enum CompactionEngine {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reserve_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_recent_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_callable: Option<bool>,
     /// An unrecognized engine loads as unset instead of failing the whole
     /// `compaction` object, which would also drop the settings beside it.
@@ -134,10 +138,35 @@ pub struct BranchSummarySettings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoRefineSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_ms: Option<u64>,
+}
+
+/// `repeatGuard`: the ipython repeat-guard circuit breaker. A run counts
+/// toward it only when its code and its result both repeat the previous
+/// run's (a poll whose output moves never trips it). Default on with the
+/// fabric thresholds (warn 3, block 6); thresholds must satisfy
+/// `1 <= warnAt < blockAt`, otherwise the defaults apply; `enabled: false`
+/// switches it off (parity mode and the golden-replay harness).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepeatGuardSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Consecutive identical runs (same code, same output) that start
+    /// producing a warning (default 3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warn_at: Option<u64>,
+    /// Consecutive identical runs after which the same code is blocked
+    /// outright (default 6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -322,6 +351,18 @@ pub enum McpServerConfig {
     },
 }
 
+/// `cacheWarming`: the prompt-cache warming profile (pi `CacheWarmingMode`).
+/// `Streaming` warms only while the agent run that sent the request is
+/// active; `Idle` also warms between runs. Unset means `Off` (opt-in: a
+/// Rust-only feature that spends money).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarmingMode {
+    Off,
+    Streaming,
+    Idle,
+}
+
 /// The settings document: every known field optional; unknown keys preserved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -352,6 +393,7 @@ pub struct Settings {
     pub theme: Option<String>,
     pub compaction: Option<CompactionSettings>,
     pub auto_refine: Option<AutoRefineSettings>,
+    pub repeat_guard: Option<RepeatGuardSettings>,
     pub agent_traces: Option<AgentTracesSettings>,
     pub factory: Option<FactorySettings>,
     pub telemetry: Option<TelemetrySettings>,
@@ -400,6 +442,9 @@ pub struct Settings {
     /// Log per-request provider timing phases to the diagnostic log
     /// (unset means OFF, exactly the TS default).
     pub request_timing: Option<bool>,
+    /// Prompt-cache warming profile; read from global settings only because
+    /// warming spends money. Unset means `off` (opt-in).
+    pub cache_warming: Option<CacheWarmingMode>,
     /// Unknown keys survive load/save round-trips (forward compatibility).
     #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: serde_json::Map<String, serde_json::Value>,

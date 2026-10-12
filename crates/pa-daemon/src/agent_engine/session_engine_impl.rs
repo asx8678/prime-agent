@@ -69,6 +69,22 @@ impl SessionEngine for AgentSessionEngine {
         })
     }
 
+    /// The built session's warmer answers; the session lock is held only
+    /// to clone the warmer handle, and the predicate itself is sync.
+    fn cache_warming_active(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            let warmer = self
+                .session
+                .lock()
+                .await
+                .as_deref()
+                .and_then(|engine| engine.session.cache_warmer().cloned());
+            warmer.is_some_and(|warmer| warmer.warming_active())
+        })
+    }
+
     fn release_settled_child_kernel(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
@@ -618,6 +634,7 @@ impl SessionEngine for AgentSessionEngine {
                 .session
                 .compact(
                     custom_instructions.as_deref(),
+                    &[],
                     &model,
                     api_key,
                     // The run's own signal: a raced summarizer still lands
@@ -715,6 +732,18 @@ impl SessionEngine for AgentSessionEngine {
             cwd: self.cwd(),
             agent_dir: self.config.agent_dir.clone(),
         };
+        // The wire-fallback adoption counter lands on the live session's
+        // telemetry, like the compaction counters.
+        let on_model_fallback = self
+            .session
+            .blocking_lock()
+            .as_deref()
+            .and_then(|engine| engine.telemetry.clone())
+            .map(|telemetry| {
+                std::sync::Arc::new(move |succeeded: bool| {
+                    telemetry.note_compaction_model_fallback(succeeded);
+                }) as pa_core::session_engine::compaction_exec::ModelFallbackHook
+            });
         let run = async {
             pa_core::session_engine::branch_summarization::generate_branch_summary(
                 &entries,
@@ -725,6 +754,7 @@ impl SessionEngine for AgentSessionEngine {
                     replace_instructions,
                     reserve_tokens,
                     auxiliary: Some(&auxiliary),
+                    on_model_fallback,
                 },
             )
             .await
@@ -841,6 +871,11 @@ impl SessionEngine for AgentSessionEngine {
         // This session's own depth gates the kernel `refine.*` host requests (depth-0 only).
         self.rlm_depth
             .store(identity.rlm_depth, std::sync::atomic::Ordering::Relaxed);
+        // The parent tree's budget: the next session build enforces it.
+        *self
+            .inherited_cost_ceiling
+            .lock()
+            .expect("inherited cost ceiling lock") = identity.inherited_cost_ceiling;
         if let Some(thinking) = &identity.thinking {
             pa_ai::models::thinking_level_from_str(thinking)
                 .ok_or_else(|| anyhow::anyhow!("unknown thinking level \"{thinking}\""))?;

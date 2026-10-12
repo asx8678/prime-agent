@@ -11,6 +11,7 @@ fn tier_model(provider: &str, api: &str, id: &str) -> Model {
         cache_write: JsNumber(0.0),
     };
     Model {
+        prompt_cache: None,
         id: id.to_string(),
         name: id.to_string(),
         api: api.to_string(),

@@ -188,7 +188,7 @@ async fn prewarmed_kernel_lands_compaction_notice_without_tool_use() {
 
     let compacted = engine
         .session
-        .compact(None, &faux.model, None, None)
+        .compact(None, &[], &faux.model, None, None)
         .await
         .expect("compact");
     let run = match compacted {

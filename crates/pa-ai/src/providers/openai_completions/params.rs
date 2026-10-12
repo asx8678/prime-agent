@@ -462,6 +462,44 @@ mod tests {
         }
     }
 
+    /// A request that opts out of caching (`CacheRetention::None`, the
+    /// one-off summarizer shape) sends no `prompt_cache_key` and no
+    /// `prompt_cache_retention`, even with a routing id on an
+    /// `api.openai.com` model that keys its cache by it otherwise.
+    #[test]
+    fn opted_out_requests_send_no_prompt_cache_fields() {
+        let model = models_generated::get_model("openai", "gpt-4").expect("compiled catalog");
+        assert!(model.base_url.contains("api.openai.com"));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserMessageContent::Text("Hi".into()),
+                timestamp: 1,
+                rest: Map::default(),
+            })],
+            tools: None,
+        };
+        let options = OpenAICompletionsOptions::from_base(StreamOptions {
+            api_key: Some("test".into()),
+            session_id: Some("routing-id".into()),
+            ..Default::default()
+        });
+        let compat = crate::providers::openai_completions::get_compat(model);
+        let cache_fields = |retention: CacheRetention| {
+            let params = build_params(model, &context, Some(&options), &compat, retention, None);
+            (
+                params.get("prompt_cache_key").cloned(),
+                params.get("prompt_cache_retention").cloned(),
+            )
+        };
+        assert_eq!(cache_fields(CacheRetention::None), (None, None));
+        assert_eq!(
+            cache_fields(CacheRetention::Short),
+            (Some(json!("routing-id")), None),
+            "the opt-out is what removes the key"
+        );
+    }
+
     /// TS #2144: `service_tier` forwards for `OpenAI` and `OpenRouter` only.
     #[test]
     fn forwards_service_tier_for_openai_and_openrouter_only() {

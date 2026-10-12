@@ -12,7 +12,7 @@
 use pa_types::session::FileEntry;
 use serde_json::Value;
 
-mod bounds;
+pub(crate) mod bounds;
 mod events;
 mod render;
 mod state;
@@ -54,7 +54,12 @@ impl Fold {
     /// kept messages. The file-list block appended after it (itself capped
     /// by `FILE_LIST_MAX_ENTRIES` / `FILE_LIST_MAX_COMBINED_CHARS` in
     /// `compaction_utils.rs`) is outside this bound.
-    pub(crate) fn summarize(&self, request: Option<&str>, context_window: u64) -> (String, Value) {
+    pub(crate) fn summarize(
+        &self,
+        request: Option<&str>,
+        preserve: &[String],
+        context_window: u64,
+    ) -> (String, Value) {
         let mut state = self.state.clone();
         state.fold(&self.events);
         // An unknown window (zero) leaves the default.
@@ -64,6 +69,9 @@ impl Fold {
             .map_or(render::DEFAULT_MAX_BYTES, |half_window| {
                 half_window.min(render::DEFAULT_MAX_BYTES)
             });
-        (render::render(&state, request, max_bytes), state.to_value())
+        (
+            render::render(&state, request, preserve, max_bytes),
+            state.to_value(),
+        )
     }
 }

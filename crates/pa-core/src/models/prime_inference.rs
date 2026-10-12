@@ -24,6 +24,7 @@ pub fn is_private_prime_inference_model(model: &Model) -> bool {
 #[must_use]
 pub fn private_prime_inference_models() -> Vec<Model> {
     vec![Model {
+        prompt_cache: None,
         id: "internal/glm-5.2-fast".to_string(),
         name: "GLM 5.2 Fast".to_string(),
         api: "openai-completions".to_string(),

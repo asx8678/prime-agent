@@ -85,6 +85,16 @@ pub struct SessionEngineConfig {
     /// request ids on the wire).
     pub semantic_edges: Option<super::semantic_edges::SemanticEdgeIdentity>,
     pub on_late_sent_agent_message: Option<crate::tools::ipython::LateSentAgentMessageHandler>,
+    /// The cache-warmer arm slot (the daemon's wrapped stream fn reads it;
+    /// the engine fills it with the warmer's `start` once built). `None`
+    /// (the headless surfaces) wires no warming.
+    pub cache_warm_arm:
+        Option<std::sync::Arc<std::sync::Mutex<Option<super::provider_adapter::WarmArm>>>>,
+    /// The cost budget a spawned child inherits from its parent's tree
+    /// (`runtimeMetadata.rlmCostCeiling` on the child's create): enforced
+    /// beside the session's own `rlm.set_cost_ceiling`. `None` for roots
+    /// and uncapped parents.
+    pub inherited_cost_ceiling: Option<super::rlm_cost::InheritedCostCeiling>,
 }
 
 pub struct SessionEngine {
@@ -106,11 +116,20 @@ pub struct SessionEngine {
     /// against; `replace_acp_mcp_servers` reaches it through this handle.
     pub mcp_manager: std::sync::Arc<std::sync::Mutex<crate::mcp::McpManager>>,
     pub turn_boundary: std::sync::Arc<super::turn_boundary::TurnBoundaryRequests>,
+    /// The session's per-session counters (shared with the seams that count
+    /// into them). The host's cache warmer counts its refreshes through this
+    /// handle even when telemetry is disabled (`agent session ended` rides
+    /// only when enabled, but the counters gate themselves).
+    pub session_counters: std::sync::Arc<super::telemetry::SessionCounters>,
     /// `None` when telemetry is disabled or the session is not depth 0.
     pub telemetry: Option<std::sync::Arc<super::telemetry::SessionTelemetry>>,
     /// The kernel `rlm.spawn` handler registers spawn targets into it; the
     /// embedding wires the child-observation sink onto it after the build.
     pub rlm_usage: std::sync::Arc<super::rlm_usage::RlmChildUsageAttributions>,
+    /// The tree cost ceiling's ledger (`rlm.set_cost_ceiling`): the host
+    /// installs its ceiling-row mirror on it, and a live model switch
+    /// refreshes the parent model's priced-ness.
+    pub rlm_tree_cost: std::sync::Arc<super::rlm_cost::RlmTreeCost>,
     /// The factory host bridge (`/factory` view lane): the daemon/TUI
     /// request surface over the kernel's factory runs, built from the
     /// session facts captured in `create_session` (the #3184 capture
@@ -124,6 +143,10 @@ pub struct SessionEngine {
     /// loops the graph and keeps a dropped session's kernel process alive
     /// until the process exits.
     pub(crate) provisioner: std::sync::Arc<crate::kernel::provisioner::IpythonKernelProvisioner>,
+    /// The static half of the cache-prefix fingerprint (tools + system
+    /// prompt), joined with the live model key per request so a model
+    /// switch reclassifies the prefix (cache-miss attribution).
+    pub(crate) prefix_static_hash: u64,
 }
 
 /// Skill overrides for built-in integrations the user is not logged into,
@@ -226,6 +249,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // Captured before `settings` moves into the resource loader: the
     // compaction budget and the auto-refine gates.
     let compaction_settings = settings.settings().compaction.clone().unwrap_or_default();
+    // Captured before `settings` moves into the resource loader: the
+    // ipython repeat-guard config (default on, fabric thresholds).
+    let repeat_guard = crate::tools::ipython::RepeatGuardConfig::from_settings(
+        &settings.settings().repeat_guard.clone().unwrap_or_default(),
+    );
     let auto_refine_gates =
         super::refine::AutoRefineGates::from_settings(settings.settings().auto_refine.as_ref());
     // Request timing: the settings half of the flag is read once here
@@ -284,6 +312,15 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         },
     };
     let model_context_window = model.context_window;
+    // The cache-miss classification's idle-gap threshold at build: the
+    // session model's own cache lifetime (each session request refreshes
+    // it from its actual model and retention).
+    let build_cache_ttl_ms = config
+        .model_info
+        .as_ref()
+        .map_or(super::cache_miss::CACHE_TTL_MS, |full| {
+            super::cache_miss::cache_ttl_ms_for(full, None)
+        });
 
     let python_skills = super::runtime_wiring::kernel_python_skills(&resources.skills);
     let session_id = wiring.session.lock().await.get_session_id().to_string();
@@ -335,7 +372,14 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         .keep_recent_tokens
         .unwrap_or(super::compaction::DEFAULT_KEEP_RECENT_TOKENS);
     if compaction_settings.agent_callable.unwrap_or(true) {
-        turn_boundary.register_compact_handlers(&mut handlers, keep_recent_tokens);
+        // The carry-update count rides the session counters like the
+        // repeat-guard seam (only when telemetry is wired).
+        let on_carry_used = config.telemetry.as_ref().map(|_| {
+            let counters = std::sync::Arc::clone(&session_counters);
+            std::sync::Arc::new(move || counters.note_compact_carry())
+                as std::sync::Arc<dyn Fn() + Send + Sync>
+        });
+        turn_boundary.register_compact_handlers(&mut handlers, keep_recent_tokens, on_carry_used);
     }
     // The daemon worker owns persistence outside the session manager, so
     // its conversation-log path implies the same artifact tree.
@@ -417,7 +461,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let preimport_filter =
         super::decision_api::decision_api_preimport_filter(decision_api_configured);
     let provisioner = super::runtime_wiring::kernel_provisioner(
-        session_id,
+        session_id.clone(),
         handlers,
         python_skills,
         preimport_filter,
@@ -431,11 +475,35 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     );
     let mut tools = config.tools.clone();
     if !tools.iter().any(|tool| tool.name() == "ipython") {
+        // The repeat-guard counts into the session counters, like the
+        // kernel-bootstrap seam above (only when telemetry is wired).
+        let on_repeat_guard_triggered = config.telemetry.as_ref().map(|_| {
+            let counters = std::sync::Arc::clone(&session_counters);
+            std::sync::Arc::new(move |blocked: bool, count: u64| {
+                counters.note_repeat_guard(blocked, count);
+            }) as crate::tools::ipython::RepeatGuardTriggeredHandler
+        });
+        let on_cell_failure_note = config.telemetry.as_ref().map(|_| {
+            let counters = std::sync::Arc::clone(&session_counters);
+            std::sync::Arc::new(move || {
+                counters.note_cell_failure_note();
+            }) as crate::tools::ipython::CellFailureNoteHandler
+        });
+        let on_output_budget_spill = config.telemetry.as_ref().map(|_| {
+            let counters = std::sync::Arc::clone(&session_counters);
+            std::sync::Arc::new(move || {
+                counters.note_output_budget_spill();
+            }) as crate::tools::ipython::OutputBudgetSpillHandler
+        });
         let definition = crate::tools::ipython::create_ipython_tool_definition(
             &cwd.to_string_lossy(),
             super::runtime_wiring::ipython_tool_options(
                 provisioner.clone(),
                 config.on_late_sent_agent_message.clone(),
+                repeat_guard,
+                on_repeat_guard_triggered,
+                on_cell_failure_note,
+                on_output_budget_spill,
             ),
         );
         tools.push(Arc::new(
@@ -478,6 +546,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let prompt_guidelines = config.prompt_guidelines.clone();
 
     let prompt_model_selector = format!("{}/{}", model_info.provider, model_info.id);
+    // The cache-miss classification's model key, captured before the
+    // selector moves into the prompt options.
+    let prefix_model_key = prompt_model_selector.clone();
     let prompt_vision_capable = Some(model_info.input.contains(&pa_types::ai::ModelInput::Image));
     let model_prompts = crate::prompts::model_prompts::load_model_prompts(
         Some(&prompt_model_selector),
@@ -526,6 +597,17 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             .retain(|skill| skill.name != super::decision_api::DECISION_API_SKILL_NAME);
     }
     let system_prompt = crate::prompts::system_prompt::build_system_prompt(&prompt_options);
+    // The static half of the cache-prefix fingerprint (tools + system
+    // prompt; a hash, never content), joined with the model key per
+    // request. Computed once here; a live model switch refreshes the
+    // request-level fingerprint through `update_model_facts`.
+    let prefix_static_hash = super::cache_miss::static_prefix_fingerprint(
+        &active_tool_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        &system_prompt,
+    );
     // While the gate is off the skill is unreachable: the prompt omits it
     // and `/skill:` cannot invoke it; while it is on, the skill is an
     // ordinary session skill.
@@ -658,6 +740,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         should_stop_before_turn: config.queued_steering_probe.clone(),
         steering_mode: config.steering_mode,
         follow_up_mode: config.follow_up_mode,
+        // TS `Agent`'s `sessionId: sessionManager.getSessionId()`: the
+        // loop's session requests carry the session's routing id, so
+        // providers key their prompt caches and the cache-warmer arm can
+        // tell them from the aux requests' fresh ids.
+        session_id: Some(session_id),
         ..Default::default()
     });
 
@@ -754,6 +841,127 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // push straight into the live session's queue.
     session.adopt_next_turn_rows(boot_notice_rows);
 
+    // PR-11: the tree-cost ledger. The restore rebuilds the spend from the
+    // session rows (assistant usage + folded child attributions, every
+    // branch) and the persisted ceilings and admission count, the
+    // parent model's priced-ness gates inherited-model spawns, and the
+    // observer feeds every assistant message's usage cost into the ledger
+    // (the parent's own spend counts — the ceiling's scope is the whole
+    // tree under the root session). Aux requests (compaction, summaries,
+    // side questions) stream outside the loop and never reach this bus.
+    {
+        let parent_selector = format!("{}/{}", model_info.provider, model_info.id);
+        wiring
+            .rlm
+            .set_parent_model_priced(wiring.rlm.model_is_priced(&parent_selector).unwrap_or(true));
+        {
+            let session = wiring.session.lock().await;
+            // Every loaded row, on every branch (`get_entries` asserts a
+            // fully hydrated session; a windowed resume restores from the
+            // rows it loaded).
+            wiring.rlm.tree_cost.restore(session.retained_entries());
+        }
+        // A spawned child's budget from its parent's tree: re-applied on
+        // every build (the create replays it), never persisted here.
+        if let Some(inherited) = config.inherited_cost_ceiling {
+            wiring.rlm.tree_cost.inherit(inherited);
+        }
+        let ledger = std::sync::Arc::clone(&wiring.rlm.tree_cost);
+        // The listener lives as long as the agent; the returned guard only
+        // pins the agent (dropping it does not unsubscribe). It is released
+        // here on purpose: held anywhere the kernel's host handlers reach
+        // (the RLM bridge), it kept the agent — and with it the session's
+        // kernel — alive past the engine's drop.
+        let observer = agent
+            .subscribe(move |event, _signal| {
+                let ledger = std::sync::Arc::clone(&ledger);
+                Box::pin(async move {
+                    if let pa_agent::types::AgentEvent::MessageEnd {
+                        message:
+                            pa_agent::types::AgentMessage::Standard(
+                                pa_agent::types::Message::Assistant(assistant),
+                            ),
+                    } = event
+                    {
+                        ledger.note_spend(assistant.usage.cost.total);
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+        drop(observer);
+    }
+
+    // The prompt-cache warmer (TS `CacheWarmer`): the host's wrapped
+    // stream fn arms it through the config's slot; this subscription —
+    // the same agent bus the telemetry subscriber rides — observes the
+    // session requests' own usage (the prompt size of the last real
+    // request) and the agent-run settles. Aux requests (compaction,
+    // summaries, side questions) stream outside the loop, so they never
+    // reach this bus.
+    // The session telemetry, once installed below: the warm arm sees every
+    // session request first and refreshes the cache-miss facts from it.
+    // Weak: the host owns the arm slot across rebuilds, and the telemetry's
+    // subscription pins the agent (and through it the session's kernel).
+    let cache_telemetry: std::sync::Arc<
+        std::sync::OnceLock<std::sync::Weak<super::telemetry::SessionTelemetry>>,
+    > = std::sync::Arc::default();
+    if let Some(warm_arm) = config.cache_warm_arm.as_ref() {
+        let mode_cwd = config.cwd.clone();
+        let mode_agent_dir = config.agent_dir.clone();
+        let refresh_counters = std::sync::Arc::clone(&session_counters);
+        let warmer = std::sync::Arc::new(super::cache_warmer::CacheWarmer::new(
+            std::sync::Arc::new(move || {
+                crate::settings::SettingsManager::create(&mode_cwd, &mode_agent_dir)
+                    .get_cache_warming_mode()
+            }),
+            std::sync::Arc::new(move || refresh_counters.note_cache_warm_refresh()),
+        ));
+        let observer = std::sync::Arc::clone(&warmer);
+        let subscription = agent
+            .subscribe(move |event, _signal| {
+                let warmer = std::sync::Arc::clone(&observer);
+                Box::pin(async move {
+                    match event {
+                        pa_agent::types::AgentEvent::MessageEnd {
+                            message:
+                                pa_agent::types::AgentMessage::Standard(
+                                    pa_agent::types::Message::Assistant(assistant),
+                                ),
+                        } => {
+                            warmer.note_prompt_tokens(
+                                assistant.usage.input
+                                    + assistant.usage.cache_read
+                                    + assistant.usage.cache_write,
+                            );
+                        }
+                        pa_agent::types::AgentEvent::AgentEnd { .. } => {
+                            warmer.on_agent_settled();
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+        warmer.set_subscription(subscription);
+        session.set_cache_warmer(std::sync::Arc::clone(&warmer));
+        let arm_telemetry = std::sync::Arc::clone(&cache_telemetry);
+        // Weak: the session owns the warmer; the host-owned arm slot outlives
+        // one build, and the warmer's subscription pins the agent.
+        let arm_warmer = std::sync::Arc::downgrade(&warmer);
+        *warm_arm.lock().expect("cache warm arm slot lock") = Some(std::sync::Arc::new(
+            move |request: super::cache_warmer::WarmRequest| {
+                if let Some(telemetry) = arm_telemetry.get().and_then(std::sync::Weak::upgrade) {
+                    telemetry.note_session_request(&request);
+                }
+                if let Some(warmer) = arm_warmer.upgrade() {
+                    warmer.start(request);
+                }
+            },
+        ));
+    }
+
     turn_boundary.bind(super::turn_boundary::TurnBoundaryRuntime {
         agent,
         session: wiring.session.clone(),
@@ -790,6 +998,14 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // Same lifetime for the `rlm_child_*` session counters: the
         // producer's flush counts through this handle.
         wiring.rlm_usage.set_telemetry(telemetry.clone());
+        // The cache-miss classification compares consecutive requests'
+        // prefix fingerprints (model, tools, system prompt — hashes only).
+        telemetry.set_prefix_fingerprint(super::cache_miss::request_prefix_fingerprint(
+            &prefix_model_key,
+            prefix_static_hash,
+        ));
+        telemetry.set_cache_ttl_ms(build_cache_ttl_ms);
+        let _ = cache_telemetry.set(std::sync::Arc::downgrade(telemetry));
     }
     let goal_driver = wiring.runtime.goal_driver().clone();
     // The factory host bridge: registered from `create_session` (the #3184
@@ -817,10 +1033,13 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         queued_goal_context_purge: config.queued_goal_context_purge.clone(),
         mcp_manager,
         turn_boundary,
+        session_counters,
         telemetry,
         rlm_usage: wiring.rlm_usage,
+        rlm_tree_cost: std::sync::Arc::clone(&wiring.rlm.tree_cost),
         factory_host,
         provisioner,
+        prefix_static_hash,
     })
 }
 
@@ -836,6 +1055,30 @@ impl SessionEngine {
                 input: model.input.clone(),
             },
             (model.context_window > 0).then_some(model.context_window),
+        );
+        // A live model switch invalidates the warmed request (TS's
+        // `isCurrent` model check): the next session request re-arms
+        // warming for the new model's prefix.
+        if let Some(warmer) = self.session.cache_warmer() {
+            warmer.invalidate("conversation context changed");
+        }
+        // The new model changes the cached prefix's identity: refresh the
+        // fingerprint the cache-miss classification compares against.
+        if let Some(telemetry) = self.telemetry.as_ref() {
+            telemetry.set_prefix_fingerprint(super::cache_miss::request_prefix_fingerprint(
+                &format!("{}/{}", model.provider, model.id),
+                self.prefix_static_hash,
+            ));
+            telemetry.set_cache_ttl_ms(super::cache_miss::cache_ttl_ms_for(model, None));
+        }
+        // Inherited-model spawns under a USD ceiling follow the model the
+        // session now runs: an unpriced model would never trip the ceiling.
+        let cost = &model.cost;
+        self.rlm_tree_cost.set_parent_model_priced(
+            cost.input.as_f64() > 0.0
+                || cost.output.as_f64() > 0.0
+                || cost.cache_read.as_f64() > 0.0
+                || cost.cache_write.as_f64() > 0.0,
         );
     }
 

@@ -130,6 +130,7 @@ mod tests {
 
     fn model(reasoning: bool, map: Option<ThinkingLevelMap>) -> Model {
         Model {
+            prompt_cache: None,
             id: "m".into(),
             name: "m".into(),
             api: "openai-completions".into(),

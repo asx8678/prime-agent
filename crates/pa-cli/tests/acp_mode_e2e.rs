@@ -1972,8 +1972,11 @@ fn compaction_metas(updates: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// A settled turn crossing the reserve headroom compacts at the boundary and publishes the
-/// `compaction` meta (a single-turn skip publishes the empty payload).
+/// A settled turn crossing the window-capped combined threshold (a
+/// deliberately huge reserve caps the effective headroom at W/4, so the
+/// threshold sits at `128_000 - 4_096 - 32_000`) compacts at the boundary and
+/// publishes the `compaction` meta (a single-turn skip publishes the empty
+/// payload).
 #[test]
 fn acp_threshold_auto_compaction_publishes_the_compaction_meta() {
     let script = json!({
@@ -1986,12 +1989,8 @@ fn acp_threshold_auto_compaction_publishes_the_compaction_meta() {
             { "text": "the auto summary" },
         ]
     });
-    let mut client = spawn_with_compaction_settings(
-        &["--mode", "acp", "--no-session"],
-        &script,
-        128_000 - 4_096 - 500,
-        10,
-    );
+    let mut client =
+        spawn_with_compaction_settings(&["--mode", "acp", "--no-session"], &script, 127_500, 10);
     let init = client.request("initialize", &initialize_params());
     let _ = client.wait_response(init, TIMEOUT);
     let new = client.request("session/new", &json!({ "mcpServers": [] }));
@@ -2005,7 +2004,7 @@ fn acp_threshold_auto_compaction_publishes_the_compaction_meta() {
         "session/prompt",
         &json!({
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": format!("turn one {}", "x".repeat(8_000)) }],
+            "prompt": [{ "type": "text", "text": format!("turn one {}", "x".repeat(380_000)) }],
         }),
     );
     let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);

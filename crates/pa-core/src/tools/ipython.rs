@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 
@@ -62,7 +62,14 @@ pub struct ExecuteResult {
     /// The `bash()` commands this cell started, summarized for display
     /// (`bashCommands` on the tool-result details).
     pub bash_commands: Option<crate::kernel::shared::KernelBashCommands>,
+    /// Where the full text of each output that overflowed its kernel
+    /// budget lives (the visible text holds only its head and tail).
+    pub spilled: crate::kernel::shared::SpilledOutputs,
 }
+
+/// The most of one spilled output a failed cell's full-output artifact
+/// reads back (64 MiB); a larger output is cut there with a marker.
+const MAX_SPILL_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The wire form of one sent agent message (TS `KernelSentAgentMessage`):
 /// `id`, `message`, `deliveryStatus`, `receiverRole` when present, and the
@@ -267,6 +274,67 @@ fn format_execute_text(result: &ExecuteResult, background_output: Option<&str>) 
     text
 }
 
+/// The most edited paths the failure note lists (fabric
+/// `MAX_COMPLETED_CALLS`).
+const MAX_FAILURE_NOTE_PATHS: usize = 8;
+/// The per-path character budget in the failure note (fabric
+/// `MAX_PATH_CHARS`).
+const MAX_FAILURE_NOTE_PATH_CHARS: usize = 100;
+
+/// The workspace-side-effects note appended to a failed cell's text
+/// (fabric `failure-progress.ts`): the edits and bash commands that already
+/// ran before the failure, bounded, plus the inspect-before-repeating line.
+/// `None` for successful cells and failures without side effects.
+fn failure_progress_note(result: &ExecuteResult) -> Option<String> {
+    if result.status != ExecuteStatus::Error {
+        return None;
+    }
+    let bash_count = result
+        .bash_commands
+        .as_ref()
+        .map(|bash| bash.count)
+        .filter(|count| *count > 0);
+    if result.diffs.is_empty() && bash_count.is_none() {
+        return None;
+    }
+    let mut items: Vec<String> = result
+        .diffs
+        .iter()
+        .take(MAX_FAILURE_NOTE_PATHS)
+        .map(|diff| format!("edit({})", compact_failure_note_path(&diff.path)))
+        .collect();
+    let omitted = result.diffs.len().saturating_sub(items.len());
+    if omitted > 0 {
+        items.push(format!("+{omitted} more"));
+    }
+    if let Some(count) = bash_count {
+        items.push(if count == 1 {
+            "1 bash command".to_string()
+        } else {
+            format!("{count} bash commands")
+        });
+    }
+    Some(format!(
+        "Completed before the cell failed (outputs not returned): {}.\nSuccessful calls may already have changed the workspace; inspect before repeating mutations.",
+        items.join("; ")
+    ))
+}
+
+/// Collapse whitespace and keep the tail within the path budget (fabric
+/// `compactPath`).
+fn compact_failure_note_path(value: &str) -> String {
+    let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars = single_line.chars().count();
+    if chars <= MAX_FAILURE_NOTE_PATH_CHARS {
+        return single_line;
+    }
+    let tail: String = single_line
+        .chars()
+        .skip(chars - (MAX_FAILURE_NOTE_PATH_CHARS - 1))
+        .collect();
+    format!("…{tail}")
+}
+
 async fn execute_with_busy_kernel_choice(
     provisioner: &dyn IpythonKernelProvisioner,
     report_startup_progress: &BootstrapProgressHandler,
@@ -337,7 +405,195 @@ pub struct IpythonToolOptions {
     /// UI surface; `None` in headless sessions.
     pub ui: Option<Arc<dyn IpythonToolUi>>,
     pub on_late_sent_agent_message: Option<LateSentAgentMessageHandler>,
+    /// The repeat-guard configuration; `None` disables the guard entirely
+    /// (the golden-replay harness and parity mode).
+    pub repeat_guard: Option<RepeatGuardConfig>,
+    /// Adoption telemetry for the repeat guard: called with whether the
+    /// observation blocked and the identical-run count (primitives only).
+    pub on_repeat_guard_triggered: Option<RepeatGuardTriggeredHandler>,
+    /// Adoption telemetry for the failure-progress note: called when a
+    /// failed cell's result carries the workspace-side-effects note.
+    pub on_cell_failure_note: Option<CellFailureNoteHandler>,
+    /// Adoption telemetry for the output budget: called when a failed
+    /// cell's combined text was bounded and its full output spilled to a
+    /// linked artifact.
+    pub on_output_budget_spill: Option<OutputBudgetSpillHandler>,
 }
+
+/// The repeat-guard thresholds (fabric `repeat-guard.ts` defaults: warn 3,
+/// block 6 — the degenerate loop that motivated them was a 220× identical
+/// `bash echo noop` run on a low-tier model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatGuardConfig {
+    /// Consecutive identical runs (same code, same output) that start
+    /// producing a warning.
+    pub warn_at: u64,
+    /// Consecutive identical runs after which the same code is blocked
+    /// outright.
+    pub block_at: u64,
+}
+
+impl RepeatGuardConfig {
+    /// The default-on configuration from `repeatGuard` settings
+    /// (`repeatGuard.enabled: false` resolves to `None`). Thresholds must
+    /// satisfy `1 <= warnAt < blockAt`; an invalid pair falls back to the
+    /// defaults (3/6) with a warning, never to a guard that blocks every
+    /// call.
+    #[must_use]
+    pub fn from_settings(settings: &crate::settings::RepeatGuardSettings) -> Option<Self> {
+        if !settings.enabled.unwrap_or(true) {
+            return None;
+        }
+        let warn_at = settings.warn_at.unwrap_or(IPYTHON_REPEAT_WARN_AT);
+        let block_at = settings.block_at.unwrap_or(IPYTHON_REPEAT_BLOCK_AT);
+        if warn_at >= 1 && block_at > warn_at {
+            return Some(Self { warn_at, block_at });
+        }
+        eprintln!(
+            "Warning: repeatGuard thresholds need 1 <= warnAt < blockAt (got warnAt {warn_at}, blockAt {block_at}); using the defaults ({IPYTHON_REPEAT_WARN_AT}/{IPYTHON_REPEAT_BLOCK_AT})."
+        );
+        Some(Self {
+            warn_at: IPYTHON_REPEAT_WARN_AT,
+            block_at: IPYTHON_REPEAT_BLOCK_AT,
+        })
+    }
+}
+
+/// Consecutive identical runs that start producing a warning (fabric
+/// `FABRIC_REPEAT_WARN`).
+pub const IPYTHON_REPEAT_WARN_AT: u64 = 3;
+/// Consecutive identical runs that get blocked outright (fabric
+/// `FABRIC_REPEAT_BLOCK`).
+pub const IPYTHON_REPEAT_BLOCK_AT: u64 = 6;
+
+/// The model-facing warning appended to a warned run's result (fabric
+/// `fabricRepeatWarnText`, adapted to the `ipython` tool and to the
+/// identical-output rule).
+#[must_use]
+pub fn repeat_warn_text(count: u64, block_at: u64) -> String {
+    format!(
+        "[circuit-breaker] identical ipython code has now run {count} times in a row with identical output; at {block_at} identical runs it will be blocked. Change the approach or finish your turn."
+    )
+}
+
+/// The model-facing text of a blocked run (fabric `fabricRepeatBlockText`,
+/// adapted to the `ipython` tool and to the identical-output rule).
+#[must_use]
+pub fn repeat_block_text(count: u64) -> String {
+    format!(
+        "Circuit breaker: this exact ipython code would run for the {count}th time in a row after producing identical output every time, so it was blocked. Re-running it adds no information. Summarize what you already know and finish your turn; if the call is genuinely required, change the code materially."
+    )
+}
+
+/// One observation of the repeat guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatGuardObservation {
+    /// The consecutive-identical run length including this call.
+    pub count: u64,
+    /// This run reached the warn threshold (`count >= warnAt`).
+    pub warn: bool,
+    /// This call is blocked before it runs.
+    pub blocked: bool,
+}
+
+/// Degenerate-loop breaker for the ipython tool (fabric
+/// `FabricRepeatGuard`, Rust-side refinement): a run counts toward the
+/// loop only when its code AND its result are identical to the previous
+/// run's — re-running the same cell with nothing changing is how lower-tier
+/// models burn a session, while polling a cell whose output moves (an
+/// `rlm.collect` while children work) is legitimate. Differing code or a
+/// differing result resets the count to 1.
+pub struct IpythonRepeatGuard {
+    last_code: Option<String>,
+    last_output: Option<u64>,
+    count: u64,
+    config: RepeatGuardConfig,
+}
+
+impl IpythonRepeatGuard {
+    #[must_use]
+    pub fn new(config: RepeatGuardConfig) -> Self {
+        Self {
+            last_code: None,
+            last_output: None,
+            count: 0,
+            config,
+        }
+    }
+
+    /// The thresholds this guard enforces.
+    #[must_use]
+    pub fn config(&self) -> RepeatGuardConfig {
+        self.config
+    }
+
+    /// Before a run: `Some` (blocked) when `code` repeats a run that has
+    /// already produced the same output `blockAt - 1` times in a row. A
+    /// blocked call leaves the state unchanged, so the same code stays
+    /// blocked and any other code proceeds.
+    #[must_use]
+    pub fn check(&self, code: &str) -> Option<RepeatGuardObservation> {
+        let repeats = self.last_code.as_deref() == Some(code)
+            && self.count.saturating_add(1) >= self.config.block_at;
+        repeats.then(|| RepeatGuardObservation {
+            count: self.count.saturating_add(1),
+            warn: true,
+            blocked: true,
+        })
+    }
+
+    /// After a run: fold the run's code and result into the count. The
+    /// result compares by a fingerprint of its model-visible text and
+    /// error flag (before any warning is appended).
+    pub fn record(&mut self, code: &str, result: &ToolExecutionResult) -> RepeatGuardObservation {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::hash::DefaultHasher::new();
+        result.is_error.hash(&mut hasher);
+        for block in &result.content {
+            match block {
+                ToolContentBlock::Text { text } => text.hash(&mut hasher),
+                ToolContentBlock::Image { data, mime_type } => {
+                    data.hash(&mut hasher);
+                    mime_type.hash(&mut hasher);
+                }
+            }
+        }
+        let output = hasher.finish();
+        self.count = if self.last_code.as_deref() == Some(code) && self.last_output == Some(output)
+        {
+            self.count.saturating_add(1)
+        } else {
+            1
+        };
+        self.last_code = Some(code.to_string());
+        self.last_output = Some(output);
+        RepeatGuardObservation {
+            count: self.count,
+            warn: self.count >= self.config.warn_at,
+            blocked: false,
+        }
+    }
+
+    /// Forget the run (a call that failed before producing a result has
+    /// nothing to compare).
+    pub fn reset(&mut self) {
+        self.last_code = None;
+        self.last_output = None;
+        self.count = 0;
+    }
+}
+
+/// The repeat-guard telemetry seam: `(blocked, count)`, primitives only.
+pub type RepeatGuardTriggeredHandler = Arc<dyn Fn(bool, u64) + Send + Sync>;
+
+/// The failure-progress-note telemetry seam (no payload: the note's paths
+/// and commands stay local; only the count uploads).
+pub type CellFailureNoteHandler = Arc<dyn Fn() + Send + Sync>;
+
+/// The output-budget telemetry seam: fires when a failed cell's text was
+/// bounded and its full output spilled to a linked artifact (no payload:
+/// only the count uploads).
+pub type OutputBudgetSpillHandler = Arc<dyn Fn() + Send + Sync>;
 
 pub fn ipython_tool_schema() -> serde_json::Value {
     json!({
@@ -423,12 +679,87 @@ pub async fn execute_ipython(
     let (r, kernel_restarted) = result.map_err(|err| anyhow::anyhow!("{}", err.message()))?;
 
     let mut text = format_execute_text(&r, r.background_output.as_deref());
+    // A failed cell that already changed the workspace carries the
+    // side-effects note so the model inspects before repeating mutations
+    // (fabric `failure-progress.ts`); successful cells stay unchanged.
+    if let Some(note) = failure_progress_note(&r) {
+        if let Some(on_note) = &options.on_cell_failure_note {
+            on_note();
+        }
+        text = if text.is_empty() {
+            note
+        } else {
+            format!("{text}\n\n{note}")
+        };
+    }
     if kernel_restarted {
         text = if text.is_empty() {
             kernel_restart_notice().to_string()
         } else {
             format!("{}\n\n{}", kernel_restart_notice(), text)
         };
+    }
+    // Failure-aware output budget (fabric `output-budget.ts`): a failed
+    // cell's combined text is capped at 20k with middle truncation, its
+    // full output spilled to a private artifact the text links — the
+    // error and the most recent output stay visible instead of a
+    // head-only cut. Successful cells keep the per-stream budgets from
+    // the kernel manager; aborted cells keep today's text too.
+    if r.status == ExecuteStatus::Error {
+        // An output that already overflowed its kernel budget shows only
+        // its head and tail in `text`: the artifact gets the complete
+        // output, read back from the spill files, so it really is the full
+        // output and its character count is the true one.
+        let full_output = if r.spilled == crate::kernel::shared::SpilledOutputs::default() {
+            None
+        } else {
+            let read_back = |path: &Option<String>, visible: &str| -> String {
+                use std::io::Read as _;
+                let Some(path) = path else {
+                    return visible.to_string();
+                };
+                let mut bytes = Vec::new();
+                let read = std::fs::File::open(path)
+                    .and_then(|file| file.take(MAX_SPILL_READ_BYTES + 1).read_to_end(&mut bytes));
+                match read {
+                    Ok(_) if bytes.len() as u64 > MAX_SPILL_READ_BYTES => {
+                        bytes.truncate(usize::try_from(MAX_SPILL_READ_BYTES).unwrap_or(usize::MAX));
+                        format!(
+                            "{}\n[... cut at {MAX_SPILL_READ_BYTES} bytes; the rest is in {path} ...]",
+                            String::from_utf8_lossy(&bytes)
+                        )
+                    }
+                    Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                    // A vanished or unreadable spill keeps the visible text.
+                    Err(_) => visible.to_string(),
+                }
+            };
+            let full = ExecuteResult {
+                stdout: read_back(&r.spilled.stdout, &r.stdout),
+                stderr: read_back(&r.spilled.stderr, &r.stderr),
+                result: r
+                    .result
+                    .as_ref()
+                    .map(|visible| read_back(&r.spilled.result, visible)),
+                ..r.clone()
+            };
+            Some(format_execute_text(
+                &full,
+                full.background_output.as_deref(),
+            ))
+        };
+        let bounded = super::output_budget::bound_model_output(
+            &text,
+            super::output_budget::MAX_FAILURE_MODEL_OUTPUT_CHARS,
+            full_output.as_deref().unwrap_or(&text),
+            super::output_budget::write_output_artifact,
+        );
+        if bounded.artifact_path.is_some() {
+            if let Some(on_spill) = &options.on_output_budget_spill {
+                on_spill();
+            }
+        }
+        text = bounded.text;
     }
 
     let image_blocks = image_blocks_from_attachments(&r.attachments);
@@ -506,13 +837,24 @@ pub async fn execute_ipython(
 }
 
 /// The `ipython` tool definition: exact name, schema, and description.
+///
+/// # Panics
+///
+/// Panics if the repeat-guard state mutex is poisoned (a prior call
+/// panicked while holding it).
 #[must_use]
 pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -> ToolDefinition {
     let options = Arc::new(options);
     let execute: crate::tools::tool_definition::ExecuteFn = {
         let options = options;
+        // One guard per tool instance (per session): the count survives every
+        // call of this session's kernel (fabric `repeat-guard.ts`).
+        let repeat_guard = options
+            .repeat_guard
+            .map(|config| Arc::new(Mutex::new(IpythonRepeatGuard::new(config))));
         Arc::new(move |tool_call_id, params, signal, on_update| {
             let options = options.clone();
+            let repeat_guard = repeat_guard.clone();
             let on_late_sent_agent_message =
                 options.on_late_sent_agent_message.as_ref().map(|handler| {
                     let handler = std::sync::Arc::clone(handler);
@@ -526,14 +868,71 @@ pub fn create_ipython_tool_definition(_cwd: &str, options: IpythonToolOptions) -
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("ipython tool requires a code string"))?
                     .to_string();
-                execute_ipython(
+                // The repeat guard: a blocked call never reaches the kernel;
+                // a warned call runs and carries the circuit-breaker line.
+                if let Some(guard) = &repeat_guard {
+                    let blocked = guard.lock().expect("repeat guard poisoned").check(&code);
+                    if let Some(observation) = blocked {
+                        if let Some(on_triggered) = &options.on_repeat_guard_triggered {
+                            on_triggered(true, observation.count);
+                        }
+                        return Ok(ToolExecutionResult {
+                            content: vec![ToolContentBlock::text(repeat_block_text(
+                                observation.count,
+                            ))],
+                            details: Some(json!({
+                                "status": "error",
+                                "repeatGuard": { "blocked": true, "count": observation.count },
+                            })),
+                            is_error: true,
+                        });
+                    }
+                }
+                let executed = execute_ipython(
                     &options,
                     &code,
                     signal,
                     on_update,
                     on_late_sent_agent_message,
                 )
-                .await
+                .await;
+                let mut result = match executed {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if let Some(guard) = &repeat_guard {
+                            guard.lock().expect("repeat guard poisoned").reset();
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Some(guard) = &repeat_guard {
+                    let (observation, config) = {
+                        let mut guard = guard.lock().expect("repeat guard poisoned");
+                        (guard.record(&code, &result), guard.config())
+                    };
+                    if observation.count == config.warn_at {
+                        if let Some(on_triggered) = &options.on_repeat_guard_triggered {
+                            on_triggered(false, observation.count);
+                        }
+                    }
+                    if observation.warn {
+                        let warn = repeat_warn_text(observation.count, config.block_at);
+                        match result.content.last_mut() {
+                            Some(ToolContentBlock::Text { text }) => {
+                                if text.is_empty() {
+                                    text.push_str(&warn);
+                                } else {
+                                    text.push_str("\n\n");
+                                    text.push_str(&warn);
+                                }
+                            }
+                            Some(ToolContentBlock::Image { .. }) | None => {
+                                result.content.push(ToolContentBlock::text(warn));
+                            }
+                        }
+                    }
+                }
+                Ok(result)
             })
         })
     };
@@ -580,6 +979,686 @@ mod tests {
         }
     }
 
+    /// A settled kernel whose cell executions are counted: proves the
+    /// repeat guard blocks *before* the executor runs.
+    struct CountedSettledCell {
+        cell: ExecuteResult,
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl KernelExecutor for CountedSettledCell {
+        fn execute(&self, _code: &str, _options: KernelExecuteOptions<'_>) -> ExecuteCellFuture {
+            self.executions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let cell = self.cell.clone();
+            Box::pin(std::future::ready(Ok(cell)))
+        }
+    }
+
+    impl IpythonKernelProvisioner for CountedSettledCell {
+        fn ensure(
+            &self,
+            _on_progress: Option<BootstrapProgressHandler>,
+            _signal: Option<AbortSignal>,
+        ) -> EnsureFuture {
+            let executor: Box<dyn KernelExecutor> = Box::new(CountedSettledCell {
+                cell: self.cell.clone(),
+                executions: self.executions.clone(),
+            });
+            Box::pin(std::future::ready(Ok(executor)))
+        }
+
+        fn kill(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// Run one call through a tool definition with the given code.
+    async fn run_code(
+        definition: &ToolDefinition,
+        code: &str,
+    ) -> anyhow::Result<ToolExecutionResult> {
+        (definition.execute)("call-1", json!({ "code": code }), None, None).await
+    }
+
+    fn guarded_options(
+        provisioner: Arc<dyn IpythonKernelProvisioner>,
+        on_repeat_guard_triggered: Option<crate::tools::ipython::RepeatGuardTriggeredHandler>,
+    ) -> IpythonToolOptions {
+        IpythonToolOptions {
+            provisioner,
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: Some(RepeatGuardConfig {
+                warn_at: IPYTHON_REPEAT_WARN_AT,
+                block_at: IPYTHON_REPEAT_BLOCK_AT,
+            }),
+            on_repeat_guard_triggered,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
+        }
+    }
+
+    fn text_result(text: &str) -> ToolExecutionResult {
+        ToolExecutionResult {
+            content: vec![ToolContentBlock::text(text)],
+            details: None,
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn repeat_guard_counts_identical_code_and_output_and_resets_on_change() {
+        let mut guard = IpythonRepeatGuard::new(RepeatGuardConfig {
+            warn_at: 3,
+            block_at: 6,
+        });
+        assert_eq!(guard.check("x = 1"), None);
+        assert_eq!(
+            guard.record("x = 1", &text_result("same")),
+            RepeatGuardObservation {
+                count: 1,
+                warn: false,
+                blocked: false,
+            }
+        );
+        guard.record("x = 1", &text_result("same"));
+        assert_eq!(
+            guard.record("x = 1", &text_result("same")),
+            RepeatGuardObservation {
+                count: 3,
+                warn: true,
+                blocked: false,
+            }
+        );
+        // The same code with a moving output is a poll, not a loop.
+        assert_eq!(guard.record("x = 1", &text_result("moved")).count, 1);
+        // Different code resets too.
+        assert_eq!(guard.record("y = 2", &text_result("moved")).count, 1);
+        for _ in 0..4 {
+            guard.record("y = 2", &text_result("moved"));
+        }
+        assert_eq!(
+            guard.check("y = 2"),
+            Some(RepeatGuardObservation {
+                count: 6,
+                warn: true,
+                blocked: true,
+            })
+        );
+        assert_eq!(guard.check("z = 3"), None, "other code is never blocked");
+        guard.reset();
+        assert_eq!(guard.check("y = 2"), None, "a reset forgets the run");
+    }
+
+    #[test]
+    fn repeat_guard_invalid_thresholds_fall_back_to_the_defaults() {
+        let defaults = Some(RepeatGuardConfig {
+            warn_at: IPYTHON_REPEAT_WARN_AT,
+            block_at: IPYTHON_REPEAT_BLOCK_AT,
+        });
+        for (warn_at, block_at) in [(Some(0), Some(6)), (Some(4), Some(4)), (Some(7), None)] {
+            let settings = crate::settings::RepeatGuardSettings {
+                enabled: None,
+                warn_at,
+                block_at,
+            };
+            assert_eq!(
+                RepeatGuardConfig::from_settings(&settings),
+                defaults,
+                "{warn_at:?}/{block_at:?}"
+            );
+        }
+        let custom = crate::settings::RepeatGuardSettings {
+            enabled: Some(true),
+            warn_at: Some(2),
+            block_at: Some(4),
+        };
+        assert_eq!(
+            RepeatGuardConfig::from_settings(&custom),
+            Some(RepeatGuardConfig {
+                warn_at: 2,
+                block_at: 4,
+            })
+        );
+        let disabled = crate::settings::RepeatGuardSettings {
+            enabled: Some(false),
+            warn_at: None,
+            block_at: None,
+        };
+        assert_eq!(RepeatGuardConfig::from_settings(&disabled), None);
+    }
+
+    /// A kernel whose every cell prints a new line: the same code polling a
+    /// moving state.
+    struct PollingCell {
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl KernelExecutor for PollingCell {
+        fn execute(&self, _code: &str, _options: KernelExecuteOptions<'_>) -> ExecuteCellFuture {
+            let run = self
+                .executions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::ready(Ok(ExecuteResult {
+                stdout: format!("children still running (poll {run})"),
+                ..ExecuteResult::default()
+            })))
+        }
+    }
+
+    impl IpythonKernelProvisioner for PollingCell {
+        fn ensure(
+            &self,
+            _on_progress: Option<BootstrapProgressHandler>,
+            _signal: Option<AbortSignal>,
+        ) -> EnsureFuture {
+            let executor: Box<dyn KernelExecutor> = Box::new(PollingCell {
+                executions: self.executions.clone(),
+            });
+            Box::pin(std::future::ready(Ok(executor)))
+        }
+
+        fn kill(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// Re-running the same polling cell while its output changes is never
+    /// warned or blocked (the `rlm.collect` while children work case).
+    #[tokio::test]
+    async fn repeat_guard_never_trips_on_a_poll_whose_output_moves() {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let definition = create_ipython_tool_definition(
+            "/tmp",
+            guarded_options(
+                Arc::new(PollingCell {
+                    executions: executions.clone(),
+                }),
+                None,
+            ),
+        );
+        for poll in 0..10 {
+            let result = run_code(&definition, "await rlm.collect()")
+                .await
+                .expect("the poll settles");
+            assert_eq!(
+                result.content,
+                vec![ToolContentBlock::text(format!(
+                    "children still running (poll {poll})"
+                ))]
+            );
+        }
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn repeat_guard_third_identical_call_warns() {
+        let cell = ExecuteResult {
+            stdout: "settled".to_string(),
+            ..ExecuteResult::default()
+        };
+        let definition = create_ipython_tool_definition(
+            "/tmp",
+            guarded_options(Arc::new(SettledCell(cell)), None),
+        );
+        let first = run_code(&definition, "x = 1").await.expect("first settles");
+        assert_eq!(first.content, vec![ToolContentBlock::text("settled")]);
+        run_code(&definition, "x = 1")
+            .await
+            .expect("second settles");
+        let third = run_code(&definition, "x = 1").await.expect("third settles");
+        let expected = format!(
+            "settled\n\n{}",
+            repeat_warn_text(IPYTHON_REPEAT_WARN_AT, IPYTHON_REPEAT_BLOCK_AT)
+        );
+        assert_eq!(third.content, vec![ToolContentBlock::text(expected)]);
+        assert!(!third.is_error, "a warned run still executed");
+    }
+
+    #[tokio::test]
+    async fn repeat_guard_sixth_identical_call_is_blocked_without_execution() {
+        let cell = ExecuteResult {
+            stdout: "settled".to_string(),
+            ..ExecuteResult::default()
+        };
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed: std::sync::Arc<std::sync::Mutex<Vec<(bool, u64)>>> = Arc::default();
+        let recorder = observed.clone();
+        let telemetry: crate::tools::ipython::RepeatGuardTriggeredHandler =
+            Arc::new(move |blocked: bool, count: u64| {
+                recorder.lock().unwrap().push((blocked, count));
+            });
+        let definition = create_ipython_tool_definition(
+            "/tmp",
+            guarded_options(
+                Arc::new(CountedSettledCell {
+                    cell,
+                    executions: executions.clone(),
+                }),
+                Some(telemetry),
+            ),
+        );
+        for _ in 0..5 {
+            run_code(&definition, "x = 1")
+                .await
+                .expect("the run settles");
+        }
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "the first five calls executed"
+        );
+        let sixth = run_code(&definition, "x = 1")
+            .await
+            .expect("the block returns");
+        assert_eq!(
+            sixth.content,
+            vec![ToolContentBlock::text(repeat_block_text(
+                IPYTHON_REPEAT_BLOCK_AT
+            ))]
+        );
+        assert!(sixth.is_error, "the blocked call is an error result");
+        assert_eq!(
+            sixth.details,
+            Some(json!({
+                "status": "error",
+                "repeatGuard": { "blocked": true, "count": IPYTHON_REPEAT_BLOCK_AT },
+            }))
+        );
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "the blocked call never reached the executor"
+        );
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            [
+                (false, IPYTHON_REPEAT_WARN_AT),
+                (true, IPYTHON_REPEAT_BLOCK_AT)
+            ],
+            "telemetry fires on the warn crossing and every block"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_guard_changed_code_resets_the_run() {
+        let cell = ExecuteResult {
+            stdout: "settled".to_string(),
+            ..ExecuteResult::default()
+        };
+        let definition = create_ipython_tool_definition(
+            "/tmp",
+            guarded_options(Arc::new(SettledCell(cell)), None),
+        );
+        for _ in 0..3 {
+            run_code(&definition, "x = 1")
+                .await
+                .expect("the run settles");
+        }
+        // Differing code resets; the next identical run restarts at 1.
+        run_code(&definition, "y = 2")
+            .await
+            .expect("the reset settles");
+        let after_reset = run_code(&definition, "x = 1").await.expect("settles");
+        assert_eq!(
+            after_reset.content,
+            vec![ToolContentBlock::text("settled")],
+            "the count restarted at 1 after the differing code"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_guard_disabled_runs_identical_code_freely() {
+        let cell = ExecuteResult {
+            stdout: "settled".to_string(),
+            ..ExecuteResult::default()
+        };
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(CountedSettledCell {
+                cell,
+                executions: executions.clone(),
+            }),
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
+        };
+        let definition = create_ipython_tool_definition("/tmp", options);
+        for _ in 0..8 {
+            let result = run_code(&definition, "x = 1").await.expect("settles");
+            assert_eq!(result.content, vec![ToolContentBlock::text("settled")]);
+        }
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            8,
+            "without the guard every identical call executes"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cell_with_side_effects_appends_the_progress_note() {
+        let cell = ExecuteResult {
+            status: ExecuteStatus::Error,
+            stdout: "partial out".to_string(),
+            error: Some(KernelErrorInfo {
+                ename: "RuntimeError".to_string(),
+                evalue: "boom".to_string(),
+                traceback: vec![
+                    "Traceback line 1".to_string(),
+                    "Traceback line 2".to_string(),
+                ],
+            }),
+            diffs: vec![
+                KernelDiffDisplay {
+                    path: "/repo/a.py".to_string(),
+                    old_str: "a = 1".to_string(),
+                    new_str: "a = 2".to_string(),
+                    start_line: None,
+                },
+                KernelDiffDisplay {
+                    path: "/repo/b.py".to_string(),
+                    old_str: "x".to_string(),
+                    new_str: "y".to_string(),
+                    start_line: None,
+                },
+            ],
+            bash_commands: Some(crate::kernel::shared::KernelBashCommands {
+                first: "cargo test".to_string(),
+                count: 1,
+                lines: 1,
+            }),
+            ..ExecuteResult::default()
+        };
+        let noted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorder = noted.clone();
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(SettledCell(cell)),
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: Some(Arc::new(move || {
+                recorder.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+            on_output_budget_spill: None,
+        };
+        let result = execute_ipython(&options, "await edit(...)", None, None, None)
+            .await
+            .expect("the failed cell settles");
+        assert_eq!(
+            result.content,
+            vec![ToolContentBlock::text(
+                "partial out\nTraceback line 1\nTraceback line 2\n\nCompleted before the cell failed (outputs not returned): edit(/repo/a.py); edit(/repo/b.py); 1 bash command.\nSuccessful calls may already have changed the workspace; inspect before repeating mutations."
+            )]
+        );
+        assert!(result.is_error);
+        assert_eq!(
+            noted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failure-note telemetry seam fired once"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_cell_with_side_effects_appends_no_note() {
+        let cell = ExecuteResult {
+            status: ExecuteStatus::Ok,
+            stdout: "done".to_string(),
+            diffs: vec![KernelDiffDisplay {
+                path: "/repo/a.py".to_string(),
+                old_str: "a = 1".to_string(),
+                new_str: "a = 2".to_string(),
+                start_line: None,
+            }],
+            bash_commands: Some(crate::kernel::shared::KernelBashCommands {
+                first: "cargo test".to_string(),
+                count: 2,
+                lines: 2,
+            }),
+            ..ExecuteResult::default()
+        };
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(SettledCell(cell)),
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
+        };
+        let result = execute_ipython(&options, "await edit(...)", None, None, None)
+            .await
+            .expect("the cell settles");
+        assert_eq!(result.content, vec![ToolContentBlock::text("done")]);
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn failed_cell_output_is_bounded_at_20k_with_a_linked_artifact() {
+        // The plan's verifier (b): a failing 100k-char cell yields at most
+        // 20k of model-visible text ending with the artifact path, and the
+        // artifact holds the full output.
+        let cell = ExecuteResult {
+            status: ExecuteStatus::Error,
+            stdout: format!("start-{}-the very last line", "x".repeat(100_000)),
+            error: Some(KernelErrorInfo {
+                ename: "RuntimeError".to_string(),
+                evalue: "boom".to_string(),
+                traceback: vec!["Traceback line 1".to_string()],
+            }),
+            ..ExecuteResult::default()
+        };
+        let spills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spill_counter = Arc::clone(&spills);
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(SettledCell(cell)),
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: Some(Arc::new(move || {
+                spill_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+        };
+        let result = execute_ipython(&options, "print('x' * 100_000)", None, None, None)
+            .await
+            .expect("the failed cell settles");
+        assert!(result.is_error);
+        let text = match &result.content[0] {
+            ToolContentBlock::Text { text } => text.clone(),
+            ToolContentBlock::Image { .. } => panic!("expected a text block"),
+        };
+        assert!(
+            text.chars().count() <= super::super::output_budget::MAX_FAILURE_MODEL_OUTPUT_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        assert!(text.contains("characters omitted by Prime Agent"));
+        assert!(text.contains("saved to: "), "links the artifact: {text}");
+        assert!(text.ends_with(']'));
+        let artifact_path = text
+            .rsplit_once("saved to: ")
+            .expect("the link is present")
+            .1
+            .trim_end_matches(']');
+        let persisted = std::fs::read_to_string(artifact_path).expect("the artifact exists");
+        // The artifact holds the full combined text: the stdout plus the
+        // error traceback, byte for byte.
+        assert_eq!(
+            persisted,
+            format!(
+                "start-{}-the very last line\nTraceback line 1",
+                "x".repeat(100_000)
+            )
+        );
+        assert_eq!(spills.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_file(artifact_path).ok();
+        std::fs::remove_dir(std::path::Path::new(artifact_path).parent().expect("dir")).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_cell_artifact_holds_the_complete_spilled_stream() {
+        // A stream that overflowed its kernel cap reaches the tool as head
+        // + tail with a link; the failed-cell artifact must still hold the
+        // complete stream, read back from the kernel's spill file, and its
+        // character count must be the true one.
+        let spill_dir = tempfile::tempdir().unwrap();
+        let spill_path = spill_dir.path().join("output.txt");
+        let full_stdout = format!(
+            "head-{}-middle-{}-tail",
+            "a".repeat(60_000),
+            "b".repeat(60_000)
+        );
+        std::fs::write(&spill_path, &full_stdout).unwrap();
+        let cell = ExecuteResult {
+            status: ExecuteStatus::Error,
+            stdout: format!(
+                "head-{}\n\n... characters omitted ...\n\n{}-tail",
+                "a".repeat(30_000),
+                "b".repeat(30_000)
+            ),
+            error: Some(KernelErrorInfo {
+                ename: "RuntimeError".to_string(),
+                evalue: "boom".to_string(),
+                traceback: vec!["Traceback line 1".to_string()],
+            }),
+            spilled: crate::kernel::shared::SpilledOutputs {
+                stdout: Some(spill_path.display().to_string()),
+                stderr: None,
+                result: None,
+            },
+            ..ExecuteResult::default()
+        };
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(SettledCell(cell)),
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
+        };
+        let result = execute_ipython(&options, "print(big)", None, None, None)
+            .await
+            .expect("the failed cell settles");
+        let text = match &result.content[0] {
+            ToolContentBlock::Text { text } => text.clone(),
+            ToolContentBlock::Image { .. } => panic!("expected a text block"),
+        };
+        let expected_full = format!("{full_stdout}\nTraceback line 1");
+        let (_, link) = text
+            .rsplit_once("[Full output (")
+            .expect("the link is present");
+        let (count, path) = link
+            .split_once(" chars) saved to: ")
+            .expect("the link shape");
+        assert_eq!(count, expected_full.chars().count().to_string());
+        let artifact_path = path.trim_end_matches(']');
+        assert_eq!(
+            std::fs::read_to_string(artifact_path).expect("the artifact exists"),
+            expected_full
+        );
+        std::fs::remove_file(artifact_path).ok();
+        std::fs::remove_dir(std::path::Path::new(artifact_path).parent().expect("dir")).ok();
+    }
+
+    #[tokio::test]
+    async fn successful_cell_keeps_its_full_output() {
+        // Success keeps today's budget: no 20k failure cap, no artifact.
+        let cell = ExecuteResult {
+            stdout: "y".repeat(100_000),
+            ..ExecuteResult::default()
+        };
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(SettledCell(cell)),
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
+        };
+        let result = execute_ipython(&options, "print('y' * 100_000)", None, None, None)
+            .await
+            .expect("the cell settles");
+        assert!(!result.is_error);
+        assert_eq!(
+            result.content,
+            vec![ToolContentBlock::text("y".repeat(100_000))]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cell_without_side_effects_appends_no_note() {
+        let cell = ExecuteResult {
+            status: ExecuteStatus::Error,
+            stdout: "partial out".to_string(),
+            ..ExecuteResult::default()
+        };
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(SettledCell(cell)),
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
+        };
+        let result = execute_ipython(&options, "1 / 0", None, None, None)
+            .await
+            .expect("the failed cell settles");
+        assert_eq!(result.content, vec![ToolContentBlock::text("partial out")]);
+    }
+
+    #[tokio::test]
+    async fn failed_cell_note_bounds_paths_and_commands() {
+        let long_path = "p".repeat(120);
+        let diffs = (1..=10)
+            .map(|index| KernelDiffDisplay {
+                path: if index == 3 {
+                    long_path.clone()
+                } else {
+                    format!("/repo/f{index}.rs")
+                },
+                old_str: String::new(),
+                new_str: String::new(),
+                start_line: None,
+            })
+            .collect::<Vec<_>>();
+        let cell = ExecuteResult {
+            status: ExecuteStatus::Error,
+            diffs,
+            bash_commands: Some(crate::kernel::shared::KernelBashCommands {
+                first: "cargo test".to_string(),
+                count: 3,
+                lines: 3,
+            }),
+            ..ExecuteResult::default()
+        };
+        let options = IpythonToolOptions {
+            provisioner: Arc::new(SettledCell(cell)),
+            ui: None,
+            on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
+        };
+        let result = execute_ipython(&options, "await edit(...)", None, None, None)
+            .await
+            .expect("the failed cell settles");
+        let compacted = format!("…{}", "p".repeat(99));
+        let expected = format!(
+            "Completed before the cell failed (outputs not returned): edit(/repo/f1.rs); edit(/repo/f2.rs); edit({compacted}); edit(/repo/f4.rs); edit(/repo/f5.rs); edit(/repo/f6.rs); edit(/repo/f7.rs); edit(/repo/f8.rs); +2 more; 3 bash commands.\nSuccessful calls may already have changed the workspace; inspect before repeating mutations."
+        );
+        assert_eq!(result.content, vec![ToolContentBlock::text(expected)]);
+    }
+
     #[tokio::test]
     async fn cell_edit_diffs_are_saved_in_the_result_details() {
         let cell = ExecuteResult {
@@ -605,6 +1684,10 @@ mod tests {
             provisioner: Arc::new(SettledCell(cell)),
             ui: None,
             on_late_sent_agent_message: None,
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
         };
         let result = execute_ipython(&options, "await edit(...)", None, None, None)
             .await

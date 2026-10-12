@@ -243,6 +243,10 @@ impl SessionUi {
             values.theme = settings.theme().unwrap_or_else(|| "prime".to_string());
             // The tier row preselects the saved default instead of the struct default.
             values.default_service_tier = settings.default_service_tier();
+            values.cache_warming = settings.cache_warming_mode();
+            values.compaction_engine = settings.compaction_engine();
+            values.auto_refine = settings.auto_refine_enabled();
+            values.repeat_guard = settings.repeat_guard_enabled();
         } else {
             values.show_images = true;
             values.auto_resize_images = true;
@@ -255,6 +259,10 @@ impl SessionUi {
             values.theme = "prime".to_string();
             // No settings seam: the tier row reads "default", never a blank value.
             values.default_service_tier = "default".to_string();
+            values.cache_warming = "off".to_string();
+            values.compaction_engine = "deterministic".to_string();
+            values.auto_refine = true;
+            values.repeat_guard = true;
         }
         // This surface ships the builtin themes.
         values.available_themes = pa_types::themes::BUILTIN_THEME_NAMES
@@ -566,6 +574,34 @@ impl SessionUi {
                     }
                 }
                 view.theme = crate::app::load_theme(value);
+            }
+            "cache-warming" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_cache_warming_mode(value) {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
+            "compaction-engine" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_compaction_engine(value) {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
+            "auto-refine" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_auto_refine_enabled(enabled),
+                    value,
+                    view,
+                );
+            }
+            "repeat-guard" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_repeat_guard_enabled(enabled),
+                    value,
+                    view,
+                );
             }
             other => {
                 self.error_row(&format!("Unknown setting: {other}"), view);

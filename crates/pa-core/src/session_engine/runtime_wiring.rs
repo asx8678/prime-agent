@@ -176,6 +176,9 @@ pub fn wire_session_runtime(
         subagent_host,
         rlm_usage.clone(),
     ));
+    // PR-11: the usage seam feeds the tree-cost ledger every folded child
+    // usage; the bridge owns the ledger the spawn gate reads.
+    rlm_usage.set_tree_cost(std::sync::Arc::clone(&rlm_bridge.tree_cost));
     register_rlm_host_handlers(&mut handlers, &rlm_bridge);
     SessionKernelWiring {
         session,
@@ -347,6 +350,7 @@ fn convert_execute_result(
         diffs: result.diffs.unwrap_or_default(),
         sent_agent_messages: result.sent_agent_messages.unwrap_or_default(),
         bash_commands: result.bash_commands,
+        spilled: result.spilled,
     }
 }
 
@@ -355,11 +359,19 @@ fn convert_execute_result(
 pub fn ipython_tool_options(
     provisioner: Arc<KernelProvisioner>,
     on_late_sent_agent_message: Option<crate::tools::ipython::LateSentAgentMessageHandler>,
+    repeat_guard: Option<crate::tools::ipython::RepeatGuardConfig>,
+    on_repeat_guard_triggered: Option<crate::tools::ipython::RepeatGuardTriggeredHandler>,
+    on_cell_failure_note: Option<crate::tools::ipython::CellFailureNoteHandler>,
+    on_output_budget_spill: Option<crate::tools::ipython::OutputBudgetSpillHandler>,
 ) -> IpythonToolOptions {
     IpythonToolOptions {
         provisioner,
         ui: None,
         on_late_sent_agent_message,
+        repeat_guard,
+        on_repeat_guard_triggered,
+        on_cell_failure_note,
+        on_output_budget_spill,
     }
 }
 
@@ -388,6 +400,7 @@ mod tests {
             status: crate::kernel::shared::ExecuteStatus::Ok,
             error: None,
             duration_ms: 4,
+            spilled: crate::kernel::shared::SpilledOutputs::default(),
         });
         assert_eq!(converted.diffs, diffs);
     }

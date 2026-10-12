@@ -919,13 +919,28 @@ async fn oversized_non_ascii_result_is_clipped_at_the_char_budget() {
         .expect("the oversized cell must settle");
     assert_eq!(big.status, ExecuteStatus::Ok, "cell: {:?}", big.error);
     let text = big.result.expect("the oversized cell carries a result");
-    let marker = "\n[... output truncated at 65536 chars ...]";
-    let expected_clipped = format!("'{}{}", "ł".repeat(65_535), marker);
+    // An oversized result is bounded, not head-clipped (fabric
+    // `output-budget.ts`): the head and tail survive within the char
+    // budget around a middle omission marker, and the full repr spills
+    // to a linked artifact.
     assert_eq!(
-        text, expected_clipped,
-        "the clip keeps exactly the first 65,536 chars plus the marker"
+        text.chars().count(),
+        65_536,
+        "the bound keeps exactly the char budget"
     );
-    assert_eq!(text.chars().count(), 65_536 + marker.chars().count());
+    assert!(text.starts_with("'ł"), "the head is kept");
+    assert!(text.contains("characters omitted by Prime Agent"));
+    assert!(text.contains("\n\n[Full output (70002 chars) saved to: "));
+    assert!(text.ends_with(']'));
+    let artifact_path = text
+        .rsplit_once("saved to: ")
+        .expect("the link is present")
+        .1
+        .trim_end_matches(']');
+    let persisted = std::fs::read_to_string(artifact_path).expect("the artifact exists");
+    assert_eq!(persisted, format!("'{}'", "ł".repeat(70_000)));
+    std::fs::remove_file(artifact_path).ok();
+    std::fs::remove_dir(std::path::Path::new(artifact_path).parent().expect("dir")).ok();
     let next = execute(&manager, "1 + 1").await;
     assert_eq!(next.result.as_deref(), Some("2"));
     let shutdown = manager.shutdown(KernelShutdownOptions::default()).await;

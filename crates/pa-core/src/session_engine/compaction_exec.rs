@@ -118,6 +118,129 @@ pub fn build_turn_prefix_request(messages: &[AgentMessage]) -> Vec<AgentMessage>
     })]
 }
 
+/// The wire-fallback telemetry seam: called once per session-model retry
+/// with whether the retry succeeded (primitives only, never content).
+pub type ModelFallbackHook = std::sync::Arc<dyn Fn(bool) + Send + Sync>;
+
+/// The session-model target a routed one-off call can fall back to.
+#[derive(Clone)]
+pub struct SessionModelFallback {
+    pub model: pa_types::ai::Model,
+    pub api_key: Option<String>,
+    /// The session model's own merged request headers (the registry's team
+    /// header, exactly like the session's requests).
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// The routed model's base headers, before a summary slice merged its
+    /// request id over them: the retry carries every header the slice added
+    /// on top of the session headers.
+    pub routed_base_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// Adoption telemetry for the retry.
+    pub on_fallback: Option<ModelFallbackHook>,
+}
+
+impl SessionModelFallback {
+    /// The retry's headers: the session model's own, plus every entry the
+    /// summary slice merged over the routed base (its request id).
+    fn retry_headers(
+        &self,
+        sent: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        let mut headers = self.headers.clone().unwrap_or_default();
+        for (key, value) in sent.into_iter().flatten() {
+            let base = self
+                .routed_base_headers
+                .as_ref()
+                .and_then(|base| base.get(key));
+            if base != Some(value) {
+                headers.insert(key.clone(), value.clone());
+            }
+        }
+        (!headers.is_empty()).then_some(headers)
+    }
+}
+
+/// Whether the routed model is the session model (same provider and id):
+/// a same-model wire failure would recur, so the fallback is skipped.
+#[must_use]
+pub fn is_session_model(routed: &pa_types::ai::Model, session: &pa_types::ai::Model) -> bool {
+    routed.provider == session.provider && routed.id == session.id
+}
+
+/// [`complete_summary_call`] with a session-model fallback (codex
+/// `compact_model_fallback.rs`): when the routed model differs from the
+/// session model and the wire call fails, retry once on the session model
+/// with the session key and headers (plus the slice's request id). An
+/// aborted run never retries. The retry re-clones the request, so the
+/// routed call owns its copy.
+///
+/// # Errors
+///
+/// Returns the routed call's error when there is no fallback (same model,
+/// no session target, or an aborted run); otherwise the session retry's
+/// error.
+#[allow(clippy::too_many_arguments)] // complete_summary_call's 7 + the fallback target and the abort signal
+pub async fn complete_summary_call_with_fallback(
+    routed_model: &pa_types::ai::Model,
+    routed_api_key: Option<String>,
+    routed_headers: Option<std::collections::BTreeMap<String, String>>,
+    max_tokens: u64,
+    request_messages: Vec<AgentMessage>,
+    on_delta: Option<SummaryDeltaSink>,
+    failure: &'static str,
+    fallback: Option<SessionModelFallback>,
+    abort: Option<&pa_agent::abort::AbortSignal>,
+) -> anyhow::Result<SummarySlice> {
+    // The routed call owns the original request; the retry needs its own.
+    let retry_messages = request_messages.clone();
+    let retry_delta = on_delta.clone();
+    let sent_headers = routed_headers.clone();
+    match complete_summary_call(
+        routed_model,
+        routed_api_key,
+        routed_headers,
+        max_tokens,
+        request_messages,
+        on_delta,
+        failure,
+    )
+    .await
+    {
+        Ok(slice) => Ok(slice),
+        Err(error) => {
+            let Some(fallback) = fallback else {
+                return Err(error);
+            };
+            // A same-model failure would recur; an aborted run discards
+            // whatever a retry produced, so it never spends one.
+            if is_session_model(routed_model, &fallback.model)
+                || abort.is_some_and(pa_agent::abort::AbortSignal::is_aborted)
+            {
+                return Err(error);
+            }
+            eprintln!(
+                "Warning: auxiliary model \"{}/{}\" failed for the summary wire call; using the session model.",
+                routed_model.provider,
+                routed_model.id
+            );
+            let headers = fallback.retry_headers(sent_headers.as_ref());
+            let retried = complete_summary_call(
+                &fallback.model,
+                fallback.api_key,
+                headers,
+                max_tokens,
+                retry_messages,
+                retry_delta,
+                failure,
+            )
+            .await;
+            if let Some(on_fallback) = &fallback.on_fallback {
+                on_fallback(retried.is_ok());
+            }
+            retried
+        }
+    }
+}
+
 /// The live summary-delta sink: called with every text delta the summarizer
 /// streams, in arrival order. Fire-and-forget (emissions never gate the run);
 /// the final summary comes from the terminal assistant message.
@@ -158,6 +281,12 @@ pub async fn complete_summary_call(
             max_tokens: Some(max_tokens),
             api_key,
             headers: headers.map(|headers| headers.into_iter().collect()),
+            // One-off summaries never read the prompt cache back, so they opt
+            // out entirely (pi `completeSummarization`: cacheRetention "none"):
+            // no cache writes, and a fresh routing id keeps the session's cache
+            // namespace clean.
+            cache_retention: Some(pa_types::ai::CacheRetention::None),
+            session_id: Some(uuid::Uuid::new_v4().to_string()),
             ..Default::default()
         });
     let assistant = match on_delta {
@@ -683,5 +812,399 @@ mod tests {
             }
             _ => panic!("expected user message"),
         }
+    }
+
+    /// The one-off summarizer opts out of prompt caching (pi
+    /// `completeSummarization` parity): the request carries
+    /// `CacheRetention::None` and a fresh routing id, so it writes no cache
+    /// entries and never pollutes the session's cache namespace.
+    #[tokio::test]
+    async fn one_off_summary_opts_out_of_prompt_caching() {
+        type Captured = (Option<pa_types::ai::CacheRetention>, Option<String>);
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                    id: "cache-out-m".to_string(),
+                    name: Some("Cache Out Model".to_string()),
+                    reasoning: Some(false),
+                    input: Some(vec![pa_types::ai::ModelInput::Text]),
+                    cost: None,
+                    context_window: Some(1_000),
+                    max_tokens: Some(256),
+                }]),
+                ..Default::default()
+            });
+        let model = registration.get_model();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Captured>>> = std::sync::Arc::default();
+        let recorder = seen.clone();
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
+            std::sync::Arc::new(
+                move |_context: &pa_types::ai::Context,
+                      options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    let captured = options.map_or((None, None), |options| {
+                        (options.cache_retention, options.session_id.clone())
+                    });
+                    recorder.lock().unwrap().push(captured);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        "the summary",
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ),
+        )]);
+        let slice = complete_summary_call(
+            &model,
+            None,
+            None,
+            64,
+            vec![user("summarize this")],
+            None,
+            "test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(slice.summary, "the summary");
+        let seen = seen.lock().unwrap();
+        let (retention, session_id) = seen[0].clone();
+        assert_eq!(retention, Some(pa_types::ai::CacheRetention::None));
+        assert!(session_id.is_some(), "one-off requests route on a fresh id");
+        registration.unregister();
+    }
+
+    /// Serve one Anthropic Messages request on a local port: the request
+    /// body lands in the returned channel, and the reply is a minimal text
+    /// stream.
+    async fn capturing_anthropic_server() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<serde_json::Value>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 8192];
+            // Read the head, then exactly Content-Length body bytes.
+            let (head_end, content_length) = loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "the client closed before sending its request");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+                    break (end + 4, length);
+                }
+            };
+            while request.len() < head_end + content_length {
+                let read = socket.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[head_end..head_end + content_length]).unwrap();
+            let _ = body_tx.send(body);
+            let sse = [
+                r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":3,"output_tokens":1}}}"#,
+                r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"the summary"}}"#,
+                r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}"#,
+                r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+                r#"event: message_stop
+data: {"type":"message_stop"}"#,
+            ]
+            .join("\n\n")
+                + "\n\n";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (addr, body_rx)
+    }
+
+    /// The PR-1 wire proof: the one-off summarizer's request body to an
+    /// Anthropic Messages endpoint carries no `cache_control` anywhere (the
+    /// system block and the last user message would otherwise be marked).
+    #[tokio::test]
+    async fn one_off_summary_sends_no_cache_control_on_the_wire() {
+        let (addr, body) = capturing_anthropic_server().await;
+        let model: pa_types::ai::Model = serde_json::from_value(serde_json::json!({
+            "id": "claude-wire-test", "name": "Claude Wire Test",
+            "api": "anthropic-messages", "provider": "anthropic",
+            "baseUrl": format!("http://{addr}"), "reasoning": false, "input": ["text"],
+            "cost": {"input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75},
+            "contextWindow": 200_000, "maxTokens": 8_192
+        }))
+        .unwrap();
+        let slice = complete_summary_call(
+            &model,
+            Some("sk-ant-api-test".to_string()),
+            None,
+            64,
+            vec![user("summarize this")],
+            None,
+            "test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(slice.summary, "the summary");
+        let body = body.await.unwrap();
+        assert!(
+            body["system"].is_array() || body["system"].is_string(),
+            "the summarizer system prompt is on the wire: {body}"
+        );
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "no cache_control marker on the wire: {body}"
+        );
+    }
+
+    /// A faux provider serving a session model and an auxiliary model.
+    fn session_and_aux_models() -> (
+        pa_ai::faux::FauxProviderRegistration,
+        pa_types::ai::Model,
+        pa_types::ai::Model,
+    ) {
+        let definition = |id: &str| pa_ai::faux::FauxModelDefinition {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            reasoning: Some(false),
+            input: Some(vec![pa_types::ai::ModelInput::Text]),
+            cost: None,
+            context_window: Some(4_000),
+            max_tokens: Some(256),
+        };
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                models: Some(vec![definition("session-m"), definition("aux-m")]),
+                ..Default::default()
+            });
+        let aux = registration
+            .get_model_by_id("aux-m")
+            .expect("aux registered");
+        let session = registration
+            .get_model_by_id("session-m")
+            .expect("session model registered");
+        (registration, aux, session)
+    }
+
+    /// One observed summary call: the model id and the request headers.
+    type SeenCall = (String, std::collections::BTreeMap<String, String>);
+
+    /// A scripted step that records the call, then fails on the wire
+    /// (`failed`) or answers `text`.
+    fn recording_step(
+        seen: &std::sync::Arc<std::sync::Mutex<Vec<SeenCall>>>,
+        failed: bool,
+        text: &'static str,
+    ) -> pa_ai::faux::FauxResponseStep {
+        let seen = seen.clone();
+        pa_ai::faux::FauxResponseStep::Factory(std::sync::Arc::new(
+            move |_context: &pa_types::ai::Context,
+                  options: Option<&pa_ai::types::StreamOptions>,
+                  _call: u64,
+                  model: &pa_types::ai::Model| {
+                let headers = options
+                    .and_then(|options| options.headers.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                seen.lock().unwrap().push((model.id.clone(), headers));
+                let options = if failed {
+                    pa_ai::faux::FauxAssistantMessageOptions {
+                        stop_reason: Some(pa_types::ai::StopReason::Error),
+                        error_message: Some("500: overloaded".to_string()),
+                        ..Default::default()
+                    }
+                } else {
+                    pa_ai::faux::FauxAssistantMessageOptions::default()
+                };
+                Ok(pa_ai::faux::faux_assistant_text_message(text, options))
+            },
+        ))
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    /// The wire fallback: a routed model that fails on the wire is retried
+    /// once on the session model, which succeeds (codex
+    /// `compact_model_fallback.rs`). The retry carries the session model's
+    /// own headers plus the slice's request id, never the routed model's
+    /// headers, and reports the retry to the telemetry seam.
+    #[tokio::test]
+    async fn summary_wire_failure_falls_back_to_the_session_model() {
+        let (registration, aux_model, session_model) = session_and_aux_models();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<SeenCall>>> = std::sync::Arc::default();
+        registration.set_responses(vec![
+            recording_step(&seen, true, ""),
+            recording_step(&seen, false, "the fallback summary"),
+        ]);
+        let reported: std::sync::Arc<std::sync::Mutex<Vec<bool>>> = std::sync::Arc::default();
+        let report = reported.clone();
+        let slice = complete_summary_call_with_fallback(
+            &aux_model,
+            None,
+            // The routed base plus the slice's request id.
+            Some(headers(&[
+                ("x-team", "aux-team"),
+                ("x-request-id", "slice-1"),
+            ])),
+            64,
+            vec![user("summarize this")],
+            None,
+            "test",
+            Some(SessionModelFallback {
+                model: session_model,
+                api_key: None,
+                headers: Some(headers(&[("x-team", "session-team")])),
+                routed_base_headers: Some(headers(&[("x-team", "aux-team")])),
+                on_fallback: Some(std::sync::Arc::new(move |succeeded| {
+                    report.lock().unwrap().push(succeeded);
+                })),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(slice.summary, "the fallback summary");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [
+                (
+                    "aux-m".to_string(),
+                    headers(&[("x-team", "aux-team"), ("x-request-id", "slice-1")])
+                ),
+                (
+                    "session-m".to_string(),
+                    headers(&[("x-team", "session-team"), ("x-request-id", "slice-1")])
+                ),
+            ]
+        );
+        assert_eq!(reported.lock().unwrap().as_slice(), [true]);
+        registration.unregister();
+    }
+
+    /// An aborted run never spends a retry: the routed failure surfaces
+    /// after exactly one call, and the telemetry seam stays silent.
+    #[tokio::test]
+    async fn summary_wire_failure_on_an_aborted_run_does_not_retry() {
+        let (registration, aux_model, session_model) = session_and_aux_models();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<SeenCall>>> = std::sync::Arc::default();
+        registration.set_responses(vec![
+            recording_step(&seen, true, ""),
+            recording_step(&seen, false, "never served"),
+        ]);
+        let reported: std::sync::Arc<std::sync::Mutex<Vec<bool>>> = std::sync::Arc::default();
+        let report = reported.clone();
+        let controller = pa_agent::abort::AbortController::new();
+        controller.abort();
+        let signal = controller.signal();
+        let result = complete_summary_call_with_fallback(
+            &aux_model,
+            None,
+            None,
+            64,
+            vec![user("summarize this")],
+            None,
+            "test",
+            Some(SessionModelFallback {
+                model: session_model,
+                api_key: None,
+                headers: None,
+                routed_base_headers: None,
+                on_fallback: Some(std::sync::Arc::new(move |succeeded| {
+                    report.lock().unwrap().push(succeeded);
+                })),
+            }),
+            Some(&signal),
+        )
+        .await;
+        assert!(result.is_err(), "the routed failure surfaces");
+        assert_eq!(seen.lock().unwrap().len(), 1, "exactly one call was made");
+        assert!(reported.lock().unwrap().is_empty());
+        registration.unregister();
+    }
+
+    /// A same-model failure does not retry: the fallback is skipped when the
+    /// routed model IS the session model (the retry would fail the same way).
+    #[tokio::test]
+    async fn summary_wire_failure_same_model_does_not_retry() {
+        let registration =
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                    id: "same-m".to_string(),
+                    name: Some("Same Model".to_string()),
+                    reasoning: Some(false),
+                    input: Some(vec![pa_types::ai::ModelInput::Text]),
+                    cost: None,
+                    context_window: Some(4_000),
+                    max_tokens: Some(256),
+                }]),
+                ..Default::default()
+            });
+        let model = registration.get_model();
+        let call_count = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let counter = call_count.clone();
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
+            std::sync::Arc::new(
+                move |_context: &pa_types::ai::Context,
+                      _options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      _model: &pa_types::ai::Model| {
+                    *counter.lock().unwrap() += 1;
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        "",
+                        pa_ai::faux::FauxAssistantMessageOptions {
+                            stop_reason: Some(pa_types::ai::StopReason::Error),
+                            error_message: Some("500: overloaded".to_string()),
+                            ..Default::default()
+                        },
+                    ))
+                },
+            ),
+        )]);
+        let result = complete_summary_call_with_fallback(
+            &model,
+            None,
+            None,
+            64,
+            vec![user("summarize this")],
+            None,
+            "test",
+            Some(SessionModelFallback {
+                model: model.clone(),
+                api_key: None,
+                headers: None,
+                routed_base_headers: None,
+                on_fallback: None,
+            }),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "the same-model failure is not retried");
+        assert_eq!(*call_count.lock().unwrap(), 1, "exactly one call was made");
+        registration.unregister();
     }
 }

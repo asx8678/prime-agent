@@ -30,13 +30,14 @@ prime-agent is a recursive harness. Each session builds a tree of agents, starti
 
 The following programmatic tools are available in the REPL for subagent management:
 
-- `rlm.spawn(prompt: str, *, name: str, model: str | None = None, thinking: str | None = None, kind: str | None = None) -> RLMSpawnHandle`: spawns a new subagent one level deeper than the caller; returns immediately; errors when the caller cannot create subagents; if not given, `model` and `thinking` are inherited from the parent; results never arrive as `rlm.spawn()` return values, they arrive only via agent_message; `name` must be unique among the spawned agent's siblings, and be meaningful and descriptive but short; `kind` selects a dedicated child kind — `kind="decision"` spawns the Decision API child (the model comes from the `decisionApi.systemOneModel` setting and the child answers every message with one decision)
+- `rlm.spawn(prompt: str, *, name: str, model: str | None = None, thinking: str | None = None, kind: str | None = None, schema: dict | None = None) -> RLMSpawnHandle`: spawns a new subagent one level deeper than the caller; returns immediately; errors when the caller cannot create subagents; if not given, `model` and `thinking` are inherited from the parent; results never arrive as `rlm.spawn()` return values, they arrive only via agent_message; `name` must be unique among the spawned agent's siblings, and be meaningful and descriptive but short; `kind` selects a dedicated child kind — `kind="decision"` spawns the Decision API child (the model comes from the `decisionApi.systemOneModel` setting and the child answers every message with one decision); `schema` is a JSON Schema dict the child's collected result must satisfy (a TypeBox schema is a JSON Schema object at runtime and carries over unchanged): `rlm.collect` validates the settled answer and reports the first 5 validation errors on the result (`schema_valid`/`schema_errors`) — never a hidden retry, and the child is never killed for an invalid result
 - `rlm.create_session(prompt: str, name: str | None = None, model: str | None = None, thinking: str | None = None, cwd: str | None = None) -> RLMCreateSessionHandle`: creates another depth-0 session; only available to agents at depth 0 backed by a daemon; returns after the session is successfully created and the first prompt sent
 - `rlm.find_models(query: str = '', limit: int = 8) -> list[RLMModel]`
 - `rlm.list_subagents() -> list[RLMSubagent]`: direct child handles
 - `rlm.delete_subagent(target: str | RLMSubagent) -> RLMSubagent`
 - `rlm.rename(new_name: str, *, session_id=None) -> str`: rename the calling session (omit `session_id`) or a direct child (spawn handle, `list_subagents()` row, or session id; never the child's name); names must be unique among siblings, and the renamed session sees a transcript line for the change
-- `rlm.collect(targets=None, *, timeout_ms: int = 0) -> list[RLMChildResult]`: typed snapshots of direct children (status, settled flag, answer preview, error) without steering anyone; `timeout_ms=0` returns a non-blocking snapshot; a positive timeout blocks only this call until the children settle or the deadline passes
+- `rlm.collect(targets=None, *, timeout_ms: int = 0) -> list[RLMChildResult]`: typed snapshots of direct children (status, settled flag, answer preview, error, plus schema validation when the spawn passed `schema=`) without steering anyone; `timeout_ms=0` returns a non-blocking snapshot; a positive timeout blocks only this call until the children settle or the deadline passes
+- `rlm.set_cost_ceiling(cost_usd: float | None = None, *, spawn_limit: int | None = None) -> dict`: opt-in cap on the whole spawn tree's spend under this root session (the parent's own usage included); `None` keeps a dimension uncapped, passing both clears; while a USD ceiling is set, `rlm.spawn` refuses models with no catalog price and any refused spawn raises `RuntimeError` before the child starts; the ceilings and admission count persist across restarts; each child inherits what is left of the budget at spawn time and can tighten but never loosen it, so the cap covers the whole tree; returns the ledger snapshot `{cost_usd, spawns_admitted, ceiling_usd, spawn_limit, inherited}` (numbers; `inherited` is the budget this session got from its parent, or `None`)
 - `rlm.progress_note(message: str) -> dict`: report brief in-flight progress to the parent orchestrator (at most 512 characters, throttled to about one note per 10 seconds); the parent sees notes without needing a reply
 - `RLMSpawnHandle`
   - `rlm_child_id: str`
@@ -138,8 +139,10 @@ Memories are created by two mechanisms:
 
 prime-agent compacts automatically when there is only a given number of tokens left in the context window (default: 16384), when the user triggers compaction, or when the agent triggers compaction. REPL state persists across compactions, but compaction removes individual variables whose serialized form exceeds 16 MiB.
 
-- `compact.run(instructions: str | None = None) -> dict`: schedule a compaction at the next assistant turn boundary
-- `compact.status() -> dict`: context usage & threshold before auto-compaction
+- `compact.run(instructions: str | None = None, preserve: list[str] | None = None) -> dict`: schedule a compaction at the next assistant turn boundary; `preserve` names items kept verbatim in that one summary
+- `compact.carry(note: str) -> dict`: pin a short note that every compaction summary includes until removed
+- `compact.drop(index: int) -> dict`: remove a carried note by the index `compact.status()` prints
+- `compact.status() -> dict`: context usage, threshold before auto-compaction, and the carried notes with their drop indexes
 
 ## Goal
 

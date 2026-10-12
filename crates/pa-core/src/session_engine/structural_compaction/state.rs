@@ -11,8 +11,9 @@ use super::bounds::{one_line, Addressed, Excerpt, Line, Sample};
 use super::events::{BashOutcome, CellOutcome, CellStatus, Event, NoticeKind};
 
 /// Bumped whenever the saved shape or a fold rule changes: a state saved by
-/// another version is not folded further.
-pub(crate) const STATE_VERSION: u32 = 1;
+/// another version is not folded further (the previous summary is carried
+/// once as a labeled excerpt instead). Version 2 added `carried`.
+pub(crate) const STATE_VERSION: u32 = 2;
 
 const REQUESTS: usize = 24;
 const EXCHANGES: usize = 3;
@@ -169,6 +170,10 @@ pub(crate) struct State {
     pub(super) transcript_omitted: u64,
     pub(super) status: Status,
     pub(super) blocks: Sample<Block>,
+    /// The compaction carry-forward list: the latest carry row's items,
+    /// rendered into every summary until replaced or cleared.
+    #[serde(default)]
+    pub(super) carried: Vec<String>,
 }
 
 impl State {
@@ -271,7 +276,9 @@ impl State {
                     BashOutcome::Exited(0) => None,
                     BashOutcome::Exited(code) => Some(format!("exit {code}")),
                     BashOutcome::Cancelled => Some("cancelled".to_string()),
-                    BashOutcome::Failed => Some("failed to start".to_string()),
+                    // Neutral for both a spawn failure and a signal death:
+                    // the row records no exit code either way.
+                    BashOutcome::NoExitCode => Some("ended without an exit code".to_string()),
                 };
                 self.settle(&at, FailureKind::Command, subject, error);
             }
@@ -284,6 +291,7 @@ impl State {
                 self.child_ended(name, kind, detail.as_deref());
             }
             Event::Notice { kind, text } => self.notice(*kind, text),
+            Event::CarryItems { items } => self.carried.clone_from(items),
             Event::Custom { custom_type, text } => {
                 let at = self.address();
                 self.note(

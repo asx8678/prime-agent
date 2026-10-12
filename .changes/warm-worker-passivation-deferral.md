@@ -1,0 +1,1 @@
+- A worker whose cache is still being kept warm no longer parks itself mid-window when `idleEvictionMinutes` is set shorter than the warm window; the passivation resumes once the window ends.

@@ -265,6 +265,7 @@ pub fn build_prime_inference_models_with_minimum(
         let vision = entry.vision.unwrap_or(false)
             || template.is_some_and(|t| t.input.contains(&ModelInput::Image));
         models.push(Model {
+            prompt_cache: None,
             id: entry.id.clone(),
             name: entry
                 .name

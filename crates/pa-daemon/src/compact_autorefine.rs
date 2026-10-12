@@ -158,8 +158,13 @@ mod tests {
             .collect()
     }
 
-    /// The reserve headroom between one small turn's usage and a big crossing turn's (the
-    /// f14 battery shape): small turns stay below, big turns cross, environment-independently.
+    /// The baseline usage of one small turn, for sizing a crossing turn
+    /// against the threshold: the big turn must clear the combined-limit
+    /// ceiling `window - min(max_out, W/2) - min(reserve, W/4)` — with the
+    /// window-capped reservations, a reserve past a quarter window stops
+    /// lowering the threshold, so the crossing is sized in prompt tokens
+    /// (320k chars ~ 80k tokens) against the capped ceiling (79,616 at
+    /// 128k), environment-independent through the measured baseline.
     fn crossing_headroom() -> u64 {
         let (probe, _probe_dir) =
             faux_engine_with_settings(&json!({ "responses": [{"text": "seed reply"}] }), 1);
@@ -173,7 +178,7 @@ mod tests {
             })
             .expect("probe turn produced usage");
         drop(probe);
-        let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
+        let big_tokens = (320_000 + "seed turn  crossing".len() as u64).div_ceil(4);
         baseline + big_tokens / 2
     }
 
@@ -201,7 +206,7 @@ mod tests {
                 .max(1),
             true,
         );
-        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(320_000));
         let mut events: Vec<EngineEvent> = Vec::new();
         admit(&engine, "seed turn".to_string(), &mut events);
         admit(&engine, big_prompt, &mut events);
@@ -329,7 +334,7 @@ mod tests {
                 .max(1),
             false,
         );
-        let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
+        let big_prompt = format!("seed turn {} crossing", "x".repeat(320_000));
         let mut events: Vec<EngineEvent> = Vec::new();
         admit(&engine, "seed turn".to_string(), &mut events);
         admit(&engine, big_prompt, &mut events);

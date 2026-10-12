@@ -13,7 +13,8 @@ struct TabLayout {
 }
 
 /// The settings tabs: General (session behavior), Models (model-side choices), Display (what the UI
-/// renders), Editor (the input editor), Agents (the agent tree and its services).
+/// renders), Editor (the input editor), Agents (the agent tree and its services), Advanced (the
+/// Rust-only runtime features: cache warming, the compaction engine, auto-refine, the repeat guard).
 const TAB_LAYOUT: &[TabLayout] = &[
     TabLayout {
         name: "General",
@@ -56,6 +57,15 @@ const TAB_LAYOUT: &[TabLayout] = &[
             "builtin-skills",
             "idle-eviction-minutes",
             "tree-filter-mode",
+        ],
+    },
+    TabLayout {
+        name: "Advanced",
+        ids: &[
+            "cache-warming",
+            "compaction-engine",
+            "auto-refine",
+            "repeat-guard",
         ],
     },
 ];

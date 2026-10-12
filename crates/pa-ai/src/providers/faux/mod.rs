@@ -152,6 +152,9 @@ pub struct FauxProviderRegistration {
 struct FauxSharedState {
     call_count: Mutex<u64>,
     received_api_keys: Mutex<Vec<Option<String>>>,
+    /// The user-message texts of each request, per call, in order: compaction
+    /// arms assert on what reached the wire. Verification harness only.
+    received_user_texts: Mutex<Vec<Vec<String>>>,
     pending: Mutex<Vec<FauxResponseStep>>,
     prompt_cache: Mutex<HashMap<String, String>>,
     /// The last served step, recorded on every serve: an exhausted queue re-serves it in
@@ -221,6 +224,16 @@ impl FauxProviderRegistration {
     #[must_use]
     pub fn received_api_keys(&self) -> Vec<Option<String>> {
         self.state.received_api_keys.lock().unwrap().clone()
+    }
+
+    /// The user-message texts of each request, per call, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the recorded-texts `Mutex` is poisoned.
+    #[must_use]
+    pub fn received_user_texts(&self) -> Vec<Vec<String>> {
+        self.state.received_user_texts.lock().unwrap().clone()
     }
 
     /// Replace the queued responses.
@@ -733,6 +746,14 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
                 .lock()
                 .unwrap()
                 .push(options.and_then(|options| options.api_key.clone()));
+            self.state.received_user_texts.lock().unwrap().push(
+                context
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::User(_)))
+                    .map(message_to_text)
+                    .collect(),
+            );
 
             let state = self.state.clone();
             let api = self.api.clone();
@@ -875,6 +896,7 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
     let state = Arc::new(FauxSharedState {
         call_count: Mutex::new(0),
         received_api_keys: Mutex::new(Vec::new()),
+        received_user_texts: Mutex::new(Vec::new()),
         pending: Mutex::new(Vec::new()),
         prompt_cache: Mutex::new(HashMap::new()),
         ..Default::default()
@@ -895,6 +917,7 @@ pub fn register_faux_provider(options: RegisterFauxProviderOptions) -> FauxProvi
     let models: Vec<Model> = model_definitions
         .iter()
         .map(|definition| Model {
+            prompt_cache: None,
             id: definition.id.clone(),
             name: definition
                 .name

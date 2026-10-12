@@ -318,6 +318,7 @@ impl FactoryHost {
 /// mapping).
 fn agent_model_to_ai_model(model: &pa_agent::types::Model) -> AiModel {
     AiModel {
+        prompt_cache: None,
         id: model.id.clone(),
         name: model.name.clone(),
         api: model.api.clone(),

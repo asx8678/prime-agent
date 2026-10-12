@@ -383,3 +383,53 @@ fn can_passivate_worker_mirrors_the_release_gates_and_adds_the_registry_rule() {
         ));
     assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// A spawned child's create carries the parent tree's remaining budget
+/// (`runtimeMetadata.rlmCostCeiling` → the RLM identity); every session
+/// build adopts it, so the child's own spawns stay under the root's cap
+/// even after it tries to clear its own ceiling.
+#[test]
+fn a_child_session_build_enforces_the_inherited_cost_ceiling() {
+    // The faux provider is process-global: hold the shared lock so a
+    // parallel faux test never sees this engine's script.
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (engine, _dir) = faux_engine_with_settings(&json!({ "responses": [] }), 16_384);
+    let inherited = pa_core::session_engine::rlm_cost::InheritedCostCeiling {
+        cost_usd: Some(0.25),
+        spawn_limit: Some(0),
+    };
+    crate::engine::SessionEngine::configure_rlm_identity(
+        &engine,
+        crate::engine::RlmSessionIdentity {
+            rlm_depth: 1,
+            rlm_max_depth: None,
+            cwd: None,
+            session_id: None,
+            session_file: None,
+            thinking: None,
+            child_script: None,
+            semantic_spawn: None,
+            inherited_cost_ceiling: Some(inherited),
+        },
+    )
+    .unwrap();
+    let model = engine.resolve_model().unwrap();
+    engine.ensure_core_session(&model).unwrap();
+    let built = engine
+        .session
+        .blocking_lock()
+        .clone()
+        .expect("the session is built");
+    assert_eq!(
+        built.rlm_tree_cost.snapshot()["inherited"],
+        json!({ "cost_usd": 0.25, "spawn_limit": 0 })
+    );
+    built.rlm_tree_cost.set(None, None);
+    let refusal = built
+        .rlm_tree_cost
+        .check_spawn(None)
+        .expect_err("the inherited zero-spawn budget refuses");
+    assert!(refusal.contains("parent tree's remaining"), "{refusal}");
+}

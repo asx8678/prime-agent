@@ -184,6 +184,17 @@ pub struct KernelError {
     pub traceback: Vec<String>,
 }
 
+/// The artifacts holding the complete text of outputs that overflowed
+/// their per-cell budget (fabric `output-budget.ts`): each capped stream
+/// (and an oversized trailing result) spills to a private file the visible
+/// text links. `None` for an output that fit, or whose spill write failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpilledOutputs {
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub result: Option<String>,
+}
+
 /// Result of executing one cell.
 #[derive(Debug, Clone)]
 pub struct ExecuteResult {
@@ -204,6 +215,8 @@ pub struct ExecuteResult {
     pub status: ExecuteStatus,
     pub error: Option<KernelError>,
     pub duration_ms: u64,
+    /// Where the full text of each overflowing output lives.
+    pub spilled: SpilledOutputs,
 }
 
 /// Options for one `execute` call.

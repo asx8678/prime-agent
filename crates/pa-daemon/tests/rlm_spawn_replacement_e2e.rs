@@ -233,6 +233,7 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         decision_child: false,
         cell_source_code: None,
         spawned_by_request_id: None,
+        inherited_cost_ceiling: None,
     }
 }
 

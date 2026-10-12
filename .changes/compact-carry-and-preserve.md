@@ -1,0 +1,3 @@
+- `compact.carry(note)` pins a short note that every compaction summary includes in its own `[Carried notes]` block until `compact.drop(index)` removes it; the list lives in the session log, so it survives reloads, restarts, and compactions.
+- `compact.run(instructions=None, preserve=[...])` can name items kept verbatim in the next summary only.
+- `compact.status()` now reports the carried notes with their drop indexes.

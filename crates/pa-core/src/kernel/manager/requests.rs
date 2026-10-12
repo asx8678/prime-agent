@@ -1,6 +1,9 @@
 //! Request plumbing: enqueue/execute state machine, signal enum, and failure
 //! description helpers.
 
+use std::fmt::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
 use super::{
     anyhow, json, lock, merge_signals, oneshot, AbortSignal, ActiveExecution, Arc, AsyncWriteExt,
     Duration, ExecBuffers, ExecuteOptions, ExecuteResult, ExecuteStatus, Instant,
@@ -8,27 +11,119 @@ use super::{
     DEFAULT_MAX_OUTPUT_CHARS, KERNEL_ABORT_GRACE_MS,
 };
 
+use crate::tools::output_budget::{bound_stream_text, create_output_artifact};
+
 pub(crate) use crate::platform::process::Signal;
 
 /// Append stream text up to `max_chars` Unicode scalars, keeping the buffered count in sync.
+/// The full-stream artifact a truncated stream spills into (fabric
+/// `output-budget.ts`): created lazily on the first overflowing frame,
+/// seeded with everything captured so far, then appended per frame so
+/// memory stays bounded while the artifact holds the whole stream. The
+/// settle path reads the tail back and links the artifact in the visible
+/// text. All writes are best-effort: a failing disk never breaks the
+/// stream path, the text just loses its artifact link.
+pub(crate) struct StreamSpill {
+    file: std::fs::File,
+    path: String,
+    chars: usize,
+}
+
+impl StreamSpill {
+    /// The artifact holding the whole stream.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Seed the artifact with the full stream so far (the visible buffer
+    /// holds every fitting frame) plus the current frame's overflow.
+    fn create(head: &str, overflow: &str) -> Option<Self> {
+        let (file, path) = create_output_artifact().ok()?;
+        let mut spill = Self {
+            file,
+            path,
+            chars: 0,
+        };
+        spill.append(head);
+        spill.append(overflow);
+        Some(spill)
+    }
+
+    /// Append one frame; counts only characters that reached the file.
+    fn append(&mut self, text: &str) {
+        if !text.is_empty() && self.file.write_all(text.as_bytes()).is_ok() {
+            self.chars += text.chars().count();
+        }
+    }
+
+    /// Read the last `bytes` bytes back, trimmed to a character boundary
+    /// at the front (the settle path passes the result as the tail chunk
+    /// to [`bound_stream_text`]).
+    fn read_tail(&mut self, bytes: usize) -> String {
+        let Ok(position) = self.file.stream_position() else {
+            return String::new();
+        };
+        let start = position.saturating_sub(u64::try_from(bytes).unwrap_or(u64::MAX));
+        if self.file.seek(SeekFrom::Start(start)).is_err() {
+            return String::new();
+        }
+        let mut raw = Vec::new();
+        // The spill file is append-only and the offset was at EOF, so
+        // reading to the end yields exactly the tail chunk.
+        if self.file.read_to_end(&mut raw).is_err() {
+            return String::new();
+        }
+        let valid = match std::str::from_utf8(&raw) {
+            Ok(text) => text,
+            Err(error) if error.valid_up_to() > 0 => {
+                std::str::from_utf8(&raw[..error.valid_up_to()]).unwrap_or_default()
+            }
+            Err(_) => "",
+        };
+        valid.to_string()
+    }
+}
+
+/// Whether [`append_truncated`] spills a capped stream's full content to
+/// an artifact: `Spilling` for the model-visible stdout/stderr streams,
+/// `Fixed` for the background-output buckets, which keep today's
+/// head-only truncation.
+pub(crate) enum StreamSpillSlot<'a> {
+    Spilling(&'a mut Option<StreamSpill>),
+    Fixed,
+}
+
 pub(crate) fn append_truncated(
     buffer: &mut String,
     truncated: &mut bool,
     chars: &mut usize,
     text: &str,
     max_chars: usize,
+    spill: StreamSpillSlot<'_>,
 ) {
+    let mut slot = match spill {
+        StreamSpillSlot::Spilling(slot) => Some(slot),
+        StreamSpillSlot::Fixed => None,
+    };
     if *chars >= max_chars {
         if !text.is_empty() {
             // The buffer filled exactly on an earlier frame; the dropped
             // remainder still counts as truncation.
             *truncated = true;
         }
+        if let Some(spill) = slot.as_mut().and_then(|slot| slot.as_mut()) {
+            spill.append(text);
+        }
         return;
     }
     let remaining = max_chars - *chars;
     let text_chars = text.chars().count();
     if text_chars <= remaining {
+        if let Some(spill) = slot.as_mut().and_then(|slot| slot.as_mut()) {
+            // The spill was seeded with everything before its creation, so
+            // every later frame — fitting or not — belongs to it too.
+            spill.append(text);
+        }
         buffer.push_str(text);
         *chars += text_chars;
     } else {
@@ -36,10 +131,44 @@ pub(crate) fn append_truncated(
             .char_indices()
             .nth(remaining)
             .map_or(text.len(), |(i, _)| i);
-        buffer.push_str(&text[..end]);
+        if let Some(spill) = slot.as_mut().and_then(|slot| slot.as_mut()) {
+            spill.append(text);
+        } else {
+            // First overflow: the artifact seeds from the visible
+            // buffer (which holds every fitting frame so far) plus
+            // this frame's fitting prefix and overflow. `Fixed`
+            // streams never reach this creation.
+            let mut head = std::mem::take(buffer);
+            head.push_str(&text[..end]);
+            if let Some(slot) = slot.as_mut() {
+                if let Some(spill) = StreamSpill::create(&head, &text[end..]) {
+                    **slot = Some(spill);
+                }
+            }
+            *buffer = head;
+        }
         *chars = max_chars;
         *truncated = true;
     }
+}
+
+/// Finish a truncated stream's visible text: keep the captured head,
+/// read the tail back from the spill artifact, and fit head, omission
+/// marker, tail, and the artifact link within `max_chars` (fabric
+/// `output-budget.ts`). Falls back to the plain truncation marker when
+/// the artifact never got created (a full disk).
+pub(crate) fn finish_stream_with_spill(
+    head: String,
+    spill: Option<StreamSpill>,
+    max_chars: usize,
+) -> String {
+    let Some(mut spill) = spill else {
+        let mut text = head;
+        let _ = write!(text, "\n[... output truncated at {max_chars} chars ...]");
+        return text;
+    };
+    let tail = spill.read_tail(max_chars / 2 + 256);
+    bound_stream_text(&head, &tail, spill.chars, &spill.path, max_chars)
 }
 
 pub(crate) fn describe_failure(result: &ExecuteResult) -> String {
@@ -332,7 +461,85 @@ impl ReplKernelManager {
 
 #[cfg(test)]
 mod tests {
-    use super::append_truncated;
+    use super::{append_truncated, finish_stream_with_spill, StreamSpillSlot};
+
+    #[test]
+    fn a_stream_over_the_cap_keeps_its_last_line_and_spills_the_full_stream() {
+        // The plan's verifier (a): frames totalling well over the per-stream
+        // cap still leave the model the stream's head, its last line, and a
+        // link to an artifact holding the whole stream.
+        let cap = 256;
+        let mut buffer = String::new();
+        let mut truncated = false;
+        let mut chars = 0;
+        let mut spill = None;
+        for frame in [
+            format!("{}\n", "a".repeat(200)),
+            format!("{}\n", "b".repeat(200)),
+            format!("{}\nthe last line survives", "c".repeat(200)),
+        ] {
+            append_truncated(
+                &mut buffer,
+                &mut truncated,
+                &mut chars,
+                &frame,
+                cap,
+                StreamSpillSlot::Spilling(&mut spill),
+            );
+        }
+        assert!(truncated);
+        let artifact_path = spill
+            .as_ref()
+            .expect("the overflow created the spill artifact")
+            .path
+            .clone();
+        let visible = finish_stream_with_spill(buffer, spill, cap);
+        assert!(visible.chars().count() <= cap);
+        assert!(visible.contains("aaaaa"), "the head is kept");
+        assert!(visible.contains("the last line survives"));
+        assert!(visible.ends_with(&format!(
+            "[Full output (625 chars) saved to: {artifact_path}]"
+        )));
+        assert!(visible.contains("characters omitted by Prime Agent"));
+        // The artifact holds the full stream, byte for byte.
+        let persisted = std::fs::read_to_string(&artifact_path).expect("read the artifact");
+        assert_eq!(persisted.chars().count(), 625);
+        assert!(persisted.starts_with("aaaa"));
+        assert!(persisted.ends_with("the last line survives"));
+        std::fs::remove_file(&artifact_path).ok();
+        std::fs::remove_dir(std::path::Path::new(&artifact_path).parent().expect("dir")).ok();
+    }
+
+    #[test]
+    fn fixed_streams_keep_head_only_truncation_and_never_spill() {
+        let cap = 4;
+        let mut buffer = String::new();
+        let mut truncated = false;
+        let mut chars = 0;
+        append_truncated(
+            &mut buffer,
+            &mut truncated,
+            &mut chars,
+            "abcdef",
+            cap,
+            StreamSpillSlot::Fixed,
+        );
+        append_truncated(
+            &mut buffer,
+            &mut truncated,
+            &mut chars,
+            "gh",
+            cap,
+            StreamSpillSlot::Fixed,
+        );
+        assert_eq!(buffer, "abcd");
+        assert_eq!(chars, 4);
+        assert!(truncated);
+        assert_eq!(
+            finish_stream_with_spill(buffer, None, cap),
+            "abcd\n[... output truncated at 4 chars ...]"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -466,7 +673,14 @@ for line in sys.stdin:
             let mut expected = String::new();
             let mut expected_truncated = false;
             for text in frames {
-                append_truncated(&mut actual, &mut truncated, &mut count, text, cap);
+                append_truncated(
+                    &mut actual,
+                    &mut truncated,
+                    &mut count,
+                    text,
+                    cap,
+                    StreamSpillSlot::Fixed,
+                );
                 if expected.chars().count() < cap {
                     expected.push_str(text);
                     if expected.chars().count() > cap {
@@ -497,7 +711,14 @@ for line in sys.stdin:
         let mut buffer = String::from("abcd");
         let mut truncated = false;
         let mut count = 4;
-        append_truncated(&mut buffer, &mut truncated, &mut count, "ef", 4);
+        append_truncated(
+            &mut buffer,
+            &mut truncated,
+            &mut count,
+            "ef",
+            4,
+            StreamSpillSlot::Fixed,
+        );
         assert!(truncated);
         assert_eq!(buffer, "abcd");
         assert_eq!(count, 4);
@@ -506,7 +727,14 @@ for line in sys.stdin:
         let mut empty = String::new();
         let mut never = false;
         let mut zero = 0;
-        append_truncated(&mut empty, &mut never, &mut zero, "", 4);
+        append_truncated(
+            &mut empty,
+            &mut never,
+            &mut zero,
+            "",
+            4,
+            StreamSpillSlot::Fixed,
+        );
         assert!(!never);
     }
 }

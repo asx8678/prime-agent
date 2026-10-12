@@ -88,6 +88,15 @@ fn tabs_partition_the_settings_rows() {
                     "tree-filter-mode"
                 ]
             ),
+            (
+                "Advanced",
+                vec![
+                    "cache-warming",
+                    "compaction-engine",
+                    "auto-refine",
+                    "repeat-guard"
+                ]
+            ),
         ]
     );
     let grouped: usize = menu.tabs.iter().map(|tab| tab.rows.len()).sum();
@@ -148,7 +157,7 @@ fn enter_opens_the_thinking_submenu_and_selection_applies() {
     );
     let text = render_text(&menu);
     assert!(text.iter().any(|row| {
-        row.contains("Type to search · Tab/1-5 tabs · ←/→/Enter/Space change · Esc close")
+        row.contains("Type to search · Tab/1-6 tabs · ←/→/Enter/Space change · Esc close")
     }));
 }
 
@@ -298,6 +307,10 @@ fn arrows_cycle_values_and_the_tab_keys_switch_tabs() {
     assert!(render_text(&menu)
         .iter()
         .any(|row| row.contains("Skill commands")));
+    menu.handle_key("tab", &kb());
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Cache warming")));
     menu.handle_key("tab", &kb());
     assert!(render_text(&menu)
         .iter()
@@ -472,7 +485,7 @@ fn the_strip_lists_the_tabs_and_marks_the_active_one() {
     let text: String = lines[4].iter().map(|span| span.content.as_str()).collect();
     assert_eq!(
         text,
-        "  1 General    2 Models    3 Display    4 Editor    5 Agents"
+        "  1 General    2 Models    3 Display    4 Editor    5 Agents    6 Advanced"
     );
     let strip_blank_below: String = lines[5].iter().map(|span| span.content.as_str()).collect();
     assert_eq!(strip_blank_below, "");
@@ -507,7 +520,7 @@ fn the_header_and_the_settings_list_breathe_apart() {
     assert_eq!(text[3], "");
     assert_eq!(
         text[4],
-        "  1 General    2 Models    3 Display    4 Editor    5 Agents"
+        "  1 General    2 Models    3 Display    4 Editor    5 Agents    6 Advanced"
     );
     assert_eq!(text[5], "");
     assert!(text[6].starts_with("\u{203a} Auto-compact"));
@@ -521,7 +534,7 @@ fn render_shows_value_and_selected_description() {
         .iter()
         .any(|row| row.contains("Automatically compact context when it gets too large")));
     assert!(text.iter().any(|row| {
-        row.contains("Type to search · Tab/1-5 tabs · ←/→/Enter/Space change · Esc close")
+        row.contains("Type to search · Tab/1-6 tabs · ←/→/Enter/Space change · Esc close")
     }));
     let selected = text
         .iter()

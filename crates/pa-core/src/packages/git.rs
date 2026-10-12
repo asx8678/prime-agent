@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use super::npm;
 use super::process::{run_command, run_command_capture};
-use super::source::{GitSource, SourceScope};
+use super::source::{lexical_resolve, GitSource, SourceScope};
 use super::NETWORK_TIMEOUT_MS;
 
 pub fn git_install_path(
@@ -39,6 +39,41 @@ pub fn git_install_root(scope: SourceScope, cwd: &Path, agent_dir: &Path) -> Opt
     }
 }
 
+/// The trusted install root a git target must stay inside. Unlike
+/// [`git_install_path`], this never joins source-controlled components, so a
+/// crafted host or path cannot move it: temporary installs share one
+/// resolve-only root, and project/user installs root at the scope's git
+/// directory.
+fn git_containment_root(scope: SourceScope, cwd: &Path, agent_dir: &Path) -> PathBuf {
+    match scope {
+        SourceScope::Temporary => super::temporary_root(),
+        SourceScope::Project => cwd.join(super::CONFIG_DIR_NAME).join("git"),
+        SourceScope::User => agent_dir.join("git"),
+    }
+}
+
+/// Lexically resolve a git target and reject anything escaping the scope's
+/// install root: every destructive git operation (mkdir, clone, reset/clean,
+/// `remove_dir_all`) runs only on a contained path, and a `GitSource` built
+/// without the parser is contained the same way.
+fn contained_git_target(
+    source: &GitSource,
+    scope: SourceScope,
+    cwd: &Path,
+    agent_dir: &Path,
+) -> Result<PathBuf> {
+    let root = git_containment_root(scope, cwd, agent_dir);
+    let target = git_install_path(source, scope, cwd, agent_dir);
+    let resolved = lexical_resolve(Path::new("/"), &target.display().to_string());
+    anyhow::ensure!(
+        resolved.starts_with(&root),
+        "git package path escapes the install root: {} is outside {}",
+        resolved.display(),
+        root.display()
+    );
+    Ok(target)
+}
+
 /// Clone the package repo and install its npm dependencies when present.
 pub fn install_git(
     source: &GitSource,
@@ -47,7 +82,7 @@ pub fn install_git(
     agent_dir: &Path,
     npm_command: Option<&Vec<String>>,
 ) -> Result<()> {
-    let target_dir = git_install_path(source, scope, cwd, agent_dir);
+    let target_dir = contained_git_target(source, scope, cwd, agent_dir)?;
     if target_dir.exists() {
         return Ok(());
     }
@@ -161,7 +196,7 @@ pub fn update_git(
     agent_dir: &Path,
     npm_command: Option<&Vec<String>>,
 ) -> Result<()> {
-    let target_dir = git_install_path(source, scope, cwd, agent_dir);
+    let target_dir = contained_git_target(source, scope, cwd, agent_dir)?;
     if !target_dir.exists() {
         return install_git(source, scope, cwd, agent_dir, npm_command);
     }
@@ -307,7 +342,7 @@ pub fn remove_git(
     cwd: &Path,
     agent_dir: &Path,
 ) -> Result<()> {
-    let target_dir = git_install_path(source, scope, cwd, agent_dir);
+    let target_dir = contained_git_target(source, scope, cwd, agent_dir)?;
     if !target_dir.exists() {
         return Ok(());
     }

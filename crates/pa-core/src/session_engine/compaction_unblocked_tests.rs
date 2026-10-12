@@ -130,7 +130,7 @@ fn spawn_compact(
 ) -> tokio::task::JoinHandle<anyhow::Result<CompactOutcome>> {
     let engine = Arc::clone(engine);
     let model = model.clone();
-    tokio::spawn(async move { engine.compact(None, &model, None, None).await })
+    tokio::spawn(async move { engine.compact(None, &[], &model, None, None).await })
 }
 
 /// A mid-window write is durable in the session file right away, visible

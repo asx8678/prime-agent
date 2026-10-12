@@ -23,6 +23,7 @@ fn glm_53_flash(base_url: &str) -> Model {
         "supportsStrictMode": false,
     });
     Model {
+        prompt_cache: None,
         id: "z-ai/glm-5.3-flash".into(),
         name: "GLM 5.3 Flash".into(),
         api: "openai-completions".into(),

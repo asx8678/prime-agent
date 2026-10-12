@@ -10,7 +10,9 @@ use anyhow::{bail, Result};
 use super::git;
 use super::npm;
 pub use super::source::UserOrProject;
-use super::source::{parse_source, GitSource, NpmSource, ParsedSource, SourceScope};
+use super::source::{
+    parse_installable_source, parse_source, GitSource, NpmSource, ParsedSource, SourceScope,
+};
 use crate::settings::SettingsManager;
 
 /// Progress actions reported to the callback.
@@ -247,7 +249,7 @@ impl PackageManager {
     ///
     /// Error when the npm or git install fails, or a local source path does not exist.
     pub fn install(&mut self, source: &str, scope: UserOrProject) -> Result<()> {
-        let parsed = parse_source(source);
+        let parsed = parse_installable_source(source)?;
         self.with_progress(
             ProgressAction::Install,
             source,
@@ -276,7 +278,7 @@ impl PackageManager {
     ///
     /// Error when the npm uninstall or git removal fails; local sources always succeed.
     pub fn remove(&mut self, source: &str, scope: UserOrProject) -> Result<()> {
-        let parsed = parse_source(source);
+        let parsed = parse_installable_source(source)?;
         self.with_progress(
             ProgressAction::Remove,
             source,

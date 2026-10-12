@@ -105,6 +105,7 @@ async fn faux_engine_with_telemetry(
         .expect("a session manager");
     let engine = create_session(SessionEngineConfig {
         on_late_sent_agent_message: None,
+        cache_warm_arm: None,
         semantic_edges: None,
         cron_store: None,
         steering_mode: None,
@@ -135,6 +136,7 @@ async fn faux_engine_with_telemetry(
         on_background_work_settled: None,
         queued_goal_context_purge: None,
         queued_steering_probe: None,
+        inherited_cost_ceiling: None,
     })
     .await
     .expect("the faux session assembles");
@@ -654,7 +656,7 @@ async fn requested_compaction_streams_the_ts_event_pair() {
     // threshold never re-evaluates).
     engine
         .turn_boundary
-        .schedule_compaction(Some("focus on the goal".to_string()))
+        .schedule_compaction(Some("focus on the goal".to_string()), None)
         .await;
     admit_turn_with_scheduled_request(
         &mut boundary,
@@ -722,7 +724,7 @@ async fn requested_compaction_skip_streams_the_warning_row_and_end_event() {
     .await;
     let (sink, events) = capture_sink();
     let mut boundary = TurnBoundary::with_sink(true, sink);
-    engine.turn_boundary.schedule_compaction(None).await;
+    engine.turn_boundary.schedule_compaction(None, None).await;
     admit_turn_with_scheduled_request(&mut boundary, &engine, &model, "seed turn".to_string())
         .await
         .unwrap();
@@ -775,7 +777,7 @@ async fn requested_compaction_counts_into_the_run_telemetry() {
     )
     .await
     .unwrap();
-    engine.turn_boundary.schedule_compaction(None).await;
+    engine.turn_boundary.schedule_compaction(None, None).await;
     admit_turn_with_scheduled_request(
         &mut boundary,
         &engine,
@@ -821,7 +823,7 @@ async fn deterministic_compaction_makes_no_model_call_and_counts_into_the_sessio
     )
     .await
     .unwrap();
-    engine.turn_boundary.schedule_compaction(None).await;
+    engine.turn_boundary.schedule_compaction(None, None).await;
     admit_turn_with_scheduled_request(
         &mut boundary,
         &engine,
@@ -882,10 +884,11 @@ async fn threshold_compaction_counts_into_the_run_telemetry() {
         .expect("probe turn produced usage");
     drop(probe);
 
-    // The crossing prompt adds ~12k tokens; the headroom sits halfway.
-    let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
-    let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
-    let headroom = baseline + big_tokens / 2;
+    // The window-capped reservations cap a deliberately huge reserve at
+    // W/4 (32_000), so the combined threshold sits at
+    // 128_000 - FAUX_REQUEST_BUDGET - 32_000 = 79_616: the ~82k-token
+    // crossing prompt clears it while the seed turn stays far below.
+    let big_prompt = format!("seed turn {} crossing", "x".repeat(330_000));
     let (engine, _dir, model, mock) = faux_engine_with_mock_telemetry(
         json!({
             "responses": [
@@ -898,7 +901,7 @@ async fn threshold_compaction_counts_into_the_run_telemetry() {
             "compaction": {
                 "engine": "llm",
                 "enabled": true,
-                "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
+                "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + baseline).max(1),
                 "keepRecentTokens": 10
             }
         }),
@@ -958,9 +961,11 @@ async fn multi_compaction_run_counts_every_arm() {
         .expect("probe turn produced usage");
     drop(probe);
 
-    let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
-    let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
-    let headroom = baseline + big_tokens / 2;
+    // The window-capped reservations cap a deliberately huge reserve at
+    // W/4 (32_000), so the combined threshold sits at
+    // 128_000 - FAUX_REQUEST_BUDGET - 32_000 = 79_616: the ~82k-token
+    // crossing prompt clears it while the earlier turns stay far below.
+    let big_prompt = format!("seed turn {} crossing", "x".repeat(330_000));
     let (engine, _dir, model, mock) = faux_engine_with_mock_telemetry(
         json!({
             "responses": [
@@ -975,7 +980,7 @@ async fn multi_compaction_run_counts_every_arm() {
             "compaction": {
                 "engine": "llm",
                 "enabled": true,
-                "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
+                "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + baseline).max(1),
                 "keepRecentTokens": 10
             },
             "autoRefine": { "enabled": false }
@@ -988,7 +993,7 @@ async fn multi_compaction_run_counts_every_arm() {
         .unwrap();
     // Run 2: the requested compaction at the settled boundary (the
     // request consumes the check, so the threshold never fires).
-    engine.turn_boundary.schedule_compaction(None).await;
+    engine.turn_boundary.schedule_compaction(None, None).await;
     admit_turn_with_scheduled_request(
         &mut boundary,
         &engine,
@@ -1047,15 +1052,16 @@ async fn threshold_compaction_streams_the_ts_event_pair() {
         .expect("probe turn produced usage");
     assert!(baseline < 100_000, "implausible baseline: {baseline}");
 
-    // The crossing prompt adds ~12k tokens; the headroom sits halfway.
-    let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
-    let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
-    let headroom = baseline + big_tokens / 2;
+    // The window-capped reservations cap a deliberately huge reserve at
+    // W/4 (32_000), so the combined threshold sits at
+    // 128_000 - FAUX_REQUEST_BUDGET - 32_000 = 79_616: the ~82k-token
+    // crossing prompt clears it while the seed turn stays far below.
+    let big_prompt = format!("seed turn {} crossing", "x".repeat(330_000));
     let settings = json!({
         "compaction": {
             "engine": "llm",
             "enabled": true,
-            "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + headroom).max(1),
+            "reserveTokens": 128_000u64.saturating_sub(FAUX_REQUEST_BUDGET + baseline).max(1),
             "keepRecentTokens": 10,
         }
     });
@@ -1153,7 +1159,7 @@ async fn pre_turn_check_consumes_a_pending_request_before_the_prompt() {
     // A pending request consumes at the next prompt's pre-turn check.
     engine
         .turn_boundary
-        .schedule_compaction(Some("focus on the goal".to_string()))
+        .schedule_compaction(Some("focus on the goal".to_string()), None)
         .await;
     events.lock().unwrap().clear();
     boundary.run_pre_turn(&engine, &model, None).await.unwrap();
@@ -1322,7 +1328,7 @@ async fn pre_turn_abort_arm_drops_pending_requests_and_continues() {
     assert_eq!(last.stop_reason, pa_types::ai::StopReason::Aborted);
     engine
         .turn_boundary
-        .schedule_compaction(Some("stale request".to_string()))
+        .schedule_compaction(Some("stale request".to_string()), None)
         .await;
     engine
         .turn_boundary
@@ -1485,7 +1491,7 @@ async fn compact_trigger_auto_refine_streams_at_the_next_boundary() {
     .unwrap();
     // A requested compaction: the trigger is scheduled with no further
     // turn to consume it here.
-    engine.turn_boundary.schedule_compaction(None).await;
+    engine.turn_boundary.schedule_compaction(None, None).await;
     admit_turn_with_scheduled_request(
         &mut boundary,
         &engine,
@@ -1641,7 +1647,7 @@ async fn compact_trigger_drains_at_disposal_off_the_stream() {
     )
     .await
     .unwrap();
-    engine.turn_boundary.schedule_compaction(None).await;
+    engine.turn_boundary.schedule_compaction(None, None).await;
     admit_turn_with_scheduled_request(
         &mut boundary,
         &engine,
@@ -1708,7 +1714,7 @@ async fn auto_refine_review_decline_surfaces_nothing() {
     )
     .await
     .unwrap();
-    engine.turn_boundary.schedule_compaction(None).await;
+    engine.turn_boundary.schedule_compaction(None, None).await;
     admit_turn_with_scheduled_request(
         &mut boundary,
         &engine,
@@ -1776,7 +1782,7 @@ async fn auto_refine_disabled_settings_drop_the_trigger() {
     )
     .await
     .unwrap();
-    engine.turn_boundary.schedule_compaction(None).await;
+    engine.turn_boundary.schedule_compaction(None, None).await;
     admit_turn_with_scheduled_request(
         &mut boundary,
         &engine,

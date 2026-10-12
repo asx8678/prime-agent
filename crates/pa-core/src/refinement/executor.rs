@@ -660,6 +660,7 @@ mod tests {
 
     fn test_model() -> pa_types::ai::Model {
         pa_types::ai::Model {
+            prompt_cache: None,
             id: "test".to_string(),
             name: "test".to_string(),
             api: "openai-completions".to_string(),

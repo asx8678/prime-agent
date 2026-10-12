@@ -307,6 +307,30 @@ impl pa_tui::client_settings::ClientSettings for StubSettings {
     fn set_tree_filter_mode(&self, _mode: &str) -> Result<()> {
         Ok(())
     }
+    fn cache_warming_mode(&self) -> String {
+        "off".to_string()
+    }
+    fn set_cache_warming_mode(&self, _mode: &str) -> Result<()> {
+        Ok(())
+    }
+    fn repeat_guard_enabled(&self) -> bool {
+        true
+    }
+    fn set_repeat_guard_enabled(&self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+    fn auto_refine_enabled(&self) -> bool {
+        true
+    }
+    fn set_auto_refine_enabled(&self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+    fn compaction_engine(&self) -> String {
+        "deterministic".to_string()
+    }
+    fn set_compaction_engine(&self, _engine: &str) -> Result<()> {
+        Ok(())
+    }
     fn default_service_tier(&self) -> String {
         "default".to_string()
     }

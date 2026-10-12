@@ -556,6 +556,13 @@ async fn golden_ipython_group_matches_ts() {
                 None
             },
             on_late_sent_agent_message: None,
+            // The golden replay reproduces captured behavior: the guard
+            // and the budget bounds did not exist when the corpus was
+            // recorded.
+            repeat_guard: None,
+            on_repeat_guard_triggered: None,
+            on_cell_failure_note: None,
+            on_output_budget_spill: None,
         };
         let result = ipython::execute_ipython(
             &options,
@@ -624,6 +631,13 @@ fn golden_schema_group_matches_ts() {
                 "/tmp",
                 IpythonToolOptions {
                     on_late_sent_agent_message: None,
+                    // The golden replay reproduces captured behavior: the
+                    // guard and the budget bounds did not exist when the
+                    // corpus was recorded.
+                    repeat_guard: None,
+                    on_repeat_guard_triggered: None,
+                    on_cell_failure_note: None,
+                    on_output_budget_spill: None,
                     provisioner: Arc::new(MockProvisioner {
                         kernel: Arc::new(MockKernel {
                             executions: Mutex::new(Vec::new()),

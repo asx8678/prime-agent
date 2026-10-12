@@ -177,6 +177,7 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
     let engine = create_session(SessionEngineConfig {
         on_late_sent_agent_message: None,
         semantic_edges: None,
+        cache_warm_arm: None,
         cron_store: None,
         queued_steering_probe: None,
         image_model_router: None,
@@ -206,6 +207,7 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
         prewarm_ipython_kernel: None,
         on_background_work_settled: None,
         queued_goal_context_purge: None,
+        inherited_cost_ceiling: None,
     })
     .await
     .expect("create_session");

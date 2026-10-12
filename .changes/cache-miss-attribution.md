@@ -1,0 +1,1 @@
+- Session telemetry attributes prompt-cache misses: `cache_miss_prefix_changed_count` (model, tools or system prompt changed), `cache_miss_ttl_gap_count` (idle past the cache lifetime, which follows the model and the request's retention), `cache_miss_noise_count`, `cache_miss_unattributed_count`, and `cache_missed_tokens`. Only counts and hashes are recorded, never content.

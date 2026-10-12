@@ -152,6 +152,11 @@ pub struct RlmSpawnRequest {
     /// `spawnedByRequestId`): `None` for a spawn outside an active run.
     pub spawned_by_request_id: Option<String>,
     pub cell_source_code: Option<String>,
+    /// The budget the child inherits from this session's cost ceilings
+    /// (`rlm.set_cost_ceiling`, or the budget this session inherited
+    /// itself): `None` when no ceiling applies. The host hands it to the
+    /// child's create so the cap covers the whole spawn tree.
+    pub inherited_cost_ceiling: Option<super::rlm_cost::InheritedCostCeiling>,
 }
 
 /// Validated `rlm.create_session` request handed to the host.
@@ -340,6 +345,10 @@ pub struct RlmHostBridge {
     /// The child-usage attribution producer `rlm.spawn` registers into
     /// and the daemon's child observation drives.
     pub usage: Arc<super::rlm_usage::RlmChildUsageAttributions>,
+    /// The tree cost ceiling's ledger (PR-11): `rlm.set_cost_ceiling`
+    /// writes it, the spawn gate reads it, the parent's assistant usage
+    /// and every folded child attribution feed it.
+    pub tree_cost: Arc<super::rlm_cost::RlmTreeCost>,
     /// The spawn anchor [`register_run`] reads the in-flight turn from
     /// (`None` until the engine built the session's agent).
     pub(crate) semantic_spawn: std::sync::OnceLock<SemanticSpawnAnchor>,
@@ -359,8 +368,36 @@ impl RlmHostBridge {
             notes: Arc::new(RlmProgressNotes::default()),
             host,
             usage,
+            tree_cost: super::rlm_cost::RlmTreeCost::new(),
             semantic_spawn: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Whether the catalog prices `provider/id` at all (any nonzero
+    /// rate): an unpriced model under a USD ceiling never trips it, so
+    /// PR-11's ruling refuses spawning one when a ceiling is set. `None`
+    /// for an unresolvable selector — never a false refusal.
+    #[must_use]
+    pub fn model_is_priced(&self, selector: &str) -> Option<bool> {
+        let (provider, id) = selector.split_once('/')?;
+        let model = self
+            .registry
+            .get_available()
+            .into_iter()
+            .find(|model| model.provider == provider && model.id == id)?;
+        let cost = &model.cost;
+        Some(
+            cost.input.as_f64() > 0.0
+                || cost.output.as_f64() > 0.0
+                || cost.cache_read.as_f64() > 0.0
+                || cost.cache_write.as_f64() > 0.0,
+        )
+    }
+
+    /// Record the parent model's priced-ness for inherited-model spawns
+    /// (the engine resolves it from the catalog at build).
+    pub fn set_parent_model_priced(&self, priced: bool) {
+        self.tree_cost.set_parent_model_priced(priced);
     }
 }
 
@@ -368,6 +405,7 @@ impl RlmHostBridge {
 pub fn register_rlm_host_handlers(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
     register_find_models(handlers, bridge);
     register_progress_note(handlers, bridge);
+    register_set_cost_ceiling(handlers, bridge);
     register_run(handlers, bridge);
     register_create_session(handlers, bridge);
     register_list_subagents(handlers, bridge);
@@ -454,6 +492,56 @@ fn register_progress_note(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHo
     );
 }
 
+/// `rlm.set_cost_ceiling`: set (or clear) this session tree's ceilings
+/// and answer the ledger snapshot. Direct payload keys, like
+/// `rlm.progress.note`'s `message` — not spawn kwargs.
+fn register_set_cost_ceiling(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
+    let tree_cost = Arc::clone(&bridge.tree_cost);
+    let session = Arc::clone(bridge.usage.session());
+    handlers.register(
+        "rlm.set_cost_ceiling",
+        host_handler(move |payload| {
+            let tree_cost = Arc::clone(&tree_cost);
+            let session = Arc::clone(&session);
+            Box::pin(async move {
+                const OPERATION: &str = "rlm.set_cost_ceiling";
+                let data = &payload.data;
+                let cost_usd = match data.get("cost_usd") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => {
+                        let cost = value
+                            .as_f64()
+                            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "{OPERATION} cost_usd must be a non-negative number or null"
+                                )
+                            })?;
+                        Some(cost)
+                    }
+                };
+                let spawn_limit = match data.get("spawn_limit") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => {
+                        let limit =
+                            value.as_u64().filter(|limit| *limit >= 1).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "{OPERATION} spawn_limit must be a positive integer or null"
+                                )
+                            })?;
+                        Some(limit)
+                    }
+                };
+                tree_cost.set(cost_usd, spawn_limit);
+                // Durable: a restart or reattach restores the ceilings
+                // instead of silently uncapping the tree.
+                tree_cost.persist(&mut *session.lock().await)?;
+                Ok(tree_cost.snapshot())
+            })
+        }),
+    );
+}
+
 fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
     let bridge = Arc::clone(bridge);
     handlers.register(
@@ -467,6 +555,20 @@ fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>)
                 };
                 let mut request = spawn_request_from_payload(prompt, data)?;
                 request.cell_source_code = payload.cell_source_code.clone();
+                // The tree cost ceiling (PR-11): refuse BEFORE the child
+                // starts. Parallel spawns in one cell all pass this check
+                // together, so the overshoot is bounded only by the
+                // children already running (the ruling's accepted bound).
+                let model_priced = match &request.model {
+                    Some(selector) => bridge.model_is_priced(selector),
+                    None => Some(bridge.tree_cost.parent_model_priced()),
+                };
+                if let Err(reason) = bridge.tree_cost.check_spawn(model_priced) {
+                    anyhow::bail!("{reason}");
+                }
+                // The child inherits what is left of this tree's budget,
+                // so the ceiling also caps the child's own spawns.
+                request.inherited_cost_ceiling = bridge.tree_cost.for_child();
                 // TS `_startRlmChildRun`: the spawning request is the turn
                 // whose tool call is executing now (the anchor is computed
                 // before the spawn admission's first await); a spawn
@@ -485,6 +587,15 @@ fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>)
                     None => None,
                 };
                 let handle = bridge.host.spawn(request).await?;
+                // Admitted: count it against the tree's spawn limit now,
+                // durably while a ceiling is set (a restart must not
+                // re-open the limit).
+                bridge.tree_cost.note_spawn_admitted();
+                if bridge.tree_cost.has_ceiling() {
+                    bridge
+                        .tree_cost
+                        .persist(&mut *bridge.usage.session().lock().await)?;
+                }
                 // TS `_findLastAssistantMessage` at spawn: the spawning
                 // assistant row (persisted at `message_end` before tool
                 // execution) is the target every child-usage attribution
@@ -530,6 +641,7 @@ fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmS
         decision_child,
         spawned_by_request_id: None,
         cell_source_code: None,
+        inherited_cost_ceiling: None,
     })
 }
 
@@ -1097,6 +1209,77 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "rlm.progress.note message must be at most 512 characters"
+        );
+    }
+
+    /// The ceilings and the admission count survive a rebuild: each
+    /// `set_cost_ceiling` and each admission under a ceiling persists a
+    /// row (mirrored to the persistence owner), and a fresh ledger
+    /// restored from the session rows refuses exactly where the live one
+    /// would.
+    #[tokio::test]
+    async fn the_cost_ceiling_persists_across_a_rebuild() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host = RecordingHost::new();
+        let spawn_requests = Arc::clone(&host.spawn_requests);
+        let wiring = wired(dir.path(), Some(host));
+        let mirrored: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let mirror = Arc::clone(&mirrored);
+        wiring.rlm.tree_cost.set_row_sink(Arc::new(move |row| {
+            mirror.lock().unwrap().push(row);
+        }));
+        let snapshot = call(
+            &wiring,
+            "rlm.set_cost_ceiling",
+            json!({ "cost_usd": 5.0, "spawn_limit": 1 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot,
+            json!({"cost_usd": 0.0, "spawns_admitted": 0, "ceiling_usd": 5.0, "spawn_limit": 1, "inherited": null})
+        );
+        call(
+            &wiring,
+            "rlm.run",
+            json!({ "type": "rlm.run", "prompt": "go", "kwargs": { "name": "worker" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mirrored
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|row| row["details"].clone())
+                .collect::<Vec<_>>(),
+            [
+                json!({"version": 1, "cost_usd": 5.0, "spawn_limit": 1, "spawns_admitted": 0}),
+                json!({"version": 1, "cost_usd": 5.0, "spawn_limit": 1, "spawns_admitted": 1}),
+            ]
+        );
+        // The child inherits what is left: $5 unspent, and no further
+        // spawns (its own admission used the one-spawn limit).
+        assert_eq!(
+            spawn_requests
+                .lock()
+                .await
+                .iter()
+                .map(|request| request.inherited_cost_ceiling)
+                .collect::<Vec<_>>(),
+            [Some(
+                crate::session_engine::rlm_cost::InheritedCostCeiling {
+                    cost_usd: Some(5.0),
+                    spawn_limit: Some(0),
+                }
+            )]
+        );
+        let rebuilt = crate::session_engine::rlm_cost::RlmTreeCost::new();
+        rebuilt.restore(wiring.session.lock().await.retained_entries());
+        assert_eq!(rebuilt.snapshot(), wiring.rlm.tree_cost.snapshot());
+        assert!(
+            rebuilt.check_spawn(None).is_err(),
+            "the restored spawn limit is already exhausted"
         );
     }
 

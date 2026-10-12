@@ -318,6 +318,14 @@ fn run_prompts(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().unwrap();
+    // The faux scripts serve model-written summaries, so `/compact` runs the
+    // model summarizer rather than the deterministic default.
+    std::fs::create_dir_all(dir.path().join("agent")).unwrap();
+    std::fs::write(
+        dir.path().join("agent").join("settings.json"),
+        serde_json::json!({ "compaction": { "engine": "llm" } }).to_string(),
+    )
+    .unwrap();
     let engine = AgentSessionEngine::new(AgentEngineConfig {
         cwd: dir.path().to_path_buf(),
         agent_dir: dir.path().join("agent"),

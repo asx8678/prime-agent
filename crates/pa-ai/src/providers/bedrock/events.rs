@@ -427,6 +427,7 @@ mod tests {
     #[test]
     fn metadata_usage_total_tokens_explicit_zero_falls_back_to_sum() {
         let model = Model {
+            prompt_cache: None,
             id: "anthropic.claude-fable-5".into(),
             name: "Claude Fable 5".into(),
             api: crate::providers::bedrock::API_BEDROCK_CONVERSE_STREAM.to_string(),

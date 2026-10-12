@@ -567,6 +567,7 @@ async fn build_headless_engine_with(
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
             on_late_sent_agent_message: None,
+            cache_warm_arm: None,
             cron_store: None,
             semantic_edges,
             telemetry,
@@ -606,6 +607,7 @@ async fn build_headless_engine_with(
             queued_goal_context_purge: None,
             queued_steering_probe: None,
             image_model_router: Some(image_model_router),
+            inherited_cost_ceiling: None,
         },
     )
     .await
@@ -1503,6 +1505,7 @@ async fn build_faux_engine_with(
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
             on_late_sent_agent_message: None,
+            cache_warm_arm: None,
             cron_store: None,
             // Faux verification harness: no product telemetry.
             semantic_edges: None,
@@ -1535,6 +1538,7 @@ async fn build_faux_engine_with(
             queued_goal_context_purge: None,
             queued_steering_probe: None,
             image_model_router: None,
+            inherited_cost_ceiling: None,
         },
     )
     .await
@@ -1646,6 +1650,7 @@ mod tests {
     fn headless_image_router_settle_preserves_a_mid_run_model_switch() {
         fn fixture_model(id: &str) -> pa_types::ai::Model {
             pa_types::ai::Model {
+                prompt_cache: None,
                 id: id.to_string(),
                 name: id.to_string(),
                 api: "anthropic-messages".to_string(),

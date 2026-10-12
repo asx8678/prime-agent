@@ -6,7 +6,10 @@ use anyhow::{bail, Result};
 
 use super::manager::{PackageManager, PackageUpdate, ProgressAction};
 use super::npm;
-use super::source::{parse_source, GitSource, NpmSource, ParsedSource, SourceScope, UserOrProject};
+use super::source::{
+    parse_installable_source, parse_source, GitSource, NpmSource, ParsedSource, SourceScope,
+    UserOrProject,
+};
 
 impl PackageManager {
     /// Update configured packages. With a source, only packages with the same
@@ -16,6 +19,11 @@ impl PackageManager {
     ///
     /// Error when the source matches no configured package, or the update/reinstall fails.
     pub fn update(&mut self, source: Option<&str>) -> Result<()> {
+        if let Some(source) = source {
+            // A crafted explicit source errors here instead of matching
+            // nothing and reporting "no matching package".
+            parse_installable_source(source)?;
+        }
         let identity = source.map(|source| self.get_source_match_key_for_input(source));
         let mut matched = false;
         let mut update_sources: Vec<(String, UserOrProject)> = Vec::new();
@@ -105,7 +113,9 @@ impl PackageManager {
         let mut git_candidates: Vec<GitUpdateTarget> = Vec::new();
 
         for (source, scope) in sources {
-            match parse_source(&source) {
+            // A configured entry with unsafe components (a hand-edited
+            // settings file) must error, not reach the update flows.
+            match parse_installable_source(&source)? {
                 ParsedSource::Local(_) => {}
                 ParsedSource::Npm(parsed) if parsed.pinned => {}
                 ParsedSource::Git(parsed) if parsed.pinned => {}

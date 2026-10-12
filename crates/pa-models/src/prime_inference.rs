@@ -487,6 +487,7 @@ pub fn build_prime_inference_models(
             })
             .unwrap_or(false);
         models.push(Model {
+            prompt_cache: None,
             id: entry.id.clone(),
             name: entry
                 .name
@@ -986,6 +987,7 @@ mod tests {
 
     fn template_model(id: &str) -> Model {
         Model {
+            prompt_cache: None,
             id: id.into(),
             name: format!("Bundled {id}"),
             api: "openai-completions".into(),

@@ -128,7 +128,9 @@ pub fn select_headless_terminal_result(messages: &[AgentMessage]) -> HeadlessTer
                 // without letting it hide earlier valid outcomes.
                 REFINEMENT_OUTCOME_CUSTOM_TYPE
                 | REFINEMENT_NOTICE_CUSTOM_TYPE
-                | HARNESS_DIGEST_CUSTOM_TYPE => {
+                | HARNESS_DIGEST_CUSTOM_TYPE
+                | super::compact_carry::COMPACT_CARRY_CUSTOM_TYPE
+                | super::rlm_cost::RLM_COST_CEILING_CUSTOM_TYPE => {
                     index -= 1;
                 }
                 _ => break,
@@ -296,6 +298,23 @@ mod tests {
         assert_eq!(result.compaction_outcomes.len(), 2);
         assert_eq!(result.compaction_outcomes[0].content, "compacted 3 entries");
         assert_eq!(result.compaction_outcomes[1].outcome, "failed");
+    }
+
+    #[test]
+    fn a_trailing_carry_row_never_hides_the_answer() {
+        let messages = vec![
+            text_assistant("answer", StopReason::Stop),
+            custom(
+                crate::session_engine::compact_carry::COMPACT_CARRY_CUSTOM_TYPE,
+                "[compact carry]\n- keep the API stable",
+                None,
+            ),
+        ];
+        let result = select_headless_terminal_result(&messages);
+        assert_eq!(
+            result.primary.unwrap().stdout_text().as_deref(),
+            Some("answer")
+        );
     }
 
     #[test]

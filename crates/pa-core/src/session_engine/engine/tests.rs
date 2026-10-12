@@ -56,6 +56,7 @@ async fn engine_runs_tool_loop_and_persists() {
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
         on_late_sent_agent_message: None,
+        cache_warm_arm: None,
         semantic_edges: None,
         cron_store: None,
         queued_steering_probe: None,
@@ -86,6 +87,7 @@ async fn engine_runs_tool_loop_and_persists() {
         on_background_work_settled: None,
         prewarm_ipython_kernel: None,
         queued_goal_context_purge: None,
+        inherited_cost_ceiling: None,
     })
     .await
     .unwrap();
@@ -133,6 +135,137 @@ async fn engine_runs_tool_loop_and_persists() {
     let _ = ToolDefinitionBridge::new;
 }
 
+/// The warmer wiring end to end (TS `sdk.ts`'s `cacheWarmer.start` +
+/// `CacheWarmer`): a session request arms the warmer through the config's
+/// slot, the loop's own usage feeds the prompt size, and after the refresh
+/// delay the one-token replay hits the provider. The settings' global
+/// `cacheWarming: "idle"` keeps warming alive past the run's settle.
+#[tokio::test]
+async fn the_engine_arms_and_refreshes_the_prompt_cache() {
+    let registration =
+        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+            api: Some("engine-warming-test".to_owned()),
+            ..Default::default()
+        });
+    let max_tokens_seen: Arc<std::sync::Mutex<Vec<Option<u64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_for_factory = Arc::clone(&max_tokens_seen);
+    let factory = pa_ai::faux::FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
+        seen_for_factory
+            .lock()
+            .unwrap()
+            .push(options.and_then(|options| options.max_tokens));
+        let mut message = pa_ai::faux::faux_assistant_text_message(
+            "ok",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        );
+        message.usage.input = 1_000_000;
+        Ok(message)
+    }));
+    registration.set_responses(vec![factory; 4]);
+    let mut model = registration.get_model();
+    model.prompt_cache = Some(pa_types::ai::ModelPromptCache {
+        short: Some(11),
+        long: None,
+    });
+    model.cost = pa_types::ai::ModelCost {
+        input: pa_types::JsNumber::from(300.0),
+        output: pa_types::JsNumber::from(15.0),
+        cache_read: pa_types::JsNumber::from(30.0),
+        cache_write: pa_types::JsNumber::from(375.0),
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{ "cacheWarming": "idle" }"#,
+    )
+    .unwrap();
+
+    let warm_arm: std::sync::Arc<
+        std::sync::Mutex<Option<crate::session_engine::provider_adapter::WarmArm>>,
+    > = Arc::new(std::sync::Mutex::new(None));
+    let session_manager = crate::session::manager::SessionManager::in_memory(&cwd);
+    let stream_fn = {
+        let slot = Arc::clone(&warm_arm);
+        let arm_reader: crate::session_engine::provider_adapter::WarmArm =
+            Arc::new(move |request| {
+                if let Some(arm) = slot.lock().unwrap().as_ref() {
+                    arm(request);
+                }
+            });
+        crate::session_engine::provider_adapter::warming_stream_fn(
+            Arc::new(std::sync::RwLock::new(Some(
+                crate::session_engine::provider_adapter::ProviderTarget {
+                    api_key: None,
+                    model: model.clone(),
+                    service_tier: None,
+                    headers: None,
+                },
+            ))),
+            session_manager.get_session_id().to_string(),
+            arm_reader,
+        )
+    };
+    let engine = create_session(SessionEngineConfig {
+        on_late_sent_agent_message: None,
+        cache_warm_arm: Some(Arc::clone(&warm_arm)),
+        stream_fn: Some(stream_fn),
+        cwd: cwd.clone(),
+        agent_dir,
+        session_manager: Some(session_manager),
+        model: Some(
+            crate::session_engine::provider_adapter::json_round_trip(&model)
+                .expect("model conversion"),
+        ),
+        telemetry: None,
+        prewarm_ipython_kernel: Some(false),
+        ..SessionEngineConfig::default()
+    })
+    .await
+    .unwrap();
+    let warm_usages: Arc<std::sync::Mutex<Vec<crate::session_engine::cache_warmer::WarmUsage>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm_usages_for_sink = Arc::clone(&warm_usages);
+    engine
+        .session
+        .cache_warmer()
+        .expect("the engine built a warmer")
+        .set_usage_sink(std::sync::Arc::new(move |usage| {
+            warm_usages_for_sink.lock().unwrap().push(usage);
+        }));
+
+    let outcome = engine.prompt("hi", PromptOptions::default()).await.unwrap();
+    assert_eq!(outcome, PromptOutcome::Prompt);
+    engine.session.agent().wait_for_idle().await;
+    assert!(
+        warm_arm.lock().unwrap().is_some(),
+        "the session request armed the warmer through the config slot"
+    );
+
+    // The TTL is 11 s: the first refresh is due after 1 s, past the
+    // streaming settle (idle mode keeps it armed).
+    for _ in 0..100 {
+        if max_tokens_seen.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        *max_tokens_seen.lock().unwrap(),
+        vec![None, Some(1)],
+        "the real request streams uncapped, the refresh replays with a one-token cap"
+    );
+    let usages = warm_usages.lock().unwrap();
+    assert_eq!(usages.len(), 1);
+    assert_eq!(usages[0].model, model.id);
+    registration.unregister();
+}
+
 /// A spawned child's prompt stamps its recursion depth: `create_session`
 /// at depth N reads "depth: N (not root)", never the root identity.
 #[tokio::test]
@@ -155,6 +288,7 @@ async fn spawned_child_prompt_stamps_its_depth() {
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
         on_late_sent_agent_message: None,
+        cache_warm_arm: None,
         semantic_edges: None,
         cron_store: None,
         queued_steering_probe: None,
@@ -185,6 +319,7 @@ async fn spawned_child_prompt_stamps_its_depth() {
         on_background_work_settled: None,
         prewarm_ipython_kernel: None,
         queued_goal_context_purge: None,
+        inherited_cost_ceiling: None,
     })
     .await
     .unwrap();
@@ -248,10 +383,12 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
             rlm_subagent_host: None,
             rlm_depth: None,
             telemetry: None,
+            cache_warm_arm: None,
             model_info: None,
             on_background_work_settled: None,
             prewarm_ipython_kernel: None,
             queued_goal_context_purge: None,
+            inherited_cost_ceiling: None,
         }
     }
 

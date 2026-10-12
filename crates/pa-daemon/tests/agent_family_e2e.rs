@@ -425,6 +425,7 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
             cell_source_code: None,
             spawned_by_request_id: None,
             decision_child: false,
+            inherited_cost_ceiling: None,
         })
         .await
         .expect("spawn the child");
@@ -755,6 +756,7 @@ async fn family_edges_never_cross_families_end_to_end() {
                 cell_source_code: None,
                 spawned_by_request_id: None,
                 decision_child: false,
+                inherited_cost_ceiling: None,
             })
             .await
             .expect("spawn the child");
@@ -896,6 +898,7 @@ async fn family_edges_never_cross_families_end_to_end() {
             cell_source_code: None,
             spawned_by_request_id: None,
             decision_child: false,
+            inherited_cost_ceiling: None,
         })
         .await
         .expect("spawn the grandchild");
@@ -1206,6 +1209,7 @@ async fn parent_renames_a_child_end_to_end() {
             spawned_by_request_id: None,
             cell_source_code: None,
             decision_child: false,
+            inherited_cost_ceiling: None,
         })
         .await
         .expect("spawn the child");

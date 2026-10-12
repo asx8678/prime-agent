@@ -14,6 +14,8 @@ const DIALOGUE_HEADER: &str = "[Recent user directions and discussion]";
 const DIALOGUE_MAX_BYTES: usize = 12_288;
 const REQUEST_HEADER: &str = "[Compaction Request]";
 const REQUEST_MAX_BYTES: usize = 3_072;
+const CARRIED_HEADER: &str = "[Carried notes]";
+const CARRIED_MAX_BYTES: usize = 3_072;
 const FOOTER_MAX_BYTES: usize = 1_536;
 const MAX_LINE_BYTES: usize = 2_048;
 const MAX_LINES_PER_BLOCK: usize = 128;
@@ -30,16 +32,35 @@ struct HistoryBlock {
 /// The summary of `state`, with `request` (the `/compact` instructions)
 /// quoted verbatim, in at most `max_bytes` UTF-8 bytes.
 #[must_use]
-pub(crate) fn render(state: &State, request: Option<&str>, max_bytes: usize) -> String {
+pub(crate) fn render(
+    state: &State,
+    request: Option<&str>,
+    preserve: &[String],
+    max_bytes: usize,
+) -> String {
     if max_bytes == 0 {
         return String::new();
     }
     let mut blocks = vec![HEADER.to_string()];
     blocks.extend(dialogue(state));
+    let mut request_items = Vec::new();
     if let Some(request) = request.map(str::trim).filter(|request| !request.is_empty()) {
-        let budget = REQUEST_MAX_BYTES.saturating_sub(REQUEST_HEADER.len() + 2);
-        let request = Excerpt::of(request, budget).render(budget);
-        blocks.push(format!("{REQUEST_HEADER}\n\n{request}"));
+        request_items.push(request.to_string());
+    }
+    request_items.extend(crate::session_engine::compact_carry::preserve_lines(
+        preserve,
+    ));
+    if !request_items.is_empty() {
+        blocks.push(protected_items(
+            REQUEST_HEADER,
+            &request_items,
+            REQUEST_MAX_BYTES,
+        ));
+    }
+    // The carry-forward list renders into every summary until cleared.
+    if !state.carried.is_empty() {
+        let lines = crate::session_engine::compact_carry::carry_lines(&state.carried);
+        blocks.push(protected_items(CARRIED_HEADER, &lines, CARRIED_MAX_BYTES));
     }
     let history = history_blocks(state);
     let footer = bounded_block("---", &[footer_line(state)], FOOTER_MAX_BYTES);
@@ -300,6 +321,31 @@ fn sampled_lines(lines: &[String], keep: usize) -> Vec<String> {
     ));
     sampled.extend_from_slice(&lines[lines.len() - latest..]);
     sampled
+}
+
+/// A protected multi-item block (fabric `protectedBlock`): every item
+/// stays, excerpted proportionally only when the whole block exceeds its
+/// allocation; what is left after the equal shares goes to the earliest
+/// items that can use it.
+fn protected_items(header: &str, items: &[String], max_bytes: usize) -> String {
+    let joined = format!("{header}\n\n{}", items.join("\n\n"));
+    if joined.len() <= max_bytes {
+        return joined;
+    }
+    let mut remaining = max_bytes.saturating_sub(header.len() + 2 * items.len());
+    let share = remaining / items.len().max(1);
+    let budgets: Vec<usize> = items.iter().map(|item| item.len().min(share)).collect();
+    remaining -= budgets.iter().sum::<usize>();
+    let excerpts = items
+        .iter()
+        .zip(&budgets)
+        .map(|(item, budget)| {
+            let extra = remaining.min(item.len() - budget);
+            remaining -= extra;
+            Excerpt::of(item, budget + extra).render(budget + extra)
+        })
+        .collect::<Vec<_>>();
+    format!("{header}\n\n{}", excerpts.join("\n\n"))
 }
 
 /// The history blocks within `max_bytes`: each keeps its header and gap

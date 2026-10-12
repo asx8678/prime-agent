@@ -144,6 +144,7 @@ async fn abort_during_a_kernel_cell_settles_the_turn_immediately() {
     let engine = create_session(SessionEngineConfig {
         on_late_sent_agent_message: None,
         semantic_edges: None,
+        cache_warm_arm: None,
         cron_store: None,
         steering_mode: None,
         follow_up_mode: None,
@@ -173,6 +174,7 @@ async fn abort_during_a_kernel_cell_settles_the_turn_immediately() {
         queued_goal_context_purge: None,
         queued_steering_probe: None,
         image_model_router: None,
+        inherited_cost_ceiling: None,
     })
     .await
     .expect("create_session");

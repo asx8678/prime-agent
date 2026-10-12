@@ -118,6 +118,7 @@ mod tests {
                      base_url: &str,
                      headers: Option<BTreeMap<String, String>>| {
             Model {
+                prompt_cache: None,
                 id: id.into(),
                 name: id.into(),
                 api: api.into(),

@@ -326,6 +326,12 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                         | REFINEMENT_OUTCOME_CUSTOM_TYPE
                         | PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE
                         | crate::prompts::model_prompts::MODEL_PROMPT_ERROR_CUSTOM_TYPE
+                        // The carry list reaches the model through the
+                        // summary's `[Carried notes]` block; its rows are
+                        // bookkeeping and never ride prompts themselves.
+                        | super::compact_carry::COMPACT_CARRY_CUSTOM_TYPE
+                        // The cost-ceiling bookkeeping row never rides prompts.
+                        | super::rlm_cost::RLM_COST_CEILING_CUSTOM_TYPE
                 ) {
                     continue;
                 }
@@ -466,6 +472,21 @@ mod tests {
             converted.is_empty(),
             "outcome row must not convert to LLM context"
         );
+    }
+
+    #[test]
+    fn compaction_carry_row_is_never_context() {
+        let message = pa_types::session::CustomMessage {
+            custom_type: super::super::compact_carry::COMPACT_CARRY_CUSTOM_TYPE.to_string(),
+            content: UserContent::Text("[compact carry]\n- keep the API stable".to_string()),
+            display: false,
+            details: Some(super::super::compact_carry::carry_row_details(&[
+                "keep the API stable".to_string(),
+            ])),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        };
+        assert!(convert_to_llm(&[AgentMessage::Custom(message)]).is_empty());
     }
 
     #[test]

@@ -6,6 +6,57 @@ use super::*;
 use serde_json::Map;
 
 #[tokio::test]
+async fn carried_notes_and_preserve_reach_the_llm_summarizer() {
+    let registration = faux_registration();
+    let model = registration.get_model();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = session_with_turns(tmp.path(), 3);
+    let result = execute_compaction(
+        &mut session,
+        CompactOptions {
+            model,
+            api_key: None,
+            custom_instructions: Some("focus on the goal"),
+            preserve: vec!["the exact error text".to_string()],
+            carried: vec!["keep the API stable".to_string()],
+            settings: super::super::compaction::CompactionSettings {
+                keep_recent_tokens: 20,
+                engine: crate::settings::CompactionEngine::Llm,
+                ..Default::default()
+            },
+            abort: None,
+            harness_digest: None,
+            auxiliary: None,
+            semantic_edges: None,
+            summary_delta: None,
+            on_model_fallback: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, CompactOutcome::Ran(_)));
+    let requests = registration.received_user_texts();
+    let request = requests
+        .first()
+        .expect("one summarizer wire call")
+        .join("\n");
+    assert!(request.contains("focus on the goal"));
+    assert!(
+        request.contains(
+            "Carry these notes forward into every future summary, verbatim, under a \"[Carried notes]\" block:\n- keep the API stable [carry:0]"
+        ),
+        "the carried list reaches the summarizer: {request}"
+    );
+    assert!(
+        request.contains(
+            "Preserve these items verbatim in this summary only:\n- the exact error text [preserve:0]"
+        ),
+        "the preserve items reach the summarizer: {request}"
+    );
+    registration.unregister();
+}
+
+#[tokio::test]
 async fn execute_compaction_persists_and_rebuilds() {
     let registration = faux_registration();
     let model = registration.get_model();
@@ -17,6 +68,8 @@ async fn execute_compaction_persists_and_rebuilds() {
             model,
             api_key: None,
             custom_instructions: Some("focus on the goal"),
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -27,6 +80,7 @@ async fn execute_compaction_persists_and_rebuilds() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -111,12 +165,15 @@ async fn rebuilt_live_context_prevents_repeat_auto_compaction_until_new_usage() 
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings,
             abort: None,
             harness_digest: None,
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -193,6 +250,8 @@ async fn execute_compaction_streams_summary_deltas_to_the_sink() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -203,6 +262,7 @@ async fn execute_compaction_streams_summary_deltas_to_the_sink() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: Some(sink),
+            on_model_fallback: None,
         },
     )
     .await
@@ -298,6 +358,8 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -308,6 +370,7 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: Some(sink),
+            on_model_fallback: None,
         },
     )
     .await
@@ -407,6 +470,8 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -417,6 +482,7 @@ async fn execute_compaction_attaches_harness_digest_snapshot() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -518,6 +584,8 @@ async fn execute_compaction_fails_on_an_error_summarizer_response() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -528,6 +596,7 @@ async fn execute_compaction_fails_on_an_error_summarizer_response() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -558,6 +627,8 @@ async fn durable_compaction_row_carries_the_ts_record() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -568,6 +639,7 @@ async fn durable_compaction_row_carries_the_ts_record() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await

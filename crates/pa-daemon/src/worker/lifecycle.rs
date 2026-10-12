@@ -290,6 +290,8 @@ impl Worker {
                 child_script,
                 // A TS replacement runtime has no semantic spawn.
                 semantic_spawn: None,
+                // Nor a parent tree's budget: it is a top-level runtime.
+                inherited_cost_ceiling: None,
             }) {
             Ok(()) => self.reseed_rlm_children().await,
             Err(error) => eprintln!("pa-daemon: replacement identity rebind failed: {error:#}"),

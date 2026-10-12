@@ -22,6 +22,8 @@ use super::engine::SessionEngine;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingCompaction {
     pub instructions: Option<String>,
+    /// One-shot items kept verbatim in this compaction's summary only.
+    pub preserve: Vec<String>,
 }
 
 /// A scheduled refinement (kernel `refine.run`).
@@ -72,12 +74,42 @@ pub struct TurnBoundaryRequests {
     runtime: std::sync::RwLock<Option<Arc<TurnBoundaryRuntime>>>,
     compaction: Mutex<Option<PendingCompaction>>,
     refine: Mutex<Option<PendingRefine>>,
+    /// The host runtime that owns persistence outside the session manager
+    /// (the daemon worker): a carry row appended on the non-persisted
+    /// manager reaches the durable file through it. `None` (the default)
+    /// keeps the manager's own persist (standalone mode).
+    carry_row_sink: std::sync::Mutex<Option<super::compact_carry::CarryRowSink>>,
 }
 
 impl TurnBoundaryRequests {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Subscribe the persistence owner's mirror for carry rows: a row
+    /// appended through `compact.carry`/`compact.drop` reaches the durable
+    /// file through this sink where the session manager does not own it
+    /// (the daemon worker); a host without its own store never subscribes
+    /// and the manager's own persist stands.
+    pub fn set_carry_row_sink(&self, sink: super::compact_carry::CarryRowSink) {
+        *self
+            .carry_row_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Hand a carry row to the persistence owner's mirror, when one is
+    /// subscribed.
+    pub(crate) fn persist_carry_row(&self, items: &[String]) {
+        let sink = self
+            .carry_row_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(sink) = sink {
+            sink(super::compact_carry::carry_row_wire(items));
+        }
     }
 
     /// Bind the assembled session runtime (first bind wins).
@@ -123,13 +155,22 @@ impl TurnBoundaryRequests {
     }
 
     /// Schedule a compaction for the next turn boundary: the request's
-    /// instructions win, an absent one keeps what was already scheduled.
-    pub async fn schedule_compaction(&self, instructions: Option<String>) {
+    /// instructions win, an absent one keeps what was already scheduled;
+    /// `Some` preserve items replace the pending list, `None` keeps them.
+    pub async fn schedule_compaction(
+        &self,
+        instructions: Option<String>,
+        preserve: Option<Vec<String>>,
+    ) {
         let mut slot = self.compaction.lock().await;
         let merged = PendingCompaction {
             instructions: instructions.or_else(|| {
                 slot.as_ref()
                     .and_then(|current| current.instructions.clone())
+            }),
+            preserve: preserve.unwrap_or_else(|| {
+                slot.as_ref()
+                    .map_or(Vec::new(), |current| current.preserve.clone())
             }),
         };
         *slot = Some(merged);
@@ -208,12 +249,15 @@ impl TurnBoundaryRequests {
         );
     }
 
-    /// Register `compact.status`/`compact.run`, gated by the compaction `agentCallable`
-    /// setting; `create_session` passes the resolved keep-recent budget.
+    /// Register `compact.status`/`compact.run`/`compact.carry`/`compact.drop`,
+    /// gated by the compaction `agentCallable` setting; `create_session`
+    /// passes the resolved keep-recent budget and the adoption-telemetry
+    /// seam for persisted carry updates.
     pub fn register_compact_handlers(
         self: &Arc<Self>,
         handlers: &mut HostRequestHandlers,
         keep_recent_tokens: u64,
+        on_carry_used: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) {
         let requests = Arc::downgrade(self);
         handlers.register(
@@ -234,6 +278,18 @@ impl TurnBoundaryRequests {
                         None => None,
                     };
                     let scheduled = requests.compaction_scheduled().await;
+                    let carry = match requests.bound() {
+                        Some(runtime) => {
+                            let session = runtime.session.lock().await;
+                            let entries: Vec<pa_types::session::FileEntry> = session
+                                .active_branch_entries()
+                                .into_iter()
+                                .cloned()
+                                .collect();
+                            super::compact_carry::latest_carry_items(&entries)
+                        }
+                        None => Vec::new(),
+                    };
                     let (tokens, window, percent) = match usage {
                         Some(usage) => (
                             usage.tokens.map_or(Value::Null, Value::from),
@@ -247,6 +303,7 @@ impl TurnBoundaryRequests {
                         "context_window": window,
                         "percent": percent,
                         "scheduled": scheduled,
+                        "carry": carry,
                     }))
                 })
             }),
@@ -265,6 +322,13 @@ impl TurnBoundaryRequests {
                         "instructions",
                         "compact.run instructions must be a string when provided",
                     )?;
+                    let preserve = match payload.data.get("preserve") {
+                        None => None,
+                        Some(value) => Some(
+                            super::compact_carry::validate_items(value, "preserve", "compact.run")
+                                .map_err(anyhow::Error::msg)?,
+                        ),
+                    };
                     let Some(runtime) = requests.bound() else {
                         return Ok(no_active_turn(
                             "no active turn; compaction can only be requested while a turn is running",
@@ -292,11 +356,148 @@ impl TurnBoundaryRequests {
                     {
                         return Ok(json!({ "scheduled": false, "reason": reason }));
                     }
-                    requests.schedule_compaction(instructions).await;
+                    requests
+                        .schedule_compaction(instructions, preserve)
+                        .await;
                     Ok(json!({
                         "scheduled": true,
                         "note": "Compaction runs when the current turn ends; you resume automatically afterwards. Continue working normally.",
                     }))
+                })
+            }),
+        );
+        // The carry-forward list: a persisted custom row, so the latest row
+        // on the branch is the current value (reload and restart replay
+        // it). No operations reads the list; an update validates, appends
+        // a row, and answers the resulting list. Unchanged lists skip the
+        // write, so repeated calls stay idempotent.
+        // The second handler's share is cloned before the original moves
+        // into the first.
+        let drop_carry_telemetry = on_carry_used.clone();
+        let requests = Arc::downgrade(self);
+        handlers.register(
+            "compact.carry",
+            host_handler(move |payload| {
+                let requests = requests.clone();
+                let carry_telemetry = on_carry_used.clone();
+                Box::pin(async move {
+                    let Some(requests) = requests.upgrade() else {
+                        return Err(anyhow::anyhow!(
+                            "the session ended before the request could be served"
+                        ));
+                    };
+                    let Some(runtime) = requests.bound() else {
+                        return Err(anyhow::anyhow!(
+                            "compact.carry requires an assembled session"
+                        ));
+                    };
+                    let update =
+                        super::compact_carry::CarryUpdate::from_payload(&payload.data)
+                            .map_err(anyhow::Error::msg)?;
+                    // The manager append serves the in-process fold; the
+                    // persistence owner's mirror (the daemon worker) lands
+                    // the durable row where the manager does not own the
+                    // file. The sink runs AFTER the session guard drops:
+                    // the mirror may take the host runtime's own locks.
+                    let (items, changed) = {
+                        let mut session = runtime.session.lock().await;
+                        let entries: Vec<pa_types::session::FileEntry> = session
+                            .active_branch_entries()
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        let current = super::compact_carry::latest_carry_items(&entries);
+                        if !update.is_update() {
+                            return Ok(json!({ "items": current }));
+                        }
+                        let items = super::compact_carry::apply_carry_update(&current, &update)
+                            .map_err(anyhow::Error::msg)?;
+                        let changed = items != current;
+                        if changed {
+                            let content = super::compact_carry::carry_row_content(&items);
+                            session.append_custom_message(
+                                super::compact_carry::COMPACT_CARRY_CUSTOM_TYPE,
+                                pa_types::ai::UserContent::Text(content),
+                                false,
+                                Some(super::compact_carry::carry_row_details(&items)),
+                            )?;
+                        }
+                        (items, changed)
+                    };
+                    // An unchanged list (re-adding a carried note, say)
+                    // appended no row, so the mirror writes none either.
+                    if changed {
+                        requests.persist_carry_row(&items);
+                    }
+                    if let Some(on_carry) = &carry_telemetry {
+                        on_carry();
+                    }
+                    Ok(json!({
+                        "items": items,
+                        "note": "Carried notes render in every summary until dropped; status() lists them with their indexes.",
+                    }))
+                })
+            }),
+        );
+        let requests = Arc::downgrade(self);
+        handlers.register(
+            "compact.drop",
+            host_handler(move |payload| {
+                let requests = requests.clone();
+                let carry_telemetry = drop_carry_telemetry.clone();
+                Box::pin(async move {
+                    let Some(requests) = requests.upgrade() else {
+                        return Err(anyhow::anyhow!(
+                            "the session ended before the request could be served"
+                        ));
+                    };
+                    let Some(runtime) = requests.bound() else {
+                        return Err(anyhow::anyhow!(
+                            "compact.drop requires an assembled session"
+                        ));
+                    };
+                    let index = payload
+                        .data
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("compact.drop index must be a non-negative integer")
+                        })?;
+                    let index = usize::try_from(index)
+                        .map_err(|_| anyhow::anyhow!("compact.drop index is too large"))?;
+                    // The same guard-scoping as `compact.carry`: the mirror
+                    // runs after the session lock drops.
+                    let (items, changed) = {
+                        let mut session = runtime.session.lock().await;
+                        let entries: Vec<pa_types::session::FileEntry> = session
+                            .active_branch_entries()
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        let current = super::compact_carry::latest_carry_items(&entries);
+                        let items = super::compact_carry::drop_carry_index(&current, index)
+                            .map_err(anyhow::Error::msg)?;
+                        let changed = items != current;
+                        if changed {
+                            let content = super::compact_carry::carry_row_content(&items);
+                            session.append_custom_message(
+                                super::compact_carry::COMPACT_CARRY_CUSTOM_TYPE,
+                                pa_types::ai::UserContent::Text(content),
+                                false,
+                                Some(super::compact_carry::carry_row_details(&items)),
+                            )?;
+                        }
+                        (items, changed)
+                    };
+                    // An unchanged list (re-adding a carried note, say)
+                    // appended no row, so the mirror writes none either.
+                    if changed {
+                        requests.persist_carry_row(&items);
+                    }
+                    if let Some(on_carry) = &carry_telemetry {
+                        on_carry();
+                    }
+                    Ok(json!({ "items": items }))
                 })
             }),
         );
@@ -400,7 +601,13 @@ impl SessionEngine {
         let pending = self.turn_boundary.take_compaction().await?;
         let compact = async {
             self.session
-                .compact(pending.instructions.as_deref(), model, api_key, abort)
+                .compact(
+                    pending.instructions.as_deref(),
+                    &pending.preserve,
+                    model,
+                    api_key,
+                    abort,
+                )
                 .await
         };
         Some(match abort {

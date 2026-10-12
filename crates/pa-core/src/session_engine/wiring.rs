@@ -119,6 +119,20 @@ impl AgentSession {
         self.agent_dir = Some(agent_dir);
     }
 
+    /// Bind the prompt-cache warmer (the engine wiring arms it through the
+    /// host's stream-fn slot; the compaction paths invalidate it when the
+    /// live context is replaced).
+    pub fn set_cache_warmer(&mut self, warmer: std::sync::Arc<super::cache_warmer::CacheWarmer>) {
+        self.cache_warmer = Some(warmer);
+    }
+
+    /// The bound prompt-cache warmer, for the invalidation call sites
+    /// (compaction, live model switches).
+    #[must_use]
+    pub fn cache_warmer(&self) -> Option<&std::sync::Arc<super::cache_warmer::CacheWarmer>> {
+        self.cache_warmer.as_ref()
+    }
+
     /// Bind the kernel-state probe behind the post-compaction
     /// `ipython_state` notice (the engine wiring hands over the session's
     /// kernel provisioner, TS `AgentSession._ipythonKernelProvisioner`).

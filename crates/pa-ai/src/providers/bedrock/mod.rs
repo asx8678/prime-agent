@@ -1001,6 +1001,7 @@ mod tests {
 
     fn test_model(id: &str) -> Model {
         Model {
+            prompt_cache: None,
             id: id.into(),
             name: "claude".into(),
             api: API_BEDROCK_CONVERSE_STREAM.into(),

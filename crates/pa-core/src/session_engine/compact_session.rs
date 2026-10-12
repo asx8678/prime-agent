@@ -7,7 +7,7 @@ use super::compaction::{estimate_context_tokens, find_cut_point, CutPointResult}
 use super::compaction_exec;
 use super::compaction_exec::{
     build_summarization_request, build_turn_prefix_request, compaction_entry_for,
-    complete_summary_call, details_for, file_ops_block, split_summary, summed_usage,
+    complete_summary_call_with_fallback, details_for, file_ops_block, split_summary, summed_usage,
     CompactionDetails, CompactionResult, SummaryDeltaSink, SummarySlice, NO_PRIOR_HISTORY,
 };
 use super::compaction_utils;
@@ -39,6 +39,13 @@ pub struct CompactOptions<'a> {
     pub api_key: Option<String>,
     /// `/compact <instructions>` guidance.
     pub custom_instructions: Option<&'a str>,
+    /// One-shot items kept verbatim in this summary only (kernel
+    /// `compact.run(preserve=...)`).
+    pub preserve: Vec<String>,
+    /// The carry-forward notes read from the branch at compaction start;
+    /// the deterministic arm folds them from rows itself, the LLM arm
+    /// appends them to its instructions.
+    pub carried: Vec<String>,
     pub settings: super::compaction::CompactionSettings,
     /// Checked before the summarizer request and again before the commit — a
     /// late abort never lands a committed compaction; `None` without a trigger.
@@ -57,6 +64,9 @@ pub struct CompactOptions<'a> {
     /// request id, and the compaction's terminal event lands before the
     /// compaction entry persists. `None` records nothing.
     pub semantic_edges: Option<std::sync::Arc<super::semantic_edges::SemanticEdgeRecorder>>,
+    /// Adoption telemetry for the routed-model wire fallback: called once
+    /// per session-model retry with whether it succeeded.
+    pub on_model_fallback: Option<super::compaction_exec::ModelFallbackHook>,
 }
 
 /// The model-visible message produced by a session entry (summarizer input).
@@ -67,7 +77,13 @@ fn message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
             _ => Some(message.clone()),
         },
         FileEntry::CustomMessage { payload, .. } => {
-            if payload.custom_type == "harness_digest" {
+            // The harness digest and the carry rows are bookkeeping: the
+            // digest never rides prompts, and the carry list reaches the
+            // summarizer through the augmented instructions instead (once,
+            // not once per historical row).
+            if payload.custom_type == "harness_digest"
+                || payload.custom_type == super::compact_carry::COMPACT_CARRY_CUSTOM_TYPE
+            {
                 return None;
             }
             Some(AgentMessage::Custom(pa_types::session::CustomMessage {
@@ -253,8 +269,11 @@ pub(crate) async fn summarize_attempt(
     // from the log, and the live block receives it whole, exactly as it
     // commits.
     if let Some(fold) = attempt.structural.as_ref() {
-        let (mut summary, state) =
-            fold.summarize(options.custom_instructions, options.model.context_window);
+        let (mut summary, state) = fold.summarize(
+            options.custom_instructions,
+            &options.preserve,
+            options.model.context_window,
+        );
         summary.push_str(&file_ops_block(
             &attempt.details.read_files,
             &attempt.details.modified_files,
@@ -285,7 +304,15 @@ pub(crate) async fn summarize_attempt(
     // history call. A split with no summarizable history stands in "No prior history.".
     // The summary calls run with their own prompt prefix, so on the session model they
     // can never hit the cached prefix — route them to the auxiliary model when its window fits.
-    let (model, api_key, summary_headers) = match options.auxiliary {
+    // The LLM arm's instructions also carry the forward list and this
+    // run's preserve items (fabric `requestLines`); the durable row keeps
+    // the user's own instructions only.
+    let custom_instructions = crate::session_engine::compact_carry::augment_instructions(
+        options.custom_instructions,
+        &options.carried,
+        &options.preserve,
+    );
+    let (model, api_key, summary_headers, session_headers) = match options.auxiliary {
         Some(context) => {
             let required = estimate_summary_request_tokens(
                 &attempt.history,
@@ -293,7 +320,7 @@ pub(crate) async fn summarize_attempt(
                 attempt.cut.is_split_turn,
                 attempt.previous_summary.as_deref(),
                 attempt.recent_state_anchor.as_deref(),
-                options.custom_instructions,
+                custom_instructions.as_deref(),
                 options.settings.reserve_tokens,
             );
             let join = {
@@ -301,27 +328,65 @@ pub(crate) async fn summarize_attempt(
                 let session_model = options.model.clone();
                 let session_api_key = options.api_key.clone();
                 tokio::task::spawn_blocking(move || {
-                    super::auxiliary_model::resolve_auxiliary_model(
+                    let routed = super::auxiliary_model::resolve_auxiliary_model(
                         &context,
                         "compaction summary",
                         &session_model,
                         session_api_key.as_deref(),
                         Some(required),
-                    )
+                    );
+                    // The wire fallback's session headers, resolved on the
+                    // same blocking hop (a registry read) and only when the
+                    // routing actually moved off the session model.
+                    let session_headers = if super::compaction_exec::is_session_model(
+                        &routed.model,
+                        &session_model,
+                    ) {
+                        None
+                    } else {
+                        super::auxiliary_model::session_fallback_with_headers(
+                            &context,
+                            &session_model,
+                            session_api_key,
+                        )
+                        .headers
+                    };
+                    (routed, session_headers)
                 })
             };
             // A JoinError (the closure panicked) degrades to the session
             // fallback, which keeps the merged headers.
-            let routed = join.await.unwrap_or_else(|_| {
-                super::auxiliary_model::session_fallback_with_headers(
-                    context,
-                    &options.model,
-                    options.api_key.clone(),
+            let (routed, session_headers) = join.await.unwrap_or_else(|_| {
+                (
+                    super::auxiliary_model::session_fallback_with_headers(
+                        context,
+                        &options.model,
+                        options.api_key.clone(),
+                    ),
+                    None,
                 )
             });
-            (routed.model, routed.api_key, routed.headers)
+            (
+                routed.model,
+                routed.api_key,
+                routed.headers,
+                session_headers,
+            )
         }
-        None => (options.model.clone(), options.api_key.clone(), None),
+        None => (options.model.clone(), options.api_key.clone(), None, None),
+    };
+    // The session-model fallback for the wire calls: `None` when the routed
+    // model IS the session model (the retry would fail the same way).
+    let session_fallback = if super::compaction_exec::is_session_model(&model, &options.model) {
+        None
+    } else {
+        Some(super::compaction_exec::SessionModelFallback {
+            model: options.model.clone(),
+            api_key: options.api_key.clone(),
+            headers: session_headers,
+            routed_base_headers: summary_headers.clone(),
+            on_fallback: options.on_model_fallback.clone(),
+        })
     };
     let history_max_tokens = history_summary_completion_budget(options.settings.reserve_tokens);
     let turn_prefix_max_tokens =
@@ -356,7 +421,7 @@ pub(crate) async fn summarize_attempt(
         }
         let request = build_summarization_request(
             &attempt.history,
-            options.custom_instructions,
+            custom_instructions.as_deref(),
             attempt.previous_summary.as_deref(),
             attempt.recent_state_anchor.as_deref(),
             options.settings.reserve_tokens,
@@ -368,7 +433,7 @@ pub(crate) async fn summarize_attempt(
             attempt.semantic_compaction.as_ref(),
             summary_headers.clone(),
             |headers| {
-                complete_summary_call(
+                complete_summary_call_with_fallback(
                     &model,
                     api_key.clone(),
                     headers,
@@ -376,6 +441,8 @@ pub(crate) async fn summarize_attempt(
                     request,
                     options.summary_delta.clone(),
                     "Summarization failed",
+                    session_fallback.clone(),
+                    options.abort,
                 )
             },
         )
@@ -390,7 +457,7 @@ pub(crate) async fn summarize_attempt(
             attempt.semantic_compaction.as_ref(),
             summary_headers.clone(),
             |headers| {
-                complete_summary_call(
+                complete_summary_call_with_fallback(
                     &model,
                     api_key.clone(),
                     headers,
@@ -405,6 +472,8 @@ pub(crate) async fn summarize_attempt(
                     // exact committed summary.
                     None,
                     "Turn prefix summarization failed",
+                    session_fallback.clone(),
+                    options.abort,
                 )
             },
         )

@@ -3,13 +3,14 @@
 use super::*;
 
 /// The faux model's per-request output budget (maxTokens `16_384` under the
-/// `32_000` request cap): threshold fixtures subtract it from the window
-/// alongside the headroom (the combined input+output ceiling).
+/// `32_000` request cap): the window-capped reservations subtract it and the
+/// capped reserve from the window (the combined input+output ceiling).
 const FAUX_REQUEST_BUDGET: u64 = 16_384;
 
 /// The automatic threshold compaction at the turn boundary. The faux
-/// provider estimates usage from the serialized context, so the headroom
-/// sits halfway between a baseline turn and the baseline plus the big prompt.
+/// provider estimates usage from the serialized context; a deliberately
+/// huge reserve exercises the combined-limit arm at its W/4 cap, so the
+/// threshold sits at `128_000 - FAUX_REQUEST_BUDGET - 32_000`.
 #[test]
 fn threshold_crossing_auto_compacts_with_the_event_pair() {
     let _faux = FAUX_TEST_LOCK
@@ -34,12 +35,11 @@ fn threshold_crossing_auto_compacts_with_the_event_pair() {
     );
     drop(probe);
 
-    // ~12k tokens of deterministic extra context on the crossing turn.
-    let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
-    let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
-    // The headroom sits between the two turns' usage (the f14 battery
-    // shape: reserveTokens so exactly the seeded crossing fires).
-    let headroom = baseline + big_tokens / 2;
+    // The window-capped reservations cap a deliberately huge reserve at
+    // W/4 (32_000), so the combined threshold sits at
+    // 128_000 - FAUX_REQUEST_BUDGET - 32_000 = 79_616: the ~82k-token
+    // crossing prompt clears it while the seed turn stays far below.
+    let big_prompt = format!("seed turn {} crossing", "x".repeat(330_000));
     let (engine, _engine_dir) = faux_engine_with_settings(
         &serde_json::json!({
             "responses": [
@@ -49,7 +49,7 @@ fn threshold_crossing_auto_compacts_with_the_event_pair() {
             ],
         }),
         128_000u64
-            .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+            .saturating_sub(FAUX_REQUEST_BUDGET + baseline)
             .max(1),
     );
 
@@ -220,13 +220,15 @@ fn threshold_compaction_stays_on_the_session_provider_after_a_resolution_drift()
     assert!(baseline < 100_000, "implausible baseline: {baseline}");
     drop(probe);
 
-    // The combined input+output ceiling sits between the two turns'
-    // usage (the 16_384 output budget is part of it).
-    let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
-    let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
-    let headroom = baseline + big_tokens / 2;
+    // The combined input+output ceiling (the output budget plus the
+    // W/4-capped reserve) sits below the crossing turn's usage.
+    // The window-capped reservations cap a deliberately huge reserve at
+    // W/4 (32_000), so the combined threshold sits at
+    // 128_000 - FAUX_REQUEST_BUDGET - 32_000 = 79_616: the ~82k-token
+    // crossing prompt clears it while the seed turn stays far below.
+    let big_prompt = format!("seed turn {} crossing", "x".repeat(330_000));
     let reserve = 128_000u64
-        .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+        .saturating_sub(FAUX_REQUEST_BUDGET + baseline)
         .max(1);
     write_settings("faux", "faux-1", reserve);
     registration.set_responses(parsed.responses);
@@ -449,9 +451,11 @@ fn threshold_compaction_counts_into_the_run_telemetry() {
         .expect("probe turn produced usage");
     drop(probe);
 
-    let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
-    let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
-    let headroom = baseline + big_tokens / 2;
+    // The window-capped reservations cap a deliberately huge reserve at
+    // W/4 (32_000), so the combined threshold sits at
+    // 128_000 - FAUX_REQUEST_BUDGET - 32_000 = 79_616: the ~82k-token
+    // crossing prompt clears it while the seed turn stays far below.
+    let big_prompt = format!("seed turn {} crossing", "x".repeat(330_000));
     let (engine, dir) = faux_engine_with_settings(
         &serde_json::json!({
             "responses": [
@@ -461,7 +465,7 @@ fn threshold_compaction_counts_into_the_run_telemetry() {
             ],
         }),
         128_000u64
-            .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+            .saturating_sub(FAUX_REQUEST_BUDGET + baseline)
             .max(1),
     );
     let mut events: Vec<EngineEvent> = Vec::new();
@@ -519,7 +523,7 @@ fn requested_compaction_counts_into_the_run_telemetry() {
         let core = guard.as_deref().expect("session built");
         engine
             .runtime
-            .block_on(async { core.turn_boundary.schedule_compaction(None).await });
+            .block_on(async { core.turn_boundary.schedule_compaction(None, None).await });
     }
     // The second turn carries enough tokens that the keep-recent cut
     // leaves the first turn summarizable (a tiny prompt cuts past it
@@ -679,13 +683,15 @@ fn threshold_skip_records_the_durable_outcome_row() {
 
     // One big crossing turn whose only summarizable history is itself:
     // the threshold fires, and the compaction skips (too short).
-    let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
-    let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
-    let headroom = baseline + big_tokens / 2;
+    // The window-capped reservations cap a deliberately huge reserve at
+    // W/4 (32_000), so the combined threshold sits at
+    // 128_000 - FAUX_REQUEST_BUDGET - 32_000 = 79_616: the ~82k-token
+    // crossing prompt clears it while the seed turn stays far below.
+    let big_prompt = format!("seed turn {} crossing", "x".repeat(330_000));
     let (engine, _engine_dir) = faux_engine_with_settings(
         &serde_json::json!({ "responses": [{"text": "crossing reply"}] }),
         128_000u64
-            .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+            .saturating_sub(FAUX_REQUEST_BUDGET + baseline)
             .max(1),
     );
     let mut events: Vec<EngineEvent> = Vec::new();
@@ -762,7 +768,7 @@ fn requested_compaction_skip_records_the_durable_outcome_row() {
         let core = guard.as_deref().expect("session built");
         engine
             .runtime
-            .block_on(async { core.turn_boundary.schedule_compaction(None).await });
+            .block_on(async { core.turn_boundary.schedule_compaction(None, None).await });
     }
     admit(&engine, "turn two".to_string(), &mut events);
     assert_eq!(
@@ -801,9 +807,11 @@ fn threshold_compaction_aborted_mid_run_records_the_cancelled_outcome() {
         .expect("probe turn produced usage");
     drop(probe);
 
-    let big_prompt = format!("seed turn {} crossing", "x".repeat(48_000));
-    let big_tokens = (48_000 + "seed turn  crossing".len() as u64).div_ceil(4);
-    let headroom = baseline + big_tokens / 2;
+    // The window-capped reservations cap a deliberately huge reserve at
+    // W/4 (32_000), so the combined threshold sits at
+    // 128_000 - FAUX_REQUEST_BUDGET - 32_000 = 79_616: the ~82k-token
+    // crossing prompt clears it while the seed turn stays far below.
+    let big_prompt = format!("seed turn {} crossing", "x".repeat(330_000));
     let (engine, _engine_dir) = faux_engine_with_settings(
         &serde_json::json!({
             "responses": [
@@ -815,7 +823,7 @@ fn threshold_compaction_aborted_mid_run_records_the_cancelled_outcome() {
             ],
         }),
         128_000u64
-            .saturating_sub(FAUX_REQUEST_BUDGET + headroom)
+            .saturating_sub(FAUX_REQUEST_BUDGET + baseline)
             .max(1),
     );
     let engine = std::sync::Arc::new(engine);
@@ -884,7 +892,7 @@ fn requested_compaction_aborted_mid_run_records_the_cancelled_outcome() {
         let core = guard.as_deref().expect("session built");
         engine
             .runtime
-            .block_on(async { core.turn_boundary.schedule_compaction(None).await });
+            .block_on(async { core.turn_boundary.schedule_compaction(None, None).await });
     }
 
     let events: std::sync::Arc<std::sync::Mutex<Vec<EngineEvent>>> = Arc::default();

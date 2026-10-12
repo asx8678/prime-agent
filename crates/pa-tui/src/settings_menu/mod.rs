@@ -315,6 +315,40 @@ pub fn settings_menu_rows(current: &SettingsCurrentValues) -> Vec<SettingsMenuRo
                 themes: current.available_themes.clone(),
             }),
         },
+        // The Advanced tab: Rust-only runtime features the TS menu does not carry (pending sign-off
+        // in next-steps/09-rust-divergence-signoff.md).
+        SettingsMenuRow {
+            id: "cache-warming",
+            label: "Cache warming",
+            description: "Keep the prompt cache alive with one-token refreshes: streaming while a run is active, idle also up to 30 minutes after it ends. Refreshes are billed; global setting, applies from the next request",
+            current: current.cache_warming.clone(),
+            values: Some(vec!["off".into(), "streaming".into(), "idle".into()]),
+            submenu: None,
+        },
+        SettingsMenuRow {
+            id: "compaction-engine",
+            label: "Compaction engine",
+            description: "Deterministic builds the compaction summary from the session log without a model call; LLM has the model write it. Applies to new and reopened sessions",
+            current: current.compaction_engine.clone(),
+            values: Some(vec!["deterministic".into(), "llm".into()]),
+            submenu: None,
+        },
+        SettingsMenuRow {
+            id: "auto-refine",
+            label: "Auto-refine",
+            description: "Periodically, and after compaction, a reviewer decides whether the harness needs refining. Applies to new and reopened sessions",
+            current: current.auto_refine.to_string(),
+            values: Some(bool_value()),
+            submenu: None,
+        },
+        SettingsMenuRow {
+            id: "repeat-guard",
+            label: "Repeat guard",
+            description: "Warn on, then block, repeated ipython runs whose code and output are identical (thresholds: repeatGuard in settings.json). Applies to new and reopened sessions",
+            current: current.repeat_guard.to_string(),
+            values: Some(bool_value()),
+            submenu: None,
+        },
     ]
 }
 
@@ -346,6 +380,10 @@ pub struct SettingsCurrentValues {
     pub available_thinking_levels: Vec<String>,
     pub theme: String,
     pub available_themes: Vec<String>,
+    pub cache_warming: String,
+    pub compaction_engine: String,
+    pub auto_refine: bool,
+    pub repeat_guard: bool,
 }
 
 impl SettingsMenu {

@@ -421,6 +421,7 @@ pub fn load_custom_models(
             let Some(base_url) = base_url else { continue };
             let compat = merge_compat(None, compat_from_value(provider_config.compat.as_ref()));
             result.models.push(Model {
+                prompt_cache: None,
                 id: model_def.id.clone(),
                 name: model_def
                     .name

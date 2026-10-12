@@ -294,6 +294,7 @@ mod tests {
 
     fn test_model() -> Model {
         Model {
+            prompt_cache: None,
             id: "m".into(),
             name: "m".into(),
             api: "openai-completions".into(),

@@ -198,6 +198,7 @@ mod tests {
 
     fn model(provider: &str, id: &str, name: &str, reasoning: bool) -> Model {
         Model {
+            prompt_cache: None,
             id: id.to_string(),
             name: name.to_string(),
             api: "faux".to_string(),

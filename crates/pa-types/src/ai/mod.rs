@@ -681,6 +681,18 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Best-effort prompt-cache lifetime per retention tier, in seconds (TS
+/// `ModelPromptCache`). A missing tier means the lifetime is unknown, so
+/// cache warming never arms for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPromptCache {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long: Option<u64>,
+}
+
 /// Unified model descriptor for the model registry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -715,6 +727,10 @@ pub struct Model {
     /// Compatibility overrides; auto-detected from `baseUrl` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<ModelCompat>,
+    /// Prompt cache lifetimes per retention tier (TS `promptCache`); unset
+    /// when the provider's cache behavior is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<ModelPromptCache>,
 }
 
 /// TS `supportsServiceTier` over the eligibility fields; the Model-typed [`supports_service_tier`]

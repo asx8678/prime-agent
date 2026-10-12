@@ -103,6 +103,8 @@ async fn split_turn_compaction_runs_two_summarizer_calls_and_merges_the_turn_con
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -113,6 +115,7 @@ async fn split_turn_compaction_runs_two_summarizer_calls_and_merges_the_turn_con
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -272,12 +275,15 @@ async fn injected_custom_turn_cuts_whole_turns_the_double_row_splits() {
             model: model.clone(),
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: settings(2),
             abort: None,
             harness_digest: None,
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -323,12 +329,15 @@ async fn injected_custom_turn_cuts_whole_turns_the_double_row_splits() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: settings(2),
             abort: None,
             harness_digest: None,
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -436,6 +445,8 @@ async fn split_turn_without_history_makes_only_the_prefix_call() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -446,6 +457,7 @@ async fn split_turn_without_history_makes_only_the_prefix_call() {
             auxiliary: None,
             semantic_edges: None,
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -571,6 +583,8 @@ async fn a_split_turn_compaction_commits_both_summary_slices_before_its_entry() 
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 10,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -581,6 +595,7 @@ async fn a_split_turn_compaction_commits_both_summary_slices_before_its_entry() 
             auxiliary: None,
             semantic_edges: Some(Arc::clone(&recorder)),
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await
@@ -676,6 +691,8 @@ async fn an_aborted_compaction_fails_its_slices_and_records_cancelled() {
             model,
             api_key: None,
             custom_instructions: None,
+            preserve: Vec::new(),
+            carried: Vec::new(),
             settings: super::super::compaction::CompactionSettings {
                 keep_recent_tokens: 20,
                 engine: crate::settings::CompactionEngine::Llm,
@@ -686,6 +703,7 @@ async fn an_aborted_compaction_fails_its_slices_and_records_cancelled() {
             auxiliary: None,
             semantic_edges: Some(Arc::clone(&recorder)),
             summary_delta: None,
+            on_model_fallback: None,
         },
     )
     .await

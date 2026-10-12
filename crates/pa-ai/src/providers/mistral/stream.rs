@@ -835,6 +835,7 @@ mod tests {
         use serde_json::json;
 
         let model = Model {
+            prompt_cache: None,
             id: "mistral-large-latest".into(),
             name: "mistral-large".into(),
             api: API_MISTRAL_CONVERSATIONS.to_string(),

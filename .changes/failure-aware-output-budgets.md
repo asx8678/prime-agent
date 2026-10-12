@@ -1,0 +1,3 @@
+- A failed cell's output no longer cuts to a head-only 65k-per-stream blob: the combined text is capped at 20,000 characters with the head and the most recent output kept around a middle omission marker, and `[Full output (N chars) saved to: <path>]` links a private artifact holding the complete text.
+- Kernel streams that overflow their per-stream cap keep their last lines too, with the full stream spilled to the same kind of linked artifact instead of being dropped.
+- Successful cells keep their existing output budgets unchanged.

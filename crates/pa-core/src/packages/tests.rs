@@ -149,7 +149,9 @@ impl Sandbox {
 
 #[test]
 fn npm_install_list_remove_flow() {
-    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let _guard = super::test_support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sandbox = Sandbox::new("npm-flow");
     let mut manager = sandbox.manager();
 
@@ -179,7 +181,9 @@ fn npm_install_list_remove_flow() {
 
 #[test]
 fn npm_update_skips_matching_versions() {
-    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let _guard = super::test_support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sandbox = Sandbox::new("npm-update-match");
     let mut manager = sandbox.manager();
     manager
@@ -196,7 +200,9 @@ fn npm_update_skips_matching_versions() {
 
 #[test]
 fn npm_update_reinstalls_moved_versions() {
-    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let _guard = super::test_support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sandbox = Sandbox::new("npm-update-moved");
     let mut manager = sandbox.manager();
     manager
@@ -218,7 +224,9 @@ fn npm_update_reinstalls_moved_versions() {
 
 #[test]
 fn update_unknown_source_is_an_error_with_suggestion() {
-    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let _guard = super::test_support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sandbox = Sandbox::new("npm-update-unknown");
     let mut manager = sandbox.manager();
     manager
@@ -233,9 +241,12 @@ fn update_unknown_source_is_an_error_with_suggestion() {
 
 #[test]
 fn git_clone_update_remove_flow() {
-    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let _guard = super::test_support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sandbox = Sandbox::new("git-flow");
     let (bare, work) = make_bare_repo(&sandbox.root);
+    let npm_command = vec![sandbox.npm_shim.display().to_string()];
 
     let source = GitSource {
         repo: bare.display().to_string(),
@@ -249,7 +260,7 @@ fn git_clone_update_remove_flow() {
         SourceScope::User,
         &sandbox.cwd,
         &sandbox.agent_dir,
-        None,
+        Some(&npm_command),
     )
     .unwrap();
 
@@ -272,7 +283,7 @@ fn git_clone_update_remove_flow() {
         SourceScope::User,
         &sandbox.cwd,
         &sandbox.agent_dir,
-        None,
+        Some(&npm_command),
     )
     .unwrap();
     assert!(installed.join("skills.md").exists());
@@ -282,7 +293,7 @@ fn git_clone_update_remove_flow() {
         SourceScope::User,
         &sandbox.cwd,
         &sandbox.agent_dir,
-        None,
+        Some(&npm_command),
     )
     .unwrap();
 
@@ -294,10 +305,13 @@ fn git_clone_update_remove_flow() {
 
 #[test]
 fn git_ref_checkout_installs_the_pinned_revision() {
-    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let _guard = super::test_support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sandbox = Sandbox::new("git-ref");
     let dir_root = sandbox.root.clone();
     let (bare, work) = make_bare_repo(&dir_root);
+    let npm_command = vec![sandbox.npm_shim.display().to_string()];
     run_git(&work, &["tag", "v1"]);
     std::fs::write(work.join("skills.md"), "moved").unwrap();
     run_git(&work, &["add", "."]);
@@ -317,7 +331,7 @@ fn git_ref_checkout_installs_the_pinned_revision() {
         SourceScope::User,
         &sandbox.cwd,
         &sandbox.agent_dir,
-        None,
+        Some(&npm_command),
     )
     .unwrap();
     let installed = sandbox
@@ -347,4 +361,45 @@ fn exe_dir_of_resolves_a_launcher_symlink() {
     let real = libexec.join("prime-agent");
     assert_eq!(exe_dir_of(&launcher), Some(libexec.clone()));
     assert_eq!(exe_dir_of(&real), Some(libexec));
+}
+
+/// A `GitSource` built directly (bypassing the parser) with traversal in its
+/// path is contained: every destructive git operation refuses a target
+/// outside the install root, and the sibling victim directory survives.
+#[test]
+fn git_operations_reject_targets_outside_the_install_root() {
+    let sandbox = Sandbox::new("git-containment");
+    let victim = sandbox.root.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep.txt"), "keep").unwrap();
+
+    let source = GitSource {
+        repo: "https://evil.invalid.test/a".to_string(),
+        host: "evil.invalid.test".to_string(),
+        path: "a/../../../../victim".to_string(),
+        r#ref: None,
+        pinned: false,
+    };
+    let error =
+        super::git::remove_git(&source, SourceScope::User, &sandbox.cwd, &sandbox.agent_dir)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("escapes the install root"), "got: {error}");
+    assert!(super::git::install_git(
+        &source,
+        SourceScope::User,
+        &sandbox.cwd,
+        &sandbox.agent_dir,
+        None,
+    )
+    .is_err());
+    assert!(super::git::update_git(
+        &source,
+        SourceScope::User,
+        &sandbox.cwd,
+        &sandbox.agent_dir,
+        None,
+    )
+    .is_err());
+    assert!(victim.join("keep.txt").exists());
 }
