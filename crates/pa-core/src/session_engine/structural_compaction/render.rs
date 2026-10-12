@@ -172,6 +172,7 @@ fn history_blocks(state: &State) -> Vec<HistoryBlock> {
             BlockOrigin::BranchSummary => "Branch summary, model-written",
             BlockOrigin::EarlierSummary => "Earlier compaction summary, model-written",
             BlockOrigin::EarlierDeterministic => "Earlier compaction summary, deterministic",
+            BlockOrigin::Fold => "Context fold result, model-written",
         };
         Some(format!(
             "{origin} [{}]:\n{}",

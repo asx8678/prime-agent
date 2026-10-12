@@ -266,7 +266,8 @@ fn message_timestamp(message: &AgentMessage) -> u64 {
 
 /// Whether the live context crossed the effective threshold
 /// ([`compaction_threshold`]) and an automatic compaction should run. Usage
-/// from before the newest `CompactionSummary` never re-triggers.
+/// from before the newest `CompactionSummary` never re-triggers, and neither
+/// does usage from before the newest closed context fold.
 #[must_use]
 pub fn threshold_compaction_due(
     messages: &[AgentMessage],
@@ -281,6 +282,16 @@ pub fn threshold_compaction_due(
         AgentMessage::CompactionSummary(summary) => Some(summary.timestamp),
         _ => None,
     });
+    // A context fold closed after the usage anchor: that usage measured the
+    // unfolded context (a turn stopped right on the `fold.end` result), and
+    // the next request leaves the fold out, so wait for its usage.
+    let fold_closed_at = messages.iter().rposition(|message| {
+        matches!(
+            message,
+            AgentMessage::ToolResult(result)
+                if super::context_fold::closed_fold(result.details.as_ref()).is_some()
+        )
+    });
     let estimate = estimate_context_tokens(messages);
     let context_tokens = if let Some(index) = estimate.last_usage_index {
         // The usage anchor must postdate the latest compaction.
@@ -289,22 +300,30 @@ pub fn threshold_compaction_due(
         {
             return false;
         }
+        if fold_closed_at.is_some_and(|at| at > index) {
+            return false;
+        }
         estimate.tokens
     }
     // No valid usage: the last assistant's raw usage decides; error
     // turns never trigger.
     else {
-        let Some(AgentMessage::Assistant(assistant)) = messages
+        let Some(index) = messages
             .iter()
-            .rev()
-            .find(|message| matches!(message, AgentMessage::Assistant(_)))
+            .rposition(|message| matches!(message, AgentMessage::Assistant(_)))
         else {
+            return false;
+        };
+        let AgentMessage::Assistant(assistant) = &messages[index] else {
             return false;
         };
         if assistant.stop_reason == pa_types::ai::StopReason::Error {
             return false;
         }
         if compaction_timestamp.is_some_and(|timestamp| assistant.timestamp <= timestamp) {
+            return false;
+        }
+        if fold_closed_at.is_some_and(|at| at > index) {
             return false;
         }
         calculate_context_tokens(&assistant.usage)
@@ -738,6 +757,63 @@ mod tests {
         assert_eq!(compaction_threshold(8_192, 8_192, &settings), 2_048);
         assert!(should_compact(7_400, 8_192, 8_192, &settings));
         assert!(!should_compact(2_000, 8_192, 8_192, &settings));
+    }
+
+    /// A `fold.end` cell's result; `folded` says whether the fold closed.
+    fn fold_end_result(folded: bool, timestamp: u64) -> AgentMessage {
+        AgentMessage::ToolResult(pa_types::ai::ToolResultMessage {
+            tool_call_id: "end".to_string(),
+            tool_name: "ipython".to_string(),
+            content: Vec::new(),
+            details: Some(serde_json::json!({
+                "status": "ok",
+                "contextFold": {
+                    "kind": "end", "description": "explore", "result": "found it",
+                    "folded": folded, "messages": 4, "tokens": 90_000, "overBudget": false,
+                },
+            })),
+            is_error: false,
+            timestamp,
+            rest: serde_json::Map::default(),
+        })
+    }
+
+    #[test]
+    fn threshold_compaction_waits_for_usage_newer_than_the_latest_closed_fold() {
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 127_500,
+            keep_recent_tokens: 10,
+            ..CompactionSettings::default()
+        };
+        // A turn stopped right on the fold.end result: the anchor measured
+        // the unfolded context.
+        let messages = vec![
+            user_message("long task", 1),
+            assistant_message(126_010, 2),
+            fold_end_result(true, 3),
+        ];
+        assert!(!threshold_compaction_due(&messages, 128_000, 0, &settings));
+        // The next request's usage measures the folded context and decides.
+        let mut messages = messages;
+        messages.push(assistant_message(126_010, 4));
+        assert!(threshold_compaction_due(&messages, 128_000, 0, &settings));
+    }
+
+    #[test]
+    fn a_voided_fold_does_not_hold_back_the_threshold() {
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 127_500,
+            keep_recent_tokens: 10,
+            ..CompactionSettings::default()
+        };
+        let messages = vec![
+            user_message("long task", 1),
+            assistant_message(126_010, 2),
+            fold_end_result(false, 3),
+        ];
+        assert!(threshold_compaction_due(&messages, 128_000, 0, &settings));
     }
 
     #[test]

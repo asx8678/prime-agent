@@ -82,6 +82,8 @@ pub(crate) enum BlockOrigin {
     /// The summary of a compaction this engine wrote, carried after its
     /// saved state was dropped (a version bump or an unreadable state).
     EarlierDeterministic,
+    /// The result of a closed context fold (`fold.end`).
+    Fold,
 }
 
 /// Model-written text carried verbatim (bounded), never summarized again.
@@ -310,6 +312,24 @@ impl State {
                     BLOCKS,
                 );
                 self.note(&at, "branch summary".to_string());
+            }
+            Event::FoldClosed {
+                description,
+                result,
+            } => {
+                let at = self.address();
+                self.blocks.push(
+                    Block {
+                        at: at.clone(),
+                        origin: BlockOrigin::Fold,
+                        text: Excerpt::of(&format!("{description}: {result}"), BLOCK_BYTES),
+                    },
+                    BLOCKS,
+                );
+                self.note(
+                    &at,
+                    format!("fold closed: {}", one_line(description, SUBJECT_CHARS)),
+                );
             }
         }
     }

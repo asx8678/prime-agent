@@ -88,6 +88,9 @@ pub(crate) enum Event {
     CarryItems { items: Vec<String> },
     /// A summary written once at a branch boundary (`/tree`).
     BranchSummary { text: String },
+    /// A context fold closed (`fold.end`): the model's result stands in for
+    /// the folded work, so it is carried like a branch summary.
+    FoldClosed { description: String, result: String },
 }
 
 /// The prompts the harness injects into a session.
@@ -194,7 +197,17 @@ fn push_message(message: &AgentMessage, events: &mut Vec<Event>) {
             });
         }
         AgentMessage::Assistant(assistant) => push_assistant(&assistant.content, events),
-        AgentMessage::ToolResult(result) => events.push(tool_end(result)),
+        AgentMessage::ToolResult(result) => {
+            events.push(tool_end(result));
+            if let Some(fold) =
+                crate::session_engine::context_fold::closed_fold(result.details.as_ref())
+            {
+                events.push(Event::FoldClosed {
+                    description: fold.description,
+                    result: fold.result,
+                });
+            }
+        }
         AgentMessage::BashExecution(bash) => {
             if bash.exclude_from_context != Some(true) {
                 events.push(Event::BashDone {

@@ -299,6 +299,95 @@ fn a_state_saved_by_another_version_is_not_folded_further() {
     );
 }
 
+/// A user turn, one `ipython` cell, and its result carrying `marker` as
+/// the cell's context-fold marker.
+fn fold_cell_log(marker: &serde_json::Value) -> Vec<FileEntry> {
+    let rows = [
+        serde_json::json!({"type": "message", "id": "e1", "message": {"role": "user", "content": "fix the parser", "timestamp": 1}}),
+        serde_json::json!({"type": "message", "id": "e2", "parentId": "e1", "message": {
+            "role": "assistant",
+            "content": [{"type": "toolCall", "id": "call_1", "name": "ipython", "arguments": {"code": "await fold.end(r)"}}],
+            "api": "test", "provider": "test", "model": "m", "stopReason": "toolUse", "timestamp": 2,
+            "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}
+        }}),
+        serde_json::json!({"type": "message", "id": "e3", "parentId": "e2", "message": {
+            "role": "toolResult", "toolCallId": "call_1", "toolName": "ipython",
+            "content": [{"type": "text", "text": "Fold closed"}],
+            "details": {"status": "ok", "contextFold": marker},
+            "isError": false, "timestamp": 3
+        }}),
+    ];
+    rows.iter()
+        .map(|row| serde_json::from_value(row.clone()).expect("a log row parses"))
+        .collect()
+}
+
+fn end_marker(folded: bool) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "end", "description": "explore the parser", "result": "the bug is in depth()",
+        "folded": folded, "messages": 6, "tokens": 4_000, "overBudget": false,
+    })
+}
+
+#[test]
+fn a_closed_fold_result_is_carried_as_a_fold_block() {
+    let events = normalize(&fold_cell_log(&end_marker(true)));
+    assert_eq!(
+        events.last(),
+        Some(&Event::FoldClosed {
+            description: text("explore the parser"),
+            result: text("the bug is in depth()"),
+        })
+    );
+    let mut state = State::new();
+    state.fold(&events);
+    let summary = render(&state, None, &[], DEFAULT_MAX_BYTES);
+    assert!(
+        summary.contains(
+            "Context fold result, model-written [u1.c1]:\nexplore the parser: the bug is in depth()"
+        ),
+        "got: {summary}"
+    );
+}
+
+#[test]
+fn an_open_or_voided_fold_adds_no_block() {
+    let begin = serde_json::json!({ "kind": "begin", "description": "explore", "goal": "find it" });
+    for marker in [begin, end_marker(false)] {
+        let events = normalize(&fold_cell_log(&marker));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::FoldClosed { .. })),
+            "{events:?}"
+        );
+    }
+}
+
+#[test]
+fn a_state_saved_before_fold_blocks_still_parses() {
+    // A version-2 state saved before fold blocks existed, folded further
+    // with a closed fold: the new variant is additive, so no version bump.
+    let mut earlier = State::new();
+    earlier.fold(&[Event::BranchSummary {
+        text: text("the branch so far"),
+    }]);
+    let saved = earlier.to_value();
+    assert!(!saved.to_string().contains("\"fold\""));
+    let mut resumed = State::from_value(&saved).expect("a saved state loads");
+    resumed.fold(&normalize(&fold_cell_log(&end_marker(true))));
+    let summary = render(&resumed, None, &[], DEFAULT_MAX_BYTES);
+    assert!(
+        summary.contains("Branch summary, model-written"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("Context fold result, model-written"),
+        "{summary}"
+    );
+}
+
 #[test]
 fn a_cell_is_labeled_by_its_first_top_level_statement() {
     let code = "import os\n# helper\ndef sh(cmd):\n    return bash(cmd)\n\n@cache\nasync def run():\n    pass\nresult = await sh('make')\n";
@@ -535,6 +624,10 @@ fn event() -> impl Strategy<Value = Event> {
             .prop_map(|(kind, text)| Event::Notice { kind, text }),
         (words(), words()).prop_map(|(custom_type, text)| Event::Custom { custom_type, text }),
         words().prop_map(|text| Event::BranchSummary { text }),
+        (words(), words()).prop_map(|(description, result)| Event::FoldClosed {
+            description,
+            result,
+        }),
     ]
 }
 

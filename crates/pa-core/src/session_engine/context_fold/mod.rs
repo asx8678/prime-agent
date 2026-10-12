@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 
 use pa_agent::types::{AgentMessage, Message, ToolResultContent};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::goals::{GoalContextDetails, GoalContextKind, GOAL_CONTEXT_CUSTOM_TYPE};
@@ -59,27 +60,43 @@ impl ContextFolding {
     }
 }
 
-/// One cell's fold marker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Marker {
+/// One cell's fold marker (`details.contextFold`), as the `fold` skill
+/// emits it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum Marker {
     /// `fold.begin`, with the fold's short label.
     Begin { description: String },
     /// `fold.end`.
-    End,
+    End(EndMarker),
+}
+
+/// A `fold.end` cell's marker. The host decides `folded` when `fold.end`
+/// runs; the view recomputes the pair either way and never trusts it for
+/// what it leaves out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct EndMarker {
+    pub(crate) description: String,
+    /// What the model keeps in place of the folded work.
+    pub(crate) result: String,
+    /// Whether the fold closed (`false`: it was voided or refused).
+    pub(crate) folded: bool,
 }
 
 impl Marker {
     /// Decode a tool result's details. Anything malformed is no marker, so
     /// it leaves nothing out.
-    fn from_details(details: Option<&Value>) -> Option<Marker> {
-        let marker = details?.get(MARKER_DETAILS_KEY)?;
-        match marker.get("kind")?.as_str()? {
-            "begin" => Some(Marker::Begin {
-                description: marker.get("description")?.as_str()?.to_string(),
-            }),
-            "end" => Some(Marker::End),
-            _ => None,
-        }
+    pub(crate) fn from_details(details: Option<&Value>) -> Option<Marker> {
+        serde_json::from_value(details?.get(MARKER_DETAILS_KEY)?.clone()).ok()
+    }
+}
+
+/// The end marker of a fold that closed, when `details` carries one.
+pub(crate) fn closed_fold(details: Option<&Value>) -> Option<EndMarker> {
+    match Marker::from_details(details)? {
+        Marker::End(end) => end.folded.then_some(end),
+        Marker::Begin { .. } => None,
     }
 }
 
@@ -219,7 +236,7 @@ impl Folds {
                                 });
                             }
                         }
-                        Some(Marker::End) => {
+                        Some(Marker::End(_)) => {
                             // An end in the begin's own group, or one that
                             // answers no known call, closes the fold and
                             // leaves out nothing.
