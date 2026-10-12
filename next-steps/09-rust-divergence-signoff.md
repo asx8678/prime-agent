@@ -49,6 +49,7 @@ default again is decided together with the TS side.
 | 10 | PR-11 `rlm.set_cost_ceiling` | opt-in USD/spawn cap over the whole spawn tree, persisted; children inherit the remaining budget | none | **model** (new API), session files, daemon create metadata | opt-in |
 | 11 | next-steps/08 idle passivation waits for a live warm window | a worker defers its own idle stop while warming (only when warming is opted in) | has `idleEvictionMinutes` but no warmer, so nothing to defer | worker lifecycle | default off (follows `cacheWarming`) |
 | 12 | next-steps/05 context folding (`fold.begin` / `fold.end`) | gated `fold` skill; requests leave out the work between a closed fold's begin and end cells (the session log keeps it), add a reminder line to results inside an open fold, and compaction carries each fold's result; 5 telemetry counters | none | **model** (new API, gated), telemetry | default off (`contextFolding.enabled`) |
+| 13 | validated_to_fix A02: provider stream idle timeout | a response body (direct providers and the proxy) that sends no byte for 10 minutes fails as a connection timeout, which the retry/failover path handles; the wait for response headers is bounded by the request's `timeout_ms` (now honored even with an abort signal) or the same 10 minutes | the SDKs time out the request at 10 minutes up to the response headers; a body that stalls after them waits forever | user (a dead stream now errors instead of hanging) | none |
 
 ## Shared surfaces each item touches
 
@@ -110,6 +111,7 @@ TS answer where a shared surface is listed.
 | 10 | ☐ | ☐ API + `rlmCostCeiling` key + skip list | |
 | 11 | ☐ | n/a | |
 | 12 | ☐ (default off) | ☐ API + schema | evaluation (next-steps/05b step 8) decides any default |
+| 13 | ☐ | n/a | only dead streams reach it |
 
 Parity-diff evidence (frame diffs, interactive and wire comparisons against a
 running TS binary) is still owed per item before merge. This brief covers the

@@ -12,6 +12,12 @@ use crate::utils::stream_failure::{
     ProviderHttpError,
 };
 
+/// How long a response body may go without a byte before the read fails as a connection timeout,
+/// which the agent's retry and failover path handles like any other. Providers keep a live stream
+/// moving (output, or pings while the model thinks) well inside this, so only a dead stream
+/// reaches it; ten minutes is the TS SDKs' default request timeout.
+const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static H2_ALPN_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -58,6 +64,8 @@ pub struct HttpResponse {
     /// The request's connection-error profile: body-read failures on the AWS http2 profile surface
     /// the TS bedrock transport's mid-stream texts.
     pub(crate) connection: ConnectionErrorProfile,
+    /// The longest wait for the next body chunk ([`BODY_IDLE_TIMEOUT`]).
+    idle_timeout: std::time::Duration,
 }
 
 impl HttpResponse {
@@ -74,15 +82,18 @@ impl HttpResponse {
                 return Err(ProviderError::Aborted);
             }
             let signal = self.signal.clone();
+            let next = tokio::time::timeout(self.idle_timeout, self.body.chunk());
             let chunk = match signal {
                 Some(signal) => {
-                    let next = self.body.chunk();
                     tokio::select! {
                         () = signal.cancelled() => return Err(ProviderError::Aborted),
                         result = next => result,
                     }
                 }
-                None => self.body.chunk().await,
+                None => next.await,
+            };
+            let Ok(chunk) = chunk else {
+                return Err(self.idle_timeout_error());
             };
             let text = match chunk {
                 Ok(Some(bytes)) => {
@@ -131,21 +142,34 @@ impl HttpResponse {
             return Err(ProviderError::Aborted);
         }
         let signal = self.signal.clone();
+        let next = tokio::time::timeout(self.idle_timeout, self.body.chunk());
         let chunk = match signal {
             Some(signal) => {
-                let next = self.body.chunk();
                 tokio::select! {
                     () = signal.cancelled() => return Err(ProviderError::Aborted),
                     result = next => result,
                 }
             }
-            None => self.body.chunk().await,
+            None => next.await,
+        };
+        let Ok(chunk) = chunk else {
+            return Err(self.idle_timeout_error());
         };
         match chunk {
             Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
             Ok(None) => Ok(None),
             Err(error) => Err(self.body_error(&error)),
         }
+    }
+
+    /// A body that sent nothing for [`Self::idle_timeout`]: a dead stream, reported as a
+    /// connection timeout so the caller's retry path takes over instead of waiting forever.
+    fn idle_timeout_error(&self) -> ProviderError {
+        ProviderError::Connection(ProviderConnectionError {
+            kind: ConnectionErrorKind::Timeout,
+            profile: self.connection.clone(),
+            cause: format!("no response bytes for {}s", self.idle_timeout.as_secs_f64()),
+        })
     }
 
     /// Classify a body-read failure: the AWS bedrock http2 profile surfaces the TS transport's
@@ -249,29 +273,28 @@ pub async fn send(request: RequestOptions) -> Result<HttpResponse, ProviderError
         builder = builder.body(body.clone());
     }
 
-    let send_future = builder.send();
-    let response = match (&signal, request.timeout_ms) {
-        (Some(signal), _) => {
+    // The response headers must arrive within the request's timeout (TS SDKs
+    // honor it whether or not a signal is passed), or within the idle window
+    // when the request sets none: a peer that never answers is dead.
+    let header_wait = request
+        .timeout_ms
+        .map_or(BODY_IDLE_TIMEOUT, std::time::Duration::from_millis);
+    let send_future = tokio::time::timeout(header_wait, builder.send());
+    let response = match &signal {
+        Some(signal) => {
             tokio::select! {
                 () = signal.cancelled() => return Err(ProviderError::Aborted),
                 result = send_future => result,
             }
         }
-        (None, Some(timeout_ms)) => {
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), send_future)
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    return Err(ProviderError::Connection(ProviderConnectionError {
-                        kind: ConnectionErrorKind::Timeout,
-                        profile: request.connection.clone(),
-                        cause: format!("request exceeded the {timeout_ms}ms timeout"),
-                    }))
-                }
-            }
-        }
-        (None, None) => send_future.await,
+        None => send_future.await,
+    };
+    let Ok(response) = response else {
+        return Err(ProviderError::Connection(ProviderConnectionError {
+            kind: ConnectionErrorKind::Timeout,
+            profile: request.connection.clone(),
+            cause: format!("request exceeded the {}ms timeout", header_wait.as_millis()),
+        }));
     };
 
     // The TS SDKs surface request-send failures as their fixed connection error texts: the
@@ -317,6 +340,7 @@ pub async fn send(request: RequestOptions) -> Result<HttpResponse, ProviderError
         signal,
         utf8_tail: Vec::new(),
         connection: request.connection,
+        idle_timeout: BODY_IDLE_TIMEOUT,
     })
 }
 
@@ -408,6 +432,36 @@ mod tests {
             text.push_str(&chunk);
         }
         assert_eq!(text, "hi 你!");
+    }
+
+    /// A stream that sends headers and a first chunk, then nothing: the next read fails as a
+    /// connection timeout after the idle window instead of waiting forever.
+    #[tokio::test]
+    async fn a_stalled_body_fails_as_a_timeout_after_the_idle_window() {
+        let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel();
+        let addr = serve_split_body(b"data: a\n\n".to_vec(), b"never".to_vec(), hold_rx).await;
+        let mut options = RequestOptions::new(reqwest::Method::GET, format!("http://{addr}/"));
+        options.signal = Some(CancellationToken::new());
+        let mut response = send(options).await.unwrap();
+        response.idle_timeout = std::time::Duration::from_millis(200);
+        assert_eq!(
+            response.next_text().await.unwrap().as_deref(),
+            Some("data: a\n\n")
+        );
+        let stalled =
+            tokio::time::timeout(std::time::Duration::from_secs(10), response.next_text())
+                .await
+                .expect("the read gives up on its own, without the outer bound");
+        assert!(
+            matches!(
+                stalled,
+                Err(ProviderError::Connection(ProviderConnectionError {
+                    kind: ConnectionErrorKind::Timeout,
+                    ..
+                }))
+            ),
+            "{stalled:?}"
+        );
     }
 
     /// A body that ends inside a multi-byte character yields the valid text plus exactly one

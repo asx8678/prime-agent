@@ -263,7 +263,8 @@ async fn proxy_run(
     });
 
     let client = reqwest::Client::new();
-    let send = async {
+    let send = tokio::time::timeout(
+        PROXY_BODY_IDLE_TIMEOUT,
         client
             .post(format!("{}/api/stream", proxy_options.proxy_url))
             .header(
@@ -272,13 +273,13 @@ async fn proxy_run(
             )
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
-    };
+            .send(),
+    );
 
     let response = match run_aborting(send, signal).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => return Err(format!("{error}")),
+        Ok(Ok(Ok(response))) => response,
+        Ok(Ok(Err(error))) => return Err(format!("{error}")),
+        Ok(Err(_elapsed)) => return Err(proxy_stalled("response")),
         Err(()) => return Err("Request aborted by user".to_string()),
     };
 
@@ -300,12 +301,13 @@ async fn proxy_run(
     let mut byte_buffer: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     loop {
-        let chunk = async { stream.next().await };
+        let chunk = tokio::time::timeout(PROXY_BODY_IDLE_TIMEOUT, stream.next());
         let chunk = match run_aborting(chunk, signal).await {
             Err(()) => return Err("Request aborted by user".to_string()),
-            Ok(None) => break,
-            Ok(Some(Err(error))) => return Err(format!("{error}")),
-            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Err(_elapsed)) => return Err(proxy_stalled("data")),
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(Err(error)))) => return Err(format!("{error}")),
+            Ok(Ok(Some(Ok(bytes)))) => bytes,
         };
 
         byte_buffer.extend_from_slice(&chunk);
@@ -336,6 +338,24 @@ async fn proxy_run(
 
     // Clean EOF without a terminal event.
     Ok(())
+}
+
+/// How long the proxy may take to answer, and its event stream may go
+/// without a byte, before the run fails: only a dead stream reaches it, since a live one sends events (the
+/// provider's output or pings) well inside the window. Ten minutes in
+/// production; short in tests so a stall test finishes.
+const PROXY_BODY_IDLE_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(2)
+} else {
+    std::time::Duration::from_secs(600)
+};
+
+/// The error a dead proxy stream ends with.
+fn proxy_stalled(waiting_for: &str) -> String {
+    format!(
+        "Proxy stream stalled: no {waiting_for} for {}s",
+        PROXY_BODY_IDLE_TIMEOUT.as_secs_f64()
+    )
 }
 
 async fn run_aborting<T>(
@@ -962,6 +982,70 @@ mod tests {
             let _ = socket.shutdown().await;
         });
         format!("http://{addr}")
+    }
+
+    /// Serve SSE headers and one event for the proxy's POST, then hold the
+    /// connection open without sending anything more.
+    async fn serve_stalled_proxy_sse(first_event: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let event = format!("data: {first_event}\n\n");
+            let framed = format!("{:x}\r\n{event}\r\n", event.len());
+            socket.write_all(framed.as_bytes()).await.unwrap();
+            // Hold the socket open, silent, until the client gives up.
+            let _ = socket.read(&mut chunk).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_stalled_proxy_stream_ends_with_an_error_instead_of_hanging() {
+        let base_url = serve_stalled_proxy_sse(r#"{"type":"start"}"#.to_string()).await;
+        let (_handle, mut stream) = stream_proxy(
+            test_model(base_url.clone()),
+            LlmContext {
+                system_prompt: None,
+                messages: Vec::new(),
+                tools: Vec::new(),
+            },
+            request_options(),
+            proxy_options(base_url),
+        );
+        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let Some(event) = stream.next_event().await else {
+                    break None;
+                };
+                if let Some(message) = event.terminal_message() {
+                    break Some(message.clone());
+                }
+            }
+        })
+        .await
+        .expect("the stalled stream ends on its own");
+        let message = terminal.expect("a terminal error event");
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert!(
+            message
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.contains("Proxy stream stalled")),
+            "{:?}",
+            message.error_message
+        );
     }
 
     fn proxy_options(proxy_url: String) -> ProxyStreamOptions {
