@@ -107,6 +107,9 @@ struct SharedState {
     waker: Option<Waker>,
     resolved: Option<AssistantMessage>,
     waiters: Vec<tokio::sync::oneshot::Sender<AssistantMessage>>,
+    /// The api, provider and model of the first event, for the error
+    /// message a stream whose writers all dropped settles with.
+    origin: Option<(String, String, String)>,
 }
 
 impl SharedState {
@@ -133,6 +136,14 @@ impl Shared {
         let mut state = self.state.lock().unwrap();
         if state.done {
             return;
+        }
+        if state.origin.is_none() {
+            let partial = event.partial();
+            state.origin = Some((
+                partial.api.clone(),
+                partial.provider.clone(),
+                partial.model.clone(),
+            ));
         }
         if event.is_terminal() {
             state.done = true;
@@ -168,8 +179,10 @@ pub struct AssistantMessageEventWriter {
 
 /// Ends the stream when the last writer clone drops before a terminal event
 /// or `end` (a provider task that panicked or returned early). Without it
-/// the reader parks forever and the agent turn hangs; with it the reader
-/// sees the stream end, which the agent loop reports as an error.
+/// the reader parks forever and the agent turn hangs. With it the events
+/// end, and `result()` settles with an error message, so every consumer
+/// (the session's stream bridge, one-off summary calls) fails the request
+/// instead of waiting.
 struct WriterLiveness {
     shared: Arc<Shared>,
 }
@@ -184,6 +197,14 @@ impl Drop for WriterLiveness {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.done {
             state.done = true;
+            if state.resolved.is_none() {
+                let (api, provider, model) = state.origin.clone().unwrap_or_default();
+                let mut message = initial_assistant_message(&api, &provider, &model);
+                message.stop_reason = StopReason::Error;
+                message.error_message =
+                    Some("The provider stream ended without a final message".to_string());
+                state.resolve(message);
+            }
             if let Some(waker) = state.waker.take() {
                 waker.wake();
             }
@@ -434,6 +455,16 @@ mod tests {
         let first = stream.next_event().await.expect("the queued event");
         assert_eq!(first.event_type(), "start");
         assert!(stream.next_event().await.is_none(), "the stream ended");
+        // The final result settles too, as an error, instead of waiting.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("the result settles");
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("The provider stream ended without a final message")
+        );
+        assert_eq!(result.model, sample_message("").model);
     }
 
     #[tokio::test]
