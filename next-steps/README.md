@@ -27,7 +27,9 @@ Saved 2026-10-11, committed on `main`. Update it as work lands.
 4. [04-pr5-carry-and-preserve.md](04-pr5-carry-and-preserve.md): notes
    that survive every compaction.
 5. [05-context-folding.md](05-context-folding.md): fold finished sub-tasks
-   out of the live context (largest, riskiest; behind a setting).
+   out of the live context (largest, riskiest; behind a setting). The
+   step-by-step build order is
+   [05b-context-folding-build-plan.md](05b-context-folding-build-plan.md).
 6. [06-follow-ups.md](06-follow-ups.md): smaller issues found along the
    way, and housekeeping.
 
