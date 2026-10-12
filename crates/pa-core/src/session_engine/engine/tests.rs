@@ -766,3 +766,84 @@ async fn a_resumed_session_with_a_closed_fold_sends_the_folded_view_only_when_en
     unfolded.drain(at - 1..=at);
     assert_eq!(first_requests[0], unfolded);
 }
+
+/// A tool that runs but reports a failure (as a failed `ipython` cell does)
+/// returns `Ok` with `is_error`: the tool-result message the model sees, and
+/// the session keeps, is marked as an error, with the tool's details intact.
+#[tokio::test]
+async fn a_tool_that_reports_a_failure_marks_its_result_as_an_error() {
+    let failing = ToolDefinition {
+        name: "cell".to_string(),
+        label: "Cell".to_string(),
+        description: "Runs a cell".to_string(),
+        prompt_snippet: String::new(),
+        parameters: serde_json::json!({ "type": "object" }),
+        execution_mode: Some(ExecutionMode::Sequential),
+        prepare_arguments: None,
+        execute: Arc::new(|_id, _params, _signal, _on_update| {
+            Box::pin(async move {
+                Ok(ToolExecutionResult {
+                    details: Some(serde_json::json!({ "status": "error" })),
+                    is_error: true,
+                    ..ToolExecutionResult::text("ValueError: boom")
+                })
+            })
+        }),
+    };
+    let provider = Arc::new(ScriptedProvider::new(fold_test_model()));
+    provider.push_tool_call_turn(None, vec![("c1", "cell", serde_json::json!({}))]);
+    provider.push_text_turn("done");
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let engine = create_session(SessionEngineConfig {
+        cwd,
+        agent_dir,
+        model: Some(fold_test_model()),
+        stream_fn: Some(provider.stream_fn()),
+        tools: vec![bridge_tool(failing)],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    engine
+        .prompt("run it", PromptOptions::default())
+        .await
+        .unwrap();
+    engine.session.agent().wait_for_idle().await;
+
+    let sent: Vec<(bool, String)> = provider.calls()[1]
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            pa_agent::types::Message::ToolResult(result) => {
+                Some((result.is_error, tool_result_text(&result.content)))
+            }
+            pa_agent::types::Message::User(_) | pa_agent::types::Message::Assistant(_) => None,
+        })
+        .collect();
+    assert_eq!(sent, vec![(true, "ValueError: boom".to_string())]);
+    let kept: Vec<(bool, Option<serde_json::Value>)> = engine
+        .session
+        .agent()
+        .state()
+        .await
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::ToolResult(
+                result,
+            )) => Some((result.is_error, result.details.clone())),
+            pa_agent::types::AgentMessage::Standard(
+                pa_agent::types::Message::User(_) | pa_agent::types::Message::Assistant(_),
+            )
+            | pa_agent::types::AgentMessage::Custom(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        kept,
+        vec![(true, Some(serde_json::json!({ "status": "error" })))]
+    );
+}

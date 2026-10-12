@@ -197,6 +197,7 @@ fn tool_execution_event(tool: &str, is_error: bool) -> (AgentEvent, AgentEvent) 
                 content: vec![ToolResultContent::text("private tool output")],
                 details: serde_json::Value::Null,
                 terminate: None,
+                is_error: false,
             },
             is_error,
         },
@@ -1694,6 +1695,7 @@ fn fold_cell_end(id: &str, marker: &serde_json::Value) -> AgentEvent {
             content: vec![ToolResultContent::text("private fold result")],
             details: serde_json::json!({ "status": "ok", "contextFold": marker }),
             terminate: None,
+            is_error: false,
         },
         is_error: false,
     }
