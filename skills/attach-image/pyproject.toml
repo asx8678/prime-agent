@@ -2,7 +2,7 @@
 name = "prime-agent-skill-attach-image"
 version = "0.1.0"
 description = "Load on-disk images into the model's context as viewable attachments."
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = ["pillow>=10.0.0", "prime-agent-runtime"]
 
 [project.scripts]

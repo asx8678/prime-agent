@@ -57,7 +57,7 @@ use version::{
 #[cfg(test)]
 use version::{recorded_skills_cover, BOOTSTRAP_SCHEMA};
 
-const PYTHON_VERSION: &str = "3.11";
+const PYTHON_VERSION: &str = "3.14";
 const RUNTIME_REQUIREMENT: &str = "prime-agent-runtime";
 pub(crate) const BOOTSTRAP_LOCK_NAME: &str = ".bootstrap.lock";
 pub(crate) const BOOTSTRAP_LOCK_RETRY_MS: u64 = 100;

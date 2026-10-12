@@ -6,7 +6,7 @@
 name = "compact"
 version = "0.1.0"
 description = "Prime Agent compact skill: context compaction control over the host bridge"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = []
 
 [build-system]
