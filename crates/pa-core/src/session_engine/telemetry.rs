@@ -207,6 +207,13 @@ struct SessionTotals {
     cache_miss_noise_count: u64,
     cache_miss_unattributed_count: u64,
     cache_missed_tokens: u64,
+    /// Context folding (`fold.begin` / `fold.end` cells): counts and the
+    /// estimated tokens hidden, never the fold's text.
+    context_fold_begin_count: u64,
+    context_fold_closed_count: u64,
+    context_fold_voided_count: u64,
+    context_fold_tokens_folded: u64,
+    context_fold_budget_nudge_count: u64,
 }
 
 impl SessionTotals {
@@ -841,6 +848,26 @@ impl SessionTelemetry {
                 "cache_missed_tokens",
                 Value::from(totals.cache_missed_tokens),
             );
+            properties.set(
+                "context_fold_begin_count",
+                Value::from(totals.context_fold_begin_count),
+            );
+            properties.set(
+                "context_fold_closed_count",
+                Value::from(totals.context_fold_closed_count),
+            );
+            properties.set(
+                "context_fold_voided_count",
+                Value::from(totals.context_fold_voided_count),
+            );
+            properties.set(
+                "context_fold_tokens_folded",
+                Value::from(totals.context_fold_tokens_folded),
+            );
+            properties.set(
+                "context_fold_budget_nudge_count",
+                Value::from(totals.context_fold_budget_nudge_count),
+            );
         }
         self.counters.write_into(&mut properties);
         self.client.track("agent session ended", properties);
@@ -1141,9 +1168,30 @@ fn handle_event(
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
             tool_name,
+            result,
             is_error,
-            ..
         } => {
+            match super::context_fold::Marker::from_details(Some(&result.details)) {
+                Some(super::context_fold::Marker::Begin { .. }) => {
+                    state.totals.context_fold_begin_count += 1;
+                }
+                Some(super::context_fold::Marker::End(end)) => {
+                    if end.folded {
+                        state.totals.context_fold_closed_count += 1;
+                        state.totals.context_fold_tokens_folded += end.tokens;
+                        // The next request leaves the fold out: its prompt is
+                        // smaller by design, not a cache miss, so the baseline
+                        // resets as after a compaction.
+                        state.prev_request = None;
+                    } else {
+                        state.totals.context_fold_voided_count += 1;
+                    }
+                    if end.over_budget {
+                        state.totals.context_fold_budget_nudge_count += 1;
+                    }
+                }
+                None => {}
+            }
             let started_at = state.tool_starts.remove(&tool_call_id);
             let duration_ms = started_at.map_or(0, |start| now.saturating_sub(start));
             let category = ToolCategory::from_tool_name(&tool_name);

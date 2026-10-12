@@ -82,6 +82,11 @@ pub(crate) struct EndMarker {
     pub(crate) result: String,
     /// Whether the fold closed (`false`: it was voided or refused).
     pub(crate) folded: bool,
+    /// How many messages the close hid, and their estimated tokens.
+    pub(crate) messages: u64,
+    pub(crate) tokens: u64,
+    /// Whether the fold had passed `maxFoldTokens` when it closed.
+    pub(crate) over_budget: bool,
 }
 
 impl Marker {

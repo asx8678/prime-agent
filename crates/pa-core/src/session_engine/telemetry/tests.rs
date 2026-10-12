@@ -1684,3 +1684,113 @@ async fn a_run_active_when_telemetry_turns_off_is_severed_not_merged() {
         "the off-period tool end never counts"
     );
 }
+
+/// An `ipython` cell's end carrying `marker` as its context-fold marker.
+fn fold_cell_end(id: &str, marker: &serde_json::Value) -> AgentEvent {
+    AgentEvent::ToolExecutionEnd {
+        tool_call_id: id.to_string(),
+        tool_name: "ipython".to_string(),
+        result: pa_agent::types::AgentToolResult {
+            content: vec![ToolResultContent::text("private fold result")],
+            details: serde_json::json!({ "status": "ok", "contextFold": marker }),
+            terminate: None,
+        },
+        is_error: false,
+    }
+}
+
+fn fold_end_marker(folded: bool, over_budget: bool) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "end", "description": "private label", "result": "private result",
+        "folded": folded, "messages": 6, "tokens": 4_000, "overBudget": over_budget,
+    })
+}
+
+#[tokio::test]
+async fn fold_markers_count_into_the_session_totals() {
+    let fixture = fixture();
+    let telemetry = SessionTelemetry::detached(
+        fixture.client.clone(),
+        fixture.state.clone(),
+        "interactive".to_string(),
+    );
+    let begin = serde_json::json!({ "kind": "begin", "description": "private label", "goal": "private goal" });
+    emit(&fixture, fold_cell_end("c1", &begin));
+    emit(&fixture, fold_cell_end("c2", &fold_end_marker(true, false)));
+    emit(&fixture, fold_cell_end("c3", &begin));
+    emit(&fixture, fold_cell_end("c4", &fold_end_marker(true, true)));
+    emit(&fixture, fold_cell_end("c5", &begin));
+    emit(
+        &fixture,
+        fold_cell_end("c6", &fold_end_marker(false, false)),
+    );
+
+    telemetry.end().await.unwrap();
+    let ended = &event_properties(&fixture.mock, "agent session ended").await[0];
+    let folds: serde_json::Map<String, serde_json::Value> = ended
+        .iter()
+        .filter(|(key, _)| key.starts_with("context_fold_"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(
+        serde_json::Value::Object(folds),
+        serde_json::json!({
+            "context_fold_begin_count": 3,
+            "context_fold_closed_count": 2,
+            "context_fold_voided_count": 1,
+            "context_fold_tokens_folded": 8_000,
+            "context_fold_budget_nudge_count": 1,
+        })
+    );
+    // Primitives only: no fold text rides the event.
+    let ended = serde_json::Value::Object(ended.clone()).to_string();
+    assert!(!ended.contains("private"), "{ended}");
+}
+
+/// A warm request, a fold end, then a much smaller request: the cache-miss
+/// classification of that last request.
+async fn cache_misses_after_a_fold_end(folded: bool) -> serde_json::Value {
+    let clock = TestClock::default();
+    let fixture = fixture_with_clock(clock.clone());
+    let telemetry = SessionTelemetry::detached(
+        fixture.client.clone(),
+        fixture.state.clone(),
+        "interactive".to_string(),
+    );
+    clock.set(0);
+    emit(
+        &fixture,
+        message_end_event(assistant_with_cache(0, 100_000, 0)),
+    );
+    emit(
+        &fixture,
+        fold_cell_end("c1", &fold_end_marker(folded, false)),
+    );
+    clock.set(5_000);
+    emit(
+        &fixture,
+        message_end_event(assistant_with_cache(30_000, 0, 0)),
+    );
+    telemetry.end().await.unwrap();
+    let ended = &event_properties(&fixture.mock, "agent session ended").await[0];
+    serde_json::json!({
+        "unattributed": ended["cache_miss_unattributed_count"],
+        "missed": ended["cache_missed_tokens"],
+    })
+}
+
+#[tokio::test]
+async fn a_closed_fold_resets_the_cache_miss_baseline() {
+    assert_eq!(
+        cache_misses_after_a_fold_end(true).await,
+        serde_json::json!({ "unattributed": 0, "missed": 0 })
+    );
+}
+
+#[tokio::test]
+async fn a_voided_fold_keeps_the_cache_miss_baseline() {
+    assert_eq!(
+        cache_misses_after_a_fold_end(false).await,
+        serde_json::json!({ "unattributed": 1, "missed": 30_000 })
+    );
+}
