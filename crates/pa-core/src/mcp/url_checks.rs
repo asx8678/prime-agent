@@ -35,7 +35,8 @@ pub(crate) fn is_literal_private_or_loopback_host(hostname: &str) -> bool {
                 if words[..7].iter().all(|word| word == &0) && words[7] == 1 {
                     return true;
                 }
-                if words[..6].iter().all(|word| word == &0) && words[5] == 0xffff {
+                // IPv4-mapped (::ffff:a.b.c.d): five zero words, then 0xffff.
+                if words[..5].iter().all(|word| word == &0) && words[5] == 0xffff {
                     let v4 = [
                         words[6] >> 8,
                         words[6] & 0xff,
@@ -159,6 +160,20 @@ mod tests {
                 "{host} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_literals_are_judged_by_their_ipv4_address() {
+        for host in ["[::ffff:7f00:1]", "[::ffff:a00:1]", "[::ffff:c0a8:1]"] {
+            assert!(
+                is_literal_private_or_loopback_host(host),
+                "{host} maps a private address and must be refused"
+            );
+        }
+        assert!(
+            !is_literal_private_or_loopback_host("[::ffff:808:808]"),
+            "a mapped public address passes"
+        );
     }
 
     #[test]
