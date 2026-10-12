@@ -355,7 +355,9 @@ jobs:
           set -euo pipefail
           reference="${RUNNER_TEMP}/lifecycle-ts-reference"
           mkdir -p "${reference}"
-          gh release download v0.9.8 --repo "${GITHUB_REPOSITORY}" \
+          # The TS release lives on the org repo; a fork has no copy, and the
+          # sha256 check below pins the bytes wherever they come from.
+          gh release download v0.9.8 --repo PrimeIntellect-ai/prime-agent \
             --pattern prime-agent-0.9.8-linux-x64.tar.gz --dir "${reference}"
           archive="${reference}/prime-agent-0.9.8-linux-x64.tar.gz"
           echo "83fb09129bf78e3e60268212cd70932166591b15188caa70c1b0efbcc76235e2  ${archive}" | sha256sum --check
