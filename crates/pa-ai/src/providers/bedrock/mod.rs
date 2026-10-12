@@ -456,7 +456,7 @@ async fn run_stream(
     command_input.insert("modelId".into(), json!(model.id));
     command_input.insert(
         "messages".into(),
-        json!(convert_messages(context, model, cache_retention)),
+        json!(convert_messages(context, model, cache_retention).map_err(ProviderError::Message)?),
     );
     if let Some(system) =
         build_system_prompt_blocks(context.system_prompt.as_deref(), model, cache_retention)
@@ -997,6 +997,62 @@ mod tests {
             &test_model("us.anthropic.claude"),
             &options
         ));
+    }
+
+    /// One user message carrying `image`, and one tool result carrying it.
+    fn image_contexts(mime_type: &str, data: &str) -> [crate::types::Context; 2] {
+        let image = serde_json::json!({ "type": "image", "data": data, "mimeType": mime_type });
+        [
+            serde_json::from_value(serde_json::json!({
+                "messages": [{ "role": "user", "content": [image], "timestamp": 1 }],
+            }))
+            .expect("a user-image context"),
+            serde_json::from_value(serde_json::json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{ "type": "toolCall", "id": "t1", "name": "shot", "arguments": {} }],
+                        "api": API_BEDROCK_CONVERSE_STREAM, "provider": "amazon-bedrock",
+                        "model": "us.anthropic.claude", "stopReason": "toolUse", "timestamp": 1,
+                        "usage": {
+                            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
+                        },
+                    },
+                    {
+                        "role": "toolResult", "toolCallId": "t1", "toolName": "shot",
+                        "content": [image], "isError": false, "timestamp": 2,
+                    },
+                ],
+            }))
+            .expect("a tool-image context"),
+        ]
+    }
+
+    #[test]
+    fn an_image_bedrock_cannot_take_fails_the_request_instead_of_panicking() {
+        use crate::providers::bedrock::convert::convert_messages;
+        // A vision model: otherwise images become placeholders before conversion.
+        let mut model = test_model("us.anthropic.claude");
+        model.input = vec![
+            crate::types::ModelInput::Text,
+            crate::types::ModelInput::Image,
+        ];
+        for context in image_contexts("image/svg+xml", "PHN2Zz4=") {
+            assert_eq!(
+                convert_messages(&context, &model, crate::types::CacheRetention::None),
+                Err("Unknown image type: image/svg+xml".to_string())
+            );
+        }
+        for context in image_contexts("image/png", "not base64!") {
+            assert_eq!(
+                convert_messages(&context, &model, crate::types::CacheRetention::None),
+                Err("Invalid base64 image data for Bedrock image block".to_string())
+            );
+        }
+        for context in image_contexts("image/png", "iVBORw0KGgo=") {
+            assert!(convert_messages(&context, &model, crate::types::CacheRetention::None).is_ok());
+        }
     }
 
     fn test_model(id: &str) -> Model {

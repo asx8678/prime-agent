@@ -108,26 +108,27 @@ pub fn normalize_tool_call_id(id: &str) -> String {
 }
 
 /// Validates the mime type and passes the base64 bytes straight through (the AWS JSON protocol
-/// transmits blobs as base64).
-fn create_image_block(mime_type: &str, data: &str) -> Value {
+/// transmits blobs as base64). An image Bedrock cannot take fails the request (TS throws the
+/// same messages), so bad bytes never leave and a tool's or user's image never panics the
+/// provider task.
+fn create_image_block(mime_type: &str, data: &str) -> Result<Value, String> {
     let format = match mime_type {
         "image/jpeg" | "image/jpg" => "jpeg",
         "image/png" => "png",
         "image/gif" => "gif",
         "image/webp" => "webp",
-        other => panic!("Unknown image type: {other}"),
+        other => return Err(format!("Unknown image type: {other}")),
     };
-    // Fail fast on invalid base64 so the request never leaves with bad bytes.
     if base64::engine::general_purpose::STANDARD
         .decode(data)
         .is_err()
     {
-        panic!("Invalid base64 image data for Bedrock image block");
+        return Err("Invalid base64 image data for Bedrock image block".to_string());
     }
-    json!({
+    Ok(json!({
         "format": format,
         "source": { "bytes": data },
-    })
+    }))
 }
 
 pub fn build_system_prompt(
@@ -152,11 +153,15 @@ pub fn build_system_prompt(
 
 // Long by design: mirrors the provider's stream shape.
 #[allow(clippy::too_many_lines)]
+///
+/// # Errors
+///
+/// An image block Bedrock cannot take (an unknown mime type or invalid base64).
 pub fn convert_messages(
     context: &Context,
     model: &Model,
     cache_retention: CacheRetention,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, String> {
     let mut result: Vec<Value> = Vec::new();
     let transformed = transform_messages_with_normalizer(&context.messages, model, &|id, _, _| {
         Some(normalize_tool_call_id(id))
@@ -174,16 +179,16 @@ pub fn convert_messages(
                         .iter()
                         .map(|c| match crate::types::user_block_payload(c) {
                             crate::types::UserBlockPayload::Text(text) => {
-                                json!({ "text": sanitize_surrogates(text) })
+                                Ok(json!({ "text": sanitize_surrogates(text) }))
                             }
                             crate::types::UserBlockPayload::Image { data, mime_type } => {
-                                json!({ "image": create_image_block(mime_type, data) })
+                                Ok(json!({ "image": create_image_block(mime_type, data)? }))
                             }
                             crate::types::UserBlockPayload::Opaque(json) => {
-                                json!({ "text": sanitize_surrogates(&json) })
+                                Ok(json!({ "text": sanitize_surrogates(&json) }))
                             }
                         })
-                        .collect(),
+                        .collect::<Result<_, String>>()?,
                 };
                 result.push(json!({ "role": "user", "content": content_blocks }));
                 i += 1;
@@ -269,20 +274,25 @@ pub fn convert_messages(
                     let Message::ToolResult(current) = &transformed[j] else {
                         break;
                     };
+                    let result_blocks = current
+                        .content
+                        .iter()
+                        .map(|c| match crate::types::user_block_payload(c) {
+                            crate::types::UserBlockPayload::Text(text) => {
+                                Ok(json!({ "text": sanitize_surrogates(text) }))
+                            }
+                            crate::types::UserBlockPayload::Image { data, mime_type } => {
+                                Ok(json!({ "image": create_image_block(mime_type, data)? }))
+                            }
+                            crate::types::UserBlockPayload::Opaque(json) => {
+                                Ok(json!({ "text": sanitize_surrogates(&json) }))
+                            }
+                        })
+                        .collect::<Result<Vec<Value>, String>>()?;
                     tool_results.push(json!({
                         "toolResult": {
                             "toolUseId": current.tool_call_id,
-                            "content": current.content.iter().map(|c| match crate::types::user_block_payload(c) {
-                                crate::types::UserBlockPayload::Text(text) => {
-                                    json!({ "text": sanitize_surrogates(text) })
-                                }
-                                crate::types::UserBlockPayload::Image { data, mime_type } => {
-                                    json!({ "image": create_image_block(mime_type, data) })
-                                }
-                                crate::types::UserBlockPayload::Opaque(json) => {
-                                    json!({ "text": sanitize_surrogates(&json) })
-                                }
-                            }).collect::<Vec<Value>>(),
+                            "content": result_blocks,
                             "status": if current.is_error { "error" } else { "success" },
                         }
                     }));
@@ -314,7 +324,7 @@ pub fn convert_messages(
         }
     }
 
-    result
+    Ok(result)
 }
 
 pub fn convert_tool_config(
