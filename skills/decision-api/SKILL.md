@@ -111,7 +111,7 @@ of them. `await loop.run()` runs to completion in one cell instead.
 Each step sends one decision request to the child and awaits its tagged
 reply. Spawn and delivery failures appear in `loop.errors` (spawn retries in
 the background); a decision that overruns `decide_timeout` fails the step and
-follows `on_error`. Stopping removes the child. Python 3.11 or newer is
+follows `on_error`. Stopping removes the child. Python 3.14 or newer is
 required.
 
 Stay in your turn while a loop runs: poll with `loop.wait(timeout=...)`, read
