@@ -195,3 +195,11 @@ legacy-upgrade-gates:
 	python3 scripts/release/test_npm_bridge.py
 
 .PHONY: legacy-upgrade-gates
+
+# The bench harness's offline battery (scripts/bench): metrics extraction
+# from session JSONL and the paired-run analysis. The tests import
+# `scripts.bench.*`, so they run from the repo root.
+bench-gates:
+	python3 -m unittest scripts.bench.test_analyze scripts.bench.test_bench_metrics
+
+.PHONY: bench-gates

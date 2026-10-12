@@ -1,0 +1,1 @@
+Write the text 'prime-agent bench smoke' to a file named smoke.txt in the current directory, then confirm it.

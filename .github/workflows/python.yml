@@ -38,3 +38,5 @@ jobs:
       - name: edit skill suite
         working-directory: skills/edit
         run: uv run --no-project --managed-python --python 3.11 python -m unittest discover -s tests
+      - name: bench harness suite
+        run: uv run --no-project --managed-python --python 3.11 python -m unittest scripts.bench.test_analyze scripts.bench.test_bench_metrics

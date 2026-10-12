@@ -1,0 +1,21 @@
+{
+  "modelId": "faux-bench",
+  "modelName": "Faux Bench Model",
+  "responses": [
+    {
+      "content": [
+        {
+          "type": "toolCall",
+          "id": "call-smoke-1",
+          "name": "ipython",
+          "arguments": {
+            "code": "await bash(\"printf 'prime-agent bench smoke\\n' > smoke.txt\")"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Wrote smoke.txt with the required marker text."
+    }
+  ]
+}
