@@ -354,13 +354,6 @@ impl Close {
     }
 }
 
-/// The label of the fold open at the end of `messages`, if any.
-pub(crate) fn open_fold(messages: &[AgentMessage], max_fold_tokens: u64) -> Option<String> {
-    Folds::scan(messages, max_fold_tokens)
-        .open
-        .map(|fold| fold.description)
-}
-
 /// The chars/4 estimate compaction uses, over the message's wire JSON.
 fn estimated_tokens(message: &AgentMessage) -> u64 {
     pa_types::usage::estimate_tokens(&serde_json::to_value(message).unwrap_or_default())

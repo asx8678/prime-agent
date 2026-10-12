@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::kernel::shared::{host_handler, HostRequestHandlers};
 use crate::session_engine::turn_boundary::TurnBoundaryRequests;
 
-use super::{open_fold, Close};
+use super::{Close, Folds};
 
 const DESCRIPTION_CHARS: usize = 80;
 const GOAL_CHARS: usize = 2_000;
@@ -37,10 +37,11 @@ pub(crate) fn register_handlers(
                 }
                 let goal = text_field(&payload.data, "fold.begin", "goal", GOAL_CHARS)?;
                 let messages = live_messages(&requests).await?;
-                Ok(match open_fold(&messages, max_fold_tokens) {
+                Ok(match Folds::scan(&messages, max_fold_tokens).open {
                     Some(open) => json!({
                         "text": format!(
-                            "Fold not opened: a fold is already open: {open}; finish it with fold.end before starting another."
+                            "Fold not opened: a fold is already open: {}; finish it with fold.end before starting another.",
+                            open.description
                         ),
                     }),
                     None => json!({
