@@ -395,3 +395,29 @@ shorter.
 
 TUI or `/settings` changes, a slash command, F2, F3, and any change to the
 static system prompt. Each would need its own parity evidence and sign-off.
+
+## Status (2026-10-12)
+
+Steps 1-7 are committed on `main` (not pushed): `4239e6dcc` kernel
+channel, `cbcf1670e` view and setting, `eda478201` compaction trigger and
+summary, `baa919dc1` telemetry, `4a92b495e` skill and handlers,
+`0976637f6` real-kernel test, then the zro check. Deviations from the plan
+above, each explained in its commit message: the view, scan and handlers
+share one module (`context_fold/mod.rs` + `handlers.rs`, no `view.rs`);
+side questions get the view through a `ContextFolding` value stored on
+`SessionEngine` and passed by the daemon (one `pa-daemon` call site);
+the host, not the skill, owns the marker payload and the printed texts
+(the skill emits and prints what the host answers).
+
+Parity evidence: `prime-agent prompt` with `contextFolding` unset is
+byte-identical before (`a0d9e3314`) and after the series, once the skill
+paths of the comparison worktree are normalized; with it on, only the
+`fold` inventory entry is added.
+
+Real-model check on zro (`glm-5.3-flash`, `openai-completions` API): with
+no hint the model never folded (as the paper predicts for untrained
+models); told to fold, it opened and closed two folds, the prompt dropped
+after each close (14,648 to 13,754 and 14,346 to 14,198 tokens), no provider
+error, and the bug was fixed in both runs. Not yet covered: Anthropic
+extended thinking and OpenAI Responses reasoning items (the evaluation gate
+in step 7 stays open). Step 8, the evaluation, is next.
