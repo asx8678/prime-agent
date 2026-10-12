@@ -32,6 +32,10 @@ Saved 2026-10-11, committed on `main`. Update it as work lands.
    [05b-context-folding-build-plan.md](05b-context-folding-build-plan.md).
 6. [06-follow-ups.md](06-follow-ups.md): smaller issues found along the
    way, and housekeeping.
+7. [10-orchestration-patterns.md](10-orchestration-patterns.md): which
+   multi-agent patterns fit prime-agent (council and fusion as a gated,
+   user-invoked `orchestrate` skill; observers later) and how to build
+   them.
 
 ## How to work in this repo (lessons from this round)
 
