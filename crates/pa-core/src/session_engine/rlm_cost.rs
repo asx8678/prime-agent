@@ -48,7 +48,8 @@ pub struct InheritedCostCeiling {
 /// The durable-row mirror a host that owns persistence outside the session
 /// manager (the daemon worker) installs: it receives each ceiling row's
 /// `custom_message` wire shape.
-pub type CeilingRowSink = Arc<dyn Fn(Value) + Send + Sync>;
+/// Returns the durable write's error, so the call that set the ceiling can report it.
+pub type CeilingRowSink = Arc<dyn Fn(Value) -> anyhow::Result<()> + Send + Sync>;
 
 /// One session tree's cost state: the ceilings (opt-in; `None` = that
 /// dimension uncapped, today's behavior), the admitted-spawn count, and
@@ -202,7 +203,7 @@ impl RlmTreeCost {
     ///
     /// # Errors
     ///
-    /// Returns the session manager's append error.
+    /// Returns the session manager's append error, or the persistence owner's write error.
     ///
     /// # Panics
     ///
@@ -226,7 +227,7 @@ impl RlmTreeCost {
                 "content": content,
                 "display": false,
                 "details": details,
-            }));
+            }))?;
         }
         Ok(())
     }

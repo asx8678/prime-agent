@@ -449,6 +449,48 @@ pub fn find_cut_point(
             _ => cut_index -= 1,
         }
     }
+    // A cut must not split a closed context fold: with the begin marker summarized away and
+    // part of the hidden span kept, the next request's fold view finds no begin and sends the
+    // folded work again. Such a cut moves forward to the end cell's assistant message, so the
+    // whole span goes into the summary and the end cell, which carries the result, stays.
+    // The daemon's durable re-cut runs this same function, so both sides agree.
+    let mut open_begin: Option<usize> = None;
+    let mut last_assistant: Option<usize> = None;
+    for (i, entry) in entries
+        .iter()
+        .enumerate()
+        .take(end_index.min(entries.len()))
+        .skip(start_index)
+    {
+        let FileEntry::Message { message, .. } = entry else {
+            continue;
+        };
+        match message {
+            AgentMessage::Assistant(_) => last_assistant = Some(i),
+            AgentMessage::ToolResult(result) => {
+                match super::context_fold::Marker::from_details(result.details.as_ref()) {
+                    Some(super::context_fold::Marker::Begin { .. }) => {
+                        open_begin = open_begin.or(Some(i));
+                    }
+                    Some(super::context_fold::Marker::End(end)) => {
+                        if let (Some(begin), Some(end_assistant)) =
+                            (open_begin.take(), last_assistant)
+                        {
+                            if end.folded && begin < cut_index && cut_index < end_assistant {
+                                cut_index = end_assistant;
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            AgentMessage::User(_)
+            | AgentMessage::Custom(_)
+            | AgentMessage::BashExecution(_)
+            | AgentMessage::BranchSummary(_)
+            | AgentMessage::CompactionSummary(_) => {}
+        }
+    }
     let is_user_message = matches!(
         &entries[cut_index],
         FileEntry::Message {
@@ -949,6 +991,54 @@ mod tests {
         let keep_small = find_cut_point(&assistant_final, 0, 4, 1);
         assert!(keep_small.is_split_turn);
         assert_eq!(keep_small.turn_start_index, Some(2));
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_closed_context_fold() {
+        let marker_result = |id: &str, parent: &str, marker: serde_json::Value| {
+            message_entry(
+                id,
+                parent,
+                AgentMessage::ToolResult(pa_types::ai::ToolResultMessage {
+                    tool_call_id: format!("call-{parent}"),
+                    tool_name: "ipython".to_string(),
+                    content: Vec::new(),
+                    details: Some(serde_json::json!({ "contextFold": marker })),
+                    is_error: false,
+                    timestamp: 0,
+                    rest: serde_json::Map::default(),
+                }),
+            )
+        };
+        let entries = vec![
+            user_entry("u1", "root", "start"),
+            assistant_entry("a1", "u1"),
+            marker_result(
+                "t1",
+                "a1",
+                serde_json::json!({ "kind": "begin", "description": "explore" }),
+            ),
+            assistant_entry("a2", "t1"),
+            assistant_entry("a3", "a2"),
+            assistant_entry("a4", "a3"),
+            marker_result(
+                "t4",
+                "a4",
+                serde_json::json!({ "kind": "end", "description": "explore", "result": "found", "folded": true }),
+            ),
+            user_entry("u2", "t4", "next"),
+            assistant_entry("a5", "u2"),
+        ];
+        // Whatever the budget, the first kept row is never a hidden row (a2, a3) whose begin
+        // marker the cut summarized away.
+        for keep in [1, 50, 100, 150, 200, 300, 400, 500, 600, 800, 10_000] {
+            let cut = find_cut_point(&entries, 0, entries.len(), keep);
+            assert!(
+                !(3..=4).contains(&cut.first_kept_entry_index),
+                "keep {keep}: the cut {} splits the fold",
+                cut.first_kept_entry_index
+            );
+        }
     }
 
     #[test]

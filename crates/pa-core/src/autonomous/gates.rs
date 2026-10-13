@@ -14,7 +14,7 @@ use super::{
 /// Output cap for gate results surfaced in continuation text.
 const MAX_GATE_OUTPUT_CHARS: usize = 6000;
 /// Output cap for gate child processes (both streams combined per stream).
-const MAX_CHILD_PROCESS_OUTPUT_CHARS: usize = 1024 * 1024;
+const MAX_CHILD_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Timeout for the git commands that capture a worktree snapshot.
 const SNAPSHOT_TIMEOUT_MS: u64 = 10_000;
 
@@ -461,7 +461,7 @@ pub async fn run_gate_command(
 /// remainder is drained so a full pipe never blocks the child.
 async fn read_pipe_capped<R: tokio::io::AsyncRead + Unpin>(mut pipe: Option<R>) -> (String, bool) {
     use tokio::io::AsyncReadExt;
-    let cap = MAX_CHILD_PROCESS_OUTPUT_CHARS;
+    let cap = MAX_CHILD_PROCESS_OUTPUT_BYTES;
     let mut kept = String::new();
     let mut truncated = false;
     let mut buffer = [0u8; 8192];
@@ -476,7 +476,11 @@ async fn read_pipe_capped<R: tokio::io::AsyncRead + Unpin>(mut pipe: Option<R>) 
                         if chunk.len() <= remaining {
                             kept.push_str(&chunk);
                         } else {
-                            kept.push_str(&chunk[..remaining]);
+                            let mut end = remaining;
+                            while !chunk.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            kept.push_str(&chunk[..end]);
                             truncated = true;
                         }
                     } else {
@@ -497,6 +501,19 @@ mod tests {
         AutonomousDecisionReason,
     };
     use pa_types::ai::StopReason;
+
+    #[tokio::test]
+    async fn over_cap_multibyte_output_is_cut_on_a_char_boundary() {
+        // One ASCII byte shifts every 2-byte `é` so the cap lands mid-character.
+        let output = format!("x{}", "é".repeat(MAX_CHILD_PROCESS_OUTPUT_BYTES / 2 + 10));
+        let (kept, truncated) = read_pipe_capped(Some(output.as_bytes())).await;
+        assert!(truncated);
+        assert!(kept.len() <= MAX_CHILD_PROCESS_OUTPUT_BYTES);
+        assert!(
+            kept.len() + 4 > MAX_CHILD_PROCESS_OUTPUT_BYTES,
+            "only the split char is dropped"
+        );
+    }
 
     fn config(enabled: bool) -> AgentAutonomousConfig {
         AgentAutonomousConfig {

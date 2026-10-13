@@ -100,6 +100,14 @@ pub fn worker_launch_env(
     if let Some(script) = script {
         env.insert(crate::worker::WORKER_SCRIPT_ENV.to_string(), script);
     }
+    // The worker's kernel journals its `bash()` process groups here (the runtime reads the
+    // env it inherits) and the worker's kernel teardown reaps them.
+    if let Some(path) = &descriptor.orphan_process_journal_path {
+        env.insert(
+            pa_core::kernel::orphan_journal::ORPHAN_PROCESS_JOURNAL_ENV.to_string(),
+            path.clone(),
+        );
+    }
     if descriptor
         .create_command
         .rest
@@ -582,9 +590,8 @@ mod tests {
         assert_eq!(rebuilt["script"], "/script.json");
     }
 
-    #[test]
-    fn descriptor_validates_against_socket() {
-        let descriptor = WorkerDescriptor {
+    fn ready_descriptor() -> WorkerDescriptor {
+        WorkerDescriptor {
             version: 2,
             worker_id: "abc123def456".to_string(),
             pid: 42,
@@ -615,11 +622,33 @@ mod tests {
             last_failure_at: None,
             last_error: None,
             rest: Map::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn descriptor_validates_against_socket() {
+        let descriptor = ready_descriptor();
         let json = serde_json::to_value(&descriptor).unwrap();
         assert_eq!(json["lifecycle"], "ready");
         assert_eq!(json["workerId"], "abc123def456");
         validate_descriptor(&descriptor, Path::new("/tmp/daemon.sock")).expect("valid");
         assert!(validate_descriptor(&descriptor, Path::new("/tmp/other.sock")).is_err());
+    }
+
+    #[test]
+    fn an_armed_orphan_journal_reaches_the_worker_env() {
+        let mut descriptor = ready_descriptor();
+        let env = worker_launch_env(Path::new("/agent"), "/tmp/daemon.sock", "inst", &descriptor);
+        assert_eq!(
+            env.get(pa_core::kernel::orphan_journal::ORPHAN_PROCESS_JOURNAL_ENV),
+            None
+        );
+        descriptor.orphan_process_journal_path = Some("/tmp/w.orphans.jsonl".to_string());
+        let env = worker_launch_env(Path::new("/agent"), "/tmp/daemon.sock", "inst", &descriptor);
+        assert_eq!(
+            env.get(pa_core::kernel::orphan_journal::ORPHAN_PROCESS_JOURNAL_ENV)
+                .map(String::as_str),
+            Some("/tmp/w.orphans.jsonl")
+        );
     }
 }

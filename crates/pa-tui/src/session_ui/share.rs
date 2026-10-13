@@ -22,8 +22,9 @@ pub(crate) type TracesUploadNote = crate::traces::TraceUploadAllNote;
 pub(crate) struct ShareRun {
     /// The upload task; aborting it kills `gh` (`kill_on_drop`).
     task: tokio::task::JoinHandle<()>,
-    /// The temp HTML export `gh gist create` uploads (removed on settle).
-    tmp_file: std::path::PathBuf,
+    /// The private per-run directory holding the `session.html` export `gh gist create`
+    /// uploads (removed with its contents on settle).
+    tmp_dir: std::path::PathBuf,
 }
 
 /// A `/traces upload-all` run in flight.
@@ -506,8 +507,19 @@ impl SessionUi {
             }
             GhAuthStatus::Ok => {}
         }
-        // The temp export `gh` uploads.
-        let tmp_file = std::env::temp_dir().join("session.html");
+        // The temp export `gh` uploads sits in a fresh owner-only directory: the gist keeps
+        // its `session.html` name, while a fixed shared path could be pre-planted (symlink)
+        // or clobbered by an overlapping share.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("prime-agent-share-{}", uuid::Uuid::new_v4()));
+        let mut dir_builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut dir_builder, 0o700);
+        if let Err(error) = dir_builder.create(&tmp_dir) {
+            self.error_row(&format!("Failed to export session: {error}"), view);
+            return Ok(());
+        }
+        let tmp_file = tmp_dir.join("session.html");
         let export = self
             .bounded_request(
                 Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
@@ -520,6 +532,7 @@ impl SessionUi {
             )
             .await;
         if let Err(error) = export {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
             self.error_row(&format!("Failed to export session: {error:#}"), view);
             return Ok(());
         }
@@ -528,7 +541,7 @@ impl SessionUi {
         let child = match export_share::spawn_gist_create(&tmp_file) {
             Ok(child) => child,
             Err(error) => {
-                let _ = std::fs::remove_file(&tmp_file);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
                 self.error_row(&format!("Failed to create gist: {error}"), view);
                 return Ok(());
             }
@@ -538,10 +551,7 @@ impl SessionUi {
             let outcome = export_share::gist_outcome(child).await;
             let _ = notes.send(outcome);
         });
-        self.share = Some(ShareRun {
-            task,
-            tmp_file: tmp_file.clone(),
-        });
+        self.share = Some(ShareRun { task, tmp_dir });
         view.share_loader = Some(ShareLoader::new());
         self.dirty = true;
         Ok(())
@@ -560,7 +570,7 @@ impl SessionUi {
             return;
         };
         view.share_loader = None;
-        let _ = std::fs::remove_file(&run.tmp_file);
+        let _ = std::fs::remove_dir_all(&run.tmp_dir);
         match outcome {
             Ok(gist) => {
                 self.note(
@@ -589,7 +599,7 @@ impl SessionUi {
                     // Aborting the task drops the child and kills `gh`
                     // (kill-on-drop); the temp file goes with the run.
                     run.task.abort();
-                    let _ = std::fs::remove_file(&run.tmp_file);
+                    let _ = std::fs::remove_dir_all(&run.tmp_dir);
                 }
                 view.share_loader = None;
                 self.note("Share cancelled", view);

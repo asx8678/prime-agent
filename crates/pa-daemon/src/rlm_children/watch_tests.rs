@@ -1358,3 +1358,54 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
     assert_eq!(record.answer_text.as_deref(), Some("the captured say"));
     assert!(record.answer_captured);
 }
+
+/// A child still waiting for its parent's turn says so in its snapshot (it reads "running" but has
+/// not started); an admitted or settled child carries no such flag.
+#[test]
+fn a_child_waiting_for_the_parent_turn_is_flagged_in_its_snapshot() {
+    let base = || ChildRecord {
+        rlm_child_id: "child-id".to_string(),
+        session_name: "lane".to_string(),
+        active_session_id: "child-live".to_string(),
+        session_id: Some("child-file".to_string()),
+        session_dir: "/tmp".to_string(),
+        model: String::new(),
+        label: "task".to_string(),
+        started_at_ms: 0,
+        settled_status: None,
+        settled: false,
+        answer_preview: None,
+        answer_text: None,
+        answer_captured: false,
+        replied_since_task: false,
+        notice_delivered: false,
+        prompt_admitted: true,
+        error: None,
+        closed_by_parent: false,
+        session_file: None,
+        attributed_rows: Some(0),
+        usage_watch_live: false,
+        usage_rearm: false,
+        emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        last_emitted_status: None,
+        rename_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let mut waiting = base();
+    waiting.prompt_admitted = false;
+    assert_eq!(
+        waiting.snapshot_value()["waitingForParentTurn"],
+        json!(true)
+    );
+    assert_eq!(waiting.snapshot_value()["status"], json!("running"));
+    assert!(base()
+        .snapshot_value()
+        .get("waitingForParentTurn")
+        .is_none());
+    let mut settled = base();
+    settled.prompt_admitted = false;
+    settled.settled_status = Some("cancelled");
+    assert!(settled
+        .snapshot_value()
+        .get("waitingForParentTurn")
+        .is_none());
+}

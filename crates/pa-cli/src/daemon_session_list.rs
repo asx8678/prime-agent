@@ -297,7 +297,12 @@ fn parse_date_parts(date: &str) -> Option<(i64, u32, u32)> {
     let year: i64 = parts.next()?.parse().ok()?;
     let month: u32 = parts.next()?.parse().ok()?;
     let day: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // JS `Date`'s representable years: outside them the millis math overflows.
+    if parts.next().is_some()
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(-271_821..=275_760).contains(&year)
+    {
         return None;
     }
     Some((year, month, day))
@@ -486,6 +491,8 @@ mod tests {
     #[test]
     fn iso_parse_rejects_short_and_multibyte_time_parts() {
         assert_eq!(parse_iso_ms("2024-01-01T"), None);
+        // A year past JS Date's range overflowed the millis math.
+        assert_eq!(parse_iso_ms("999999999999-01-01T00:00:00Z"), None);
         assert_eq!(parse_iso_ms("2024-01-01Té"), None);
         assert_eq!(
             parse_iso_ms("2024-01-01T00:00:00Z"),

@@ -222,6 +222,62 @@ async fn switching_from_the_model_summarizer_keeps_its_summary_as_a_labeled_exce
     registration.unregister();
 }
 
+/// A note pinned before a model-summarizer compaction (which saves no state)
+/// still renders when the deterministic engine compacts next: the live carry
+/// list on the branch is the source, not the fold window.
+#[tokio::test]
+async fn a_carried_note_survives_a_model_summarizer_compaction_in_between() {
+    let registration = faux_registration();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::in_memory(tmp.path());
+    let items = vec!["keep the API stable".to_string()];
+    session
+        .append_custom_message(
+            crate::session_engine::compact_carry::COMPACT_CARRY_CUSTOM_TYPE,
+            UserContent::Text(crate::session_engine::compact_carry::carry_row_content(
+                &items,
+            )),
+            false,
+            Some(crate::session_engine::compact_carry::carry_row_details(
+                &items,
+            )),
+        )
+        .unwrap();
+    for i in 0..3 {
+        append_turn(&mut session, i);
+    }
+    let first = ran(execute_compaction(
+        &mut session,
+        CompactOptions {
+            settings: super::super::compaction::CompactionSettings {
+                keep_recent_tokens: 10,
+                engine: CompactionEngine::Llm,
+                ..Default::default()
+            },
+            ..deterministic(registration.get_model())
+        },
+    )
+    .await
+    .unwrap());
+    assert_eq!(first.entry.structural_state, None);
+    append_turn(&mut session, 3);
+    append_turn(&mut session, 4);
+    let second = ran(
+        execute_compaction(&mut session, deterministic(wide_model(&registration)))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        second
+            .result
+            .summary
+            .contains("[Carried notes]\n\n- keep the API stable [carry:0]"),
+        "{}",
+        second.result.summary
+    );
+    registration.unregister();
+}
+
 /// Switching back hands the model summarizer the deterministic summary as
 /// the previous summary to update.
 #[tokio::test]

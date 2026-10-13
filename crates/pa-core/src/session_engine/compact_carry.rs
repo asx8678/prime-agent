@@ -215,7 +215,8 @@ pub(crate) fn apply_carry_update(
 /// manager (the daemon worker) subscribes to: the `custom_message` wire row
 /// of a carry update, so it lands in the durable file even where the
 /// engine's manager is non-persisted.
-pub type CarryRowSink = std::sync::Arc<dyn Fn(Value) + Send + Sync>;
+/// Returns the durable write's error, so the call that changed the list can report it.
+pub type CarryRowSink = std::sync::Arc<dyn Fn(Value) -> anyhow::Result<()> + Send + Sync>;
 
 /// The summary lines a carried list renders as, one per note with its
 /// drop index (fabric `carryRequestLines`).

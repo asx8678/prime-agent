@@ -10,6 +10,7 @@ work inside the Prime Agent Python kernel.
 
 from __future__ import annotations
 
+import asyncio
 import weakref
 from typing import Any
 
@@ -56,7 +57,14 @@ def _require_str(name: str, value: object) -> None:
 
 def _claim_cell() -> None:
     context = repl.current_cell_completion_context()
-    if context is None:
+    # A detached task inherits a stale copy of its cell's context, so the context alone does
+    # not prove a live cell: the caller must be that cell's own running body task (its owner
+    # is cleared when the cell settles).
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    if context is None or context[1] is None or current is not context[1]:
         raise RuntimeError("fold.begin and fold.end only work in a cell, not in a background task")
     finished = context[0]
     if finished in _fold_cells:

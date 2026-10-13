@@ -50,8 +50,13 @@ pub struct CollectEntriesResult {
 
 fn parent_path(entries: &[FileEntry], leaf_id: &str) -> Vec<String> {
     let mut path = Vec::new();
+    // A `parentId` cycle in a hand-edited or corrupt session file must end the walk.
+    let mut visited = HashSet::new();
     let mut current = Some(leaf_id.to_string());
     while let Some(id) = current {
+        if !visited.insert(id.clone()) {
+            break;
+        }
         let Some(entry) = entries.iter().find(|entry| entry.id() == Some(id.as_str())) else {
             break;
         };
@@ -79,9 +84,10 @@ pub fn collect_entries_for_branch_summary(
         .find(|id| old_path.contains(*id))
         .cloned();
     let mut collected: Vec<FileEntry> = Vec::new();
+    let mut visited = HashSet::new();
     let mut current = Some(old_leaf_id.to_string());
     while let Some(id) = current {
-        if Some(&id) == common_ancestor_id.as_ref() {
+        if Some(&id) == common_ancestor_id.as_ref() || !visited.insert(id.clone()) {
             break;
         }
         let Some(entry) = entries
@@ -619,6 +625,22 @@ mod tests {
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.entries[0].id(), Some("a1"));
         assert_eq!(result.entries[1].id(), Some("u2"));
+    }
+
+    #[test]
+    fn a_parent_id_cycle_ends_the_walk() {
+        // a1 <-> u2 is a cycle with no root; the target sits off it.
+        let entries = vec![
+            entry("a1", Some("u2"), user("assistant turn")),
+            entry("u2", Some("a1"), user("old leaf")),
+            entry("u3", None, user("target")),
+        ];
+        let result = collect_entries_for_branch_summary(&entries, Some("u2"), "u3");
+        assert_eq!(result.common_ancestor_id, None);
+        assert_eq!(
+            result.entries.iter().map(FileEntry::id).collect::<Vec<_>>(),
+            vec![Some("a1"), Some("u2")]
+        );
     }
 
     #[test]

@@ -11,6 +11,10 @@ use std::path::Path;
 
 pub(crate) const RECOVERY_JOURNAL_SUFFIX: &str = ".recovery.jsonl";
 
+/// The per-worker orphan-process journal beside the descriptor: the kernel's `bash()` process
+/// groups are journaled there so a killed kernel's groups are reaped at teardown.
+pub(crate) const ORPHAN_PROCESS_JOURNAL_SUFFIX: &str = ".orphans.jsonl";
+
 pub(crate) fn append_record(path: &Path, record: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;

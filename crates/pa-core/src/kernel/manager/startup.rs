@@ -404,9 +404,12 @@ impl Inner {
                 // Incremental UTF-8 decoding: a chunk boundary can split a
                 // multi-byte character, so only complete sequences surface.
                 let decode = |pending: &mut Vec<u8>| {
-                    let text = String::from_utf8_lossy(pending);
-                    let decoded = text.into_owned();
-                    pending.clear();
+                    let complete = match std::str::from_utf8(pending) {
+                        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                        Ok(_) | Err(_) => pending.len(),
+                    };
+                    let decoded = String::from_utf8_lossy(&pending[..complete]).into_owned();
+                    pending.drain(..complete);
                     decoded
                 };
                 loop {
@@ -418,7 +421,9 @@ impl Inner {
                             let Some(inner) = inner.upgrade() else {
                                 break;
                             };
-                            inner.append_kernel_stderr_text(&decoded);
+                            if !decoded.is_empty() {
+                                inner.append_kernel_stderr_text(&decoded);
+                            }
                             if let Some(log) = &log {
                                 let mut log = lock(log);
                                 if log.budget >= n as u64 {
@@ -438,7 +443,8 @@ impl Inner {
                 }
                 if let Some(inner) = inner.upgrade() {
                     if !pending.is_empty() {
-                        inner.append_kernel_stderr_text(&decode(&mut pending));
+                        // EOF: an incomplete trailing sequence has no more bytes coming.
+                        inner.append_kernel_stderr_text(&String::from_utf8_lossy(&pending));
                     }
                     // Both the natural EOF and the kill path end here; the ready
                     // handshake waits on this notification for the final tail.

@@ -1,6 +1,6 @@
 //! The telemetry client: non-blocking `track`, background queue + batch flush.
 //! `track()` never blocks, never panics, and never fails the agent: events
-//! flow over an unbounded FIFO channel to a single background task that
+//! flow over a bounded FIFO channel (full: dropped and counted) to a single background task that
 //! flushes when a batch fills, on the interval, or on `flush()`/`shutdown()`.
 //! Every event is normalized through [`crate::catalog::sanitize`] before any sink sees it.
 
@@ -19,6 +19,11 @@ use crate::sink::{SinkOutcome, TelemetrySink};
 pub const DEFAULT_BATCH_SIZE: usize = 20;
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
+
+/// Commands buffered between `track` and the worker. The worker awaits sink delivery inline,
+/// so a hanging sink stops it draining; past this bound `track` drops (and counts) instead of
+/// growing memory without limit.
+const COMMAND_CHANNEL_CAPACITY: usize = 4096;
 /// The batch byte cap (wire-body estimate).
 pub const DEFAULT_MAX_BATCH_BYTES: usize = 30_000;
 /// Retention: older entries expire on the next flush.
@@ -117,7 +122,7 @@ impl std::fmt::Debug for TelemetryClientConfig {
 /// The client handle. `Clone` shares one background worker.
 #[derive(Clone)]
 pub struct TelemetryClient {
-    tx: mpsc::UnboundedSender<Cmd>,
+    tx: mpsc::Sender<Cmd>,
     /// Events dropped (queue overflow, worker gone, entry expired).
     dropped: Arc<AtomicU64>,
     /// Copy of the config base properties so `track` merges lock-free.
@@ -137,7 +142,7 @@ impl TelemetryClient {
     /// caller or pretend events were sent).
     #[must_use]
     pub fn inert() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         drop(rx);
         Self {
             tx,
@@ -153,7 +158,7 @@ impl TelemetryClient {
     ///
     /// Returns an error only when there is no tokio runtime on the current thread.
     pub fn spawn(mut config: TelemetryClientConfig) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let base_properties = config.base_properties.clone();
         let install_id = config.install_id.clone();
@@ -193,7 +198,8 @@ impl TelemetryClient {
         let mut merged = self.base_properties.clone();
         merged.merge(&properties);
         let event = TelemetryEvent::new(name, merged);
-        if self.tx.send(Cmd::Track(event)).is_err() {
+        // Never blocks: a full channel (stalled worker) or a gone worker drops the event.
+        if self.tx.try_send(Cmd::Track(event)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -206,7 +212,7 @@ impl TelemetryClient {
     /// Returns an error when the worker stopped before the flush finished.
     pub async fn flush(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(Cmd::Flush(tx)).is_err() {
+        if self.tx.send(Cmd::Flush(tx)).await.is_err() {
             return Ok(());
         }
         rx.await
@@ -221,7 +227,7 @@ impl TelemetryClient {
     /// Returns an error when the worker stopped before the shutdown handshake completed.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(Cmd::Shutdown(tx)).is_err() {
+        if self.tx.send(Cmd::Shutdown(tx)).await.is_err() {
             return Ok(());
         }
         rx.await
@@ -247,7 +253,7 @@ struct Worker {
     channels: Vec<Channel>,
     config: TelemetryClientConfig,
     queue_dropped: Arc<AtomicU64>,
-    rx: mpsc::UnboundedReceiver<Cmd>,
+    rx: mpsc::Receiver<Cmd>,
 }
 
 impl Worker {
@@ -660,6 +666,40 @@ mod tests {
         assert_eq!(a.event_names(), vec!["fanned"]);
         assert_eq!(b.event_names(), vec!["fanned"]);
         client.shutdown().await.unwrap();
+    }
+
+    /// A sink whose delivery never completes.
+    struct HangingSink;
+
+    impl TelemetrySink for HangingSink {
+        fn send_batch<'a>(
+            &'a self,
+            _install_id: &'a str,
+            _events: Vec<TelemetryEvent>,
+        ) -> Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hanging_sink_bounds_the_command_channel() {
+        let mut config = TelemetryClientConfig::new("install-1");
+        config.batch_size = 1;
+        config.sinks = vec![Arc::new(HangingSink) as Arc<dyn TelemetrySink>];
+        let client = TelemetryClient::spawn(config).unwrap();
+        // The first event wedges the worker inside the sink; every later one waits in the channel.
+        client.track("wedge", Properties::new());
+        while client.tx.capacity() < COMMAND_CHANNEL_CAPACITY {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..COMMAND_CHANNEL_CAPACITY + 10 {
+            client.track("queued", Properties::new());
+        }
+        assert_eq!(
+            client.dropped_count(),
+            10,
+            "past the bound, track drops and counts"
+        );
     }
 
     /// A sink that fails `fail_times` batches, then succeeds.

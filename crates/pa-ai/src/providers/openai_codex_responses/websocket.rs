@@ -260,6 +260,14 @@ async fn connection_worker(
     }
 }
 
+/// How long a request may go without a frame (pings included) before the read fails: the shared
+/// HTTP path's idle window, shortened in tests.
+const READ_IDLE_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(2)
+} else {
+    crate::utils_inner::http::BODY_IDLE_TIMEOUT
+};
+
 /// Read one request's events until completion, close, or error.
 async fn read_request_events(
     stream: &mut SplitStream<WsStream>,
@@ -271,7 +279,7 @@ async fn read_request_events(
         if signal.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return Err(CodexStreamError::Aborted);
         }
-        let next = stream.next();
+        let next = tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next());
         let message = match signal {
             Some(signal) => {
                 tokio::select! {
@@ -280,6 +288,16 @@ async fn read_request_events(
                 }
             }
             None => next.await,
+        };
+        // A stalled socket fails as a transport error (the caller's fallback and retry path)
+        // instead of waiting for a frame that never comes.
+        let Ok(message) = message else {
+            return Err(CodexStreamError::Transport(
+                WebSocketTransportError::runtime(format!(
+                    "No WebSocket frames for {}s",
+                    READ_IDLE_TIMEOUT.as_secs_f64()
+                )),
+            ));
         };
         match message {
             // Peer EOF without a close frame: the runtime fires a close event with code 1006
@@ -687,6 +705,8 @@ mod ws_wire_tests {
         RsvBits,
         /// Send a non-JSON text frame.
         InvalidJson,
+        /// Send nothing after the handshake, holding the socket open.
+        Stall,
     }
 
     async fn read_http_head(socket: &mut TcpStream) -> String {
@@ -796,6 +816,12 @@ mod ws_wire_tests {
                         .unwrap();
                     socket.shutdown().await.ok();
                 }
+                MockAction::Stall => {
+                    // Held until the client gives up and closes.
+                    let mut rest = Vec::new();
+                    let _ = socket.read_to_end(&mut rest).await;
+                    return;
+                }
                 MockAction::RejectHttp(_) | MockAction::BadAcceptKey => {}
             }
             // Hold the socket so the failure reaches the client cleanly.
@@ -832,6 +858,17 @@ mod ws_wire_tests {
             Err(CodexStreamError::Transport(error)) => error,
             Err(other) => panic!("expected a transport error, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_socket_fails_after_the_idle_window() {
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            request_terminal_error(MockAction::Stall),
+        )
+        .await
+        .expect("the idle window bounds the stalled read");
+        assert_eq!(error.to_string(), "No WebSocket frames for 2s");
     }
 
     #[tokio::test]

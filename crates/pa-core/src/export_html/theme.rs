@@ -236,7 +236,8 @@ fn detect_light_terminal_background(value: Option<&str>) -> bool {
 /// `parseColor`: `#RRGGBB` or `rgb(r, g, b)` to RGB, else `None`.
 fn parse_color(color: &str) -> Option<(u8, u8, u8)> {
     if let Some(hex) = color.strip_prefix('#') {
-        if hex.len() == 6 {
+        // ASCII hex digits only: the byte slices below then always cut on char boundaries.
+        if hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Some((
                 u8::from_str_radix(&hex[0..2], 16).ok()?,
                 u8::from_str_radix(&hex[2..4], 16).ok()?,
@@ -366,6 +367,12 @@ pub(crate) fn resolve_export_theme(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_multibyte_six_byte_hex_falls_back_instead_of_panicking() {
+        assert_eq!(parse_color("#zあbc"), None);
+        assert_eq!(parse_color("#7c6faf"), Some((0x7c, 0x6f, 0xaf)));
+    }
 
     /// The bundled prime theme resolves like the TS exporter.
     #[test]

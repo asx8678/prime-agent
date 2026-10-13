@@ -373,7 +373,7 @@ fn string_at(text: &str, i: usize) -> Option<usize> {
         let rest = &text[cursor..];
         if rest.starts_with('\\') {
             // Backslash escape: consumed inside the string.
-            let escaped = rest.char_indices().nth(1).map_or(1, |(idx, _)| idx + 1);
+            let escaped = 1 + rest[1..].chars().next().map_or(0, char::len_utf8);
             cursor += escaped;
             continue;
         }
@@ -604,6 +604,11 @@ mod tests {
 
     fn line_text(line: &Line) -> String {
         line.iter().map(|s| s.content.as_str()).collect()
+    }
+
+    #[test]
+    fn a_multibyte_escape_stays_inside_the_string() {
+        assert_eq!(scopes("'\\あ'"), vec![("'\\あ'".into(), Scope::String)]);
     }
 
     #[test]

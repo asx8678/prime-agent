@@ -38,6 +38,7 @@
 //! store reads - is platform-neutral product code.
 
 #[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -170,8 +171,8 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
     );
     command.env("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS", "90000");
     // Die with this test binary on unix (the protocol teardown below is
-    // the exit path; this is the backstop for a failing test).
-    #[cfg(unix)]
+    // the exit path; this is the backstop for a failing test). `PR_SET_PDEATHSIG` is Linux-only.
+    #[cfg(target_os = "linux")]
     unsafe {
         command.pre_exec(move || {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);

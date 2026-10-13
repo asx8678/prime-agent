@@ -264,6 +264,12 @@ impl Supervisor {
                 }
                 dispatched = dispatch_rx.recv() => {
                     let Some((lines, stop)) = dispatched else { break };
+                    // A committed update restart (`Stopping`) answers `stop` too, but its
+                    // exit keeps the descriptors for the successor: only a terminal stop
+                    // runs the descriptor-deleting stop pass.
+                    let terminal_stop = stop
+                        && self.update_prepare.active_state()
+                            != Some(super::PrepareState::Stopping);
                     for outbound in lines {
                         let written = match &outbound {
                             Outbound::Line(value) => write_line(&mut writer, value).await,
@@ -274,7 +280,7 @@ impl Supervisor {
                             Err(error) => {
                                 // A failed response write must not strand the
                                 // shutdown: the stop pass still has to run.
-                                if stop {
+                                if terminal_stop {
                                     self.ensure_shutdown_started().await;
                                 }
                                 return Err(error);
@@ -285,11 +291,15 @@ impl Supervisor {
                         drop(outbound);
                         pa_types::memory_release::trim_freed_heap_if_large(bytes);
                     }
-                    if stop {
+                    if terminal_stop {
                         // The initiating client's response and daemon_closing lines are flushed
                         // above; only now may the stop pass end the runtime (the accept loop
                         // stays up until begin_shutdown sets accept_exit).
                         self.ensure_shutdown_started().await;
+                        break;
+                    }
+                    if stop {
+                        // The update exit owns the runtime's end (`exit_for_update`).
                         break;
                     }
                 }
@@ -474,7 +484,7 @@ impl Supervisor {
     /// whether this client connection should stop.
     // The per-connection stream sender rides the same context bundle (lint budget +1).
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_client(
+    pub(super) async fn dispatch_client(
         self: &Arc<Self>,
         line: &str,
         effective_client_id: &Arc<std::sync::Mutex<String>>,
@@ -524,6 +534,7 @@ impl Supervisor {
         }
         // A prompt carrying an admissionId reserves it before dispatch (TS parse-time);
         // duplicates and empty ids answer the TS parse errors with `command: "parse"`.
+        let mut registered_admission: Option<(String, String)> = None;
         if let Some(admission_id) = crate::prompt_admission::input_admission_id(&envelope.command) {
             let active_session_id = crate::protocol::command_active_session_id(&envelope.command)
                 .unwrap_or_default()
@@ -542,11 +553,21 @@ impl Supervisor {
                     false,
                 );
             }
+            registered_admission = Some((active_session_id, admission_id.to_string()));
         }
+        // A gate refusal never dispatches, so it releases the reservation it made.
+        let release_admission = || {
+            if let Some((active_session_id, admission_id)) = &registered_admission {
+                connection
+                    .prompt_admissions
+                    .release(active_session_id, admission_id);
+            }
+        };
         let type_name = command_type_name(&envelope.command).to_string();
         // Terminal shutdown admission gate: once `shutting_down` has flipped, no later
         // client command may reach a worker (the stop pass may already be retiring it).
         if self.shutting_down.load(Ordering::SeqCst) {
+            release_admission();
             return (
                 vec![Outbound::Line(response_line(&response_failure(
                     Some(&command_id),
@@ -571,6 +592,7 @@ impl Supervisor {
         if !is_update_driver {
             if let Some(state) = self.update_prepare.active_state() {
                 if update_gate_refuses(state, &type_name) {
+                    release_admission();
                     return (
                         vec![Outbound::Line(response_line(&response_failure(
                             Some(&command_id),
@@ -1178,6 +1200,58 @@ mod tests {
             "the log names the requesting client and its command: {log}"
         );
         connection.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_committed_update_restart_never_runs_the_terminal_stop_pass() {
+        use pa_types::daemon::{UpdateId, UpdateTimeoutBudget};
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir: dir.path().join("agent"),
+        };
+        let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+        let update_id = UpdateId::from("u-client".to_string());
+        let budget = UpdateTimeoutBudget::from_env();
+        supervisor
+            .update_prepare
+            .begin(update_id.clone(), crate::util::now_ms(), &budget);
+        supervisor.update_prepare.drain_complete(&update_id);
+        supervisor
+            .update_prepare
+            .snapshot_written(&update_id, crate::util::now_ms(), &budget);
+        supervisor.update_prepare.prepare_acked(&update_id);
+        let (server_side, client_side) = tokio::net::UnixStream::pair().expect("socket pair");
+        let connection = {
+            let supervisor = Arc::clone(&supervisor);
+            let stream: Box<dyn TransportStream> = Box::new(server_side);
+            tokio::spawn(async move { supervisor.handle_client(stream).await })
+        };
+        let (client_read, mut client_write) = client_side.into_split();
+        let mut client = BufReader::new(client_read);
+        let mut hello = String::new();
+        client.read_line(&mut hello).await.expect("hello line");
+        let envelope = json!({
+            "type": "command",
+            "id": "commit-1",
+            "protocol": {"name": "prime-agent.daemon", "version": 7},
+            "command": {"type": "commit_update_restart", "id": "commit-1", "updateId": "u-client"},
+        });
+        client_write
+            .write_all((serde_json::to_string(&envelope).unwrap() + "\n").as_bytes())
+            .await
+            .expect("send the commit envelope");
+        // The connection loop ends once the stop response is flushed: that is the wait point.
+        let _ = tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("the commit's connection loop ends");
+        assert!(
+            !supervisor
+                .shutdown_started
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the update exit must keep the descriptors: no terminal stop pass"
+        );
     }
 
     #[cfg(unix)]

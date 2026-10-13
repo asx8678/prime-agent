@@ -29,12 +29,14 @@ fn preserve_items_render_once_inside_the_request_block() {
         "{\"type\":\"message\",\"id\":\"e1\",\"role\":\"user\",\"content\":\"fix the parser\"}\n",
         "{\"type\":\"custom_message\",\"id\":\"e2\",\"customType\":\"compaction_carry\",\"content\":\"[compact carry]\",\"display\":false,\"details\":{\"version\":1,\"items\":[\"keep the API stable\"]}}\n",
     ));
-    let fold = super::Fold::new(None, None, &rows);
-    let (first, saved) = fold.summarize(
-        Some("focus on the goal"),
-        &["the exact error text".to_string()],
-        200_000,
-    );
+    let fold = super::Fold::new(None, None, &rows, vec![text("keep the API stable")]);
+    let (first, saved) = fold
+        .summarize(
+            Some("focus on the goal"),
+            &["the exact error text".to_string()],
+            200_000,
+        )
+        .unwrap();
     assert_eq!(
         first
             .matches(
@@ -46,8 +48,13 @@ fn preserve_items_render_once_inside_the_request_block() {
     );
     // One-shot: the saved state never keeps preserve, so the next
     // compaction drops it, while carried notes stay.
-    let refold = super::Fold::new(Some(&saved), None, Vec::<&FileEntry>::new());
-    let (second, _) = refold.summarize(None, &[], 200_000);
+    let refold = super::Fold::new(
+        Some(&saved),
+        None,
+        Vec::<&FileEntry>::new(),
+        vec![text("keep the API stable")],
+    );
+    let (second, _) = refold.summarize(None, &[], 200_000).unwrap();
     assert!(
         !second.contains("[preserve:"),
         "preserve renders in exactly one summary: {second}"
@@ -81,16 +88,21 @@ fn a_carry_row_folds_into_state_and_survives_two_summaries() {
         "{\"type\":\"custom_message\",\"id\":\"e2\",\"customType\":\"compaction_carry\",\"content\":\"[compact carry]\",\"display\":false,\"details\":{\"version\":1,\"items\":[\"keep the API stable\"]}}\n",
     );
     let rows = entries(log);
-    let fold = super::Fold::new(None, None, &rows);
-    let (first_summary, saved) = fold.summarize(None, &[], 200_000);
+    let fold = super::Fold::new(None, None, &rows, vec![text("keep the API stable")]);
+    let (first_summary, saved) = fold.summarize(None, &[], 200_000).unwrap();
     assert!(
         first_summary.contains("[Carried notes]\n\n- keep the API stable [carry:0]"),
         "the folded row renders its note: {first_summary}"
     );
     // The saved state carries the list, so the next compaction — folding no
     // new rows at all — still renders it.
-    let refold = super::Fold::new(Some(&saved), None, Vec::<&FileEntry>::new());
-    let (second_summary, _) = refold.summarize(None, &[], 200_000);
+    let refold = super::Fold::new(
+        Some(&saved),
+        None,
+        Vec::<&FileEntry>::new(),
+        vec![text("keep the API stable")],
+    );
+    let (second_summary, _) = refold.summarize(None, &[], 200_000).unwrap();
     assert!(
         second_summary.contains("- keep the API stable [carry:0]"),
         "carried notes survive the compaction boundary: {second_summary}"
@@ -290,11 +302,11 @@ fn a_carried_deterministic_summary_is_not_labeled_model_written() {
 
 #[test]
 fn a_state_saved_by_another_version_is_not_folded_further() {
-    let mut saved = State::new().to_value();
+    let mut saved = State::new().to_value().unwrap();
     saved["version"] = serde_json::json!(STATE_VERSION + 1);
     assert_eq!(State::from_value(&saved), None);
     assert_eq!(
-        State::from_value(&State::new().to_value()),
+        State::from_value(&State::new().to_value().unwrap()),
         Some(State::new())
     );
 }
@@ -373,7 +385,7 @@ fn a_state_saved_before_fold_blocks_still_parses() {
     earlier.fold(&[Event::BranchSummary {
         text: text("the branch so far"),
     }]);
-    let saved = earlier.to_value();
+    let saved = earlier.to_value().unwrap();
     assert!(!saved.to_string().contains("\"fold\""));
     let mut resumed = State::from_value(&saved).expect("a saved state loads");
     resumed.fold(&normalize(&fold_cell_log(&end_marker(true))));
@@ -642,7 +654,7 @@ proptest! {
         whole.fold(&events);
         let mut first = State::new();
         first.fold(&events[..split]);
-        let mut resumed = State::from_value(&first.to_value()).expect("a saved state loads");
+        let mut resumed = State::from_value(&first.to_value().unwrap()).expect("a saved state loads");
         resumed.fold(&events[split..]);
         prop_assert_eq!(resumed, whole);
     }

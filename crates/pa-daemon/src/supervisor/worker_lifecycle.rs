@@ -281,7 +281,17 @@ impl Supervisor {
             process_start_id: None,
             socket_path: worker_socket.to_string_lossy().to_string(),
             recovery_journal_path: recovery_journal_path.to_string_lossy().to_string(),
-            orphan_process_journal_path: None,
+            // Armed for every worker: without it a SIGKILLed or crashed kernel leaks every
+            // process group its `bash()` calls spawned.
+            orphan_process_journal_path: Some(
+                self.descriptor_dir
+                    .join(format!(
+                        "{worker_id}{}",
+                        crate::journal::ORPHAN_PROCESS_JOURNAL_SUFFIX
+                    ))
+                    .to_string_lossy()
+                    .to_string(),
+            ),
             supervisor_socket_path: self.options.socket_path.to_string_lossy().to_string(),
             authentication_token: uuid::Uuid::new_v4().to_string(),
             worker_instance_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -750,12 +760,13 @@ impl Supervisor {
     /// `stopWorkerUntracked`'s contract): deleting the descriptor of a live worker orphans
     /// it behind its lease.
     pub(super) async fn retire_worker_after_stop(self: &Arc<Self>, resident: &Arc<ResidentWorker>) {
-        let (pid, start_id, recovery_journal_path) = {
+        let (pid, start_id, recovery_journal_path, orphan_process_journal_path) = {
             let descriptor = resident.descriptor.lock().await;
             (
                 descriptor.pid as u32,
                 descriptor.process_start_id.clone(),
                 descriptor.recovery_journal_path.clone(),
+                descriptor.orphan_process_journal_path.clone(),
             )
         };
         // An unobservable identity never receives the escalation's signals; a live process
@@ -787,6 +798,10 @@ impl Supervisor {
                     crate::lease::get_process_start_id(pid).as_deref(),
                 ) {
                     let _ = std::fs::remove_file(&recovery_journal_path);
+                    // The worker is gone and its teardown reaped its kernel's groups.
+                    if let Some(path) = &orphan_process_journal_path {
+                        let _ = std::fs::remove_file(path);
+                    }
                 }
                 let _ = std::fs::remove_file(&resident.descriptor_path);
                 // The identity-pending side record dies with the descriptor it shadows

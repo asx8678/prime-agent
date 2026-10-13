@@ -16,7 +16,7 @@ use crate::utils::stream_failure::{
 /// which the agent's retry and failover path handles like any other. Providers keep a live stream
 /// moving (output, or pings while the model thinks) well inside this, so only a dead stream
 /// reaches it; ten minutes is the TS SDKs' default request timeout.
-const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static H2_ALPN_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();

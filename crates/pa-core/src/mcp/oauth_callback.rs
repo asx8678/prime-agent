@@ -66,6 +66,16 @@ impl CallbackShared {
 pub struct CallbackServer {
     shared: Arc<CallbackShared>,
     port: u16,
+    /// The accept loop owns the bound listener; aborting it frees the port.
+    accept: tokio::task::AbortHandle,
+}
+
+impl Drop for CallbackServer {
+    /// Every login outcome (success, failure, cancel) drops the server, so the port
+    /// returns to the candidate pool instead of leaking for the process lifetime.
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
 }
 
 impl CallbackServer {
@@ -85,7 +95,7 @@ impl CallbackServer {
             };
             let shared = Arc::new(CallbackShared::default());
             let task_shared = Arc::clone(&shared);
-            tokio::spawn(async move {
+            let accept = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
                         break;
@@ -96,7 +106,11 @@ impl CallbackServer {
                     });
                 }
             });
-            return Ok(CallbackServer { shared, port });
+            return Ok(CallbackServer {
+                shared,
+                port,
+                accept: accept.abort_handle(),
+            });
         }
         Err(anyhow!(
             "Could not start the OAuth callback server: ports {CALLBACK_PORT_BASE}-{} are all in use. \
@@ -323,6 +337,17 @@ mod tests {
         assert_ne!(server.redirect_uri(), redirect_uri_for(CALLBACK_PORT_BASE));
         assert!(server.redirect_uri().starts_with("http://localhost:5370"));
         drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_server_frees_its_port_for_later_logins() {
+        // More logins than candidate ports: each dropped server must release its port.
+        for _ in 0..CALLBACK_PORT_COUNT * 2 {
+            let server = CallbackServer::start("Linear").await.unwrap();
+            drop(server);
+            // The abort lands when the runtime next polls the accept task.
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]

@@ -298,3 +298,28 @@ fn rust_binary_heals_stale_lock_file_artifact() {
         "the healed artifact must be gone; release removes the lock directory"
     );
 }
+
+#[test]
+fn rust_binary_refuses_to_overwrite_unparseable_settings() {
+    let rust = PathBuf::from(env!("CARGO_BIN_EXE_prime-agent"));
+    let sandbox = sandbox("rs-unparseable");
+    let corrupt = "{\"defaultModel\": \"keep-me\",";
+    std::fs::write(settings_path(&sandbox), corrupt).expect("seed corrupt settings");
+    let (exit, stdout, stderr) = run(
+        &rust,
+        &[
+            "mcp",
+            "add",
+            "http-six",
+            "--url",
+            "https://example.invalid/mcp",
+        ],
+        &sandbox,
+    );
+    assert_ne!(exit, Some(0), "stdout: {stdout:?}, stderr: {stderr:?}");
+    assert_eq!(
+        std::fs::read_to_string(settings_path(&sandbox)).expect("read settings"),
+        corrupt,
+        "an unparseable settings.json must be left untouched"
+    );
+}

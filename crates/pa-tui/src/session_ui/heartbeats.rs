@@ -17,6 +17,89 @@ pub(crate) struct HeartbeatsUpdate {
 }
 
 impl SessionUi {
+    /// `/heartbeat [status|pause|resume|stop|clear|[every <interval>] [--steer|--follow-up]
+    /// <instruction>]`: parsed with the host's own grammar (`pa_types::heartbeat_command`), then
+    /// run through the daemon's `heartbeat_get`/`heartbeat_set`/`heartbeat_update`; the outcome
+    /// lands as a note, a parse or request failure as an error row.
+    pub(super) async fn handle_heartbeat_command(&mut self, args: &str, view: &mut AgentView) {
+        use pa_types::heartbeat_command::{DeliveryMode, ParsedHeartbeatCommand};
+        let parsed = match pa_types::heartbeat_command::parse_heartbeat_command(args) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.error_row(&error.to_string(), view);
+                return;
+            }
+        };
+        let active_session_id = self.active_session_id.clone();
+        let update = |action: &str| DaemonCommand::HeartbeatUpdate {
+            id: None,
+            active_session_id: active_session_id.clone(),
+            action: Value::String(action.to_string()),
+            rest: Map::default(),
+        };
+        let (request, outcome) = match parsed {
+            ParsedHeartbeatCommand::Status => (
+                DaemonCommand::HeartbeatGet {
+                    id: None,
+                    active_session_id: active_session_id.clone(),
+                    rest: Map::default(),
+                },
+                "Heartbeat",
+            ),
+            ParsedHeartbeatCommand::Pause => (update("pause"), "Heartbeat paused"),
+            ParsedHeartbeatCommand::Resume => (update("resume"), "Heartbeat resumed"),
+            ParsedHeartbeatCommand::Clear => (update("clear"), "Heartbeat stopped"),
+            ParsedHeartbeatCommand::Set {
+                schedule,
+                instruction,
+                delivery_mode,
+            } => (
+                DaemonCommand::HeartbeatSet {
+                    id: None,
+                    active_session_id: active_session_id.clone(),
+                    schedule,
+                    prompt: instruction,
+                    delivery_mode: delivery_mode.map(|mode| {
+                        Value::String(
+                            match mode {
+                                DeliveryMode::Steer => "steer",
+                                DeliveryMode::FollowUp => "follow_up",
+                            }
+                            .to_string(),
+                        )
+                    }),
+                    promote_owned_session: None,
+                    rest: Map::default(),
+                },
+                "Heartbeat set",
+            ),
+        };
+        match self
+            .bounded_request(Duration::from_millis(UI_REQUEST_TIMEOUT_MS), request)
+            .await
+        {
+            Ok(data) => {
+                let text = match data
+                    .get("heartbeat")
+                    .and_then(crate::heartbeats_picker::parse_heartbeat_job)
+                {
+                    Some(job) => format!(
+                        "{outcome}: {} ({}, delivery {}): {}",
+                        job.schedule_expression,
+                        job.status,
+                        job.delivery_mode.as_deref().unwrap_or("steer"),
+                        job.prompt
+                    ),
+                    None => "No heartbeat is set for this session.".to_string(),
+                };
+                self.note(&text, view);
+            }
+            Err(error) => self.error_row(&format!("Heartbeat command failed: {error:#}"), view),
+        }
+        // The activity dock and an open manager view pick up the change on the next refresh.
+        self.dirty = true;
+    }
+
     /// One key press while the `/heartbeats` view is open.
     pub(crate) async fn handle_heartbeats_picker_key(
         &mut self,

@@ -100,15 +100,21 @@ impl TurnBoundaryRequests {
     }
 
     /// Hand a carry row to the persistence owner's mirror, when one is
-    /// subscribed.
-    pub(crate) fn persist_carry_row(&self, items: &[String]) {
+    /// subscribed; a failed durable write is the caller's error (the list is
+    /// live in memory but would be gone after a restart).
+    pub(crate) fn persist_carry_row(&self, items: &[String]) -> anyhow::Result<()> {
         let sink = self
             .carry_row_sink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Some(sink) = sink {
-            sink(super::compact_carry::carry_row_wire(items));
+        match sink {
+            Some(sink) => sink(super::compact_carry::carry_row_wire(items)).map_err(|error| {
+                anyhow::anyhow!(
+                    "the carried notes apply to this session but could not be saved to the session file: {error}"
+                )
+            }),
+            None => Ok(()),
         }
     }
 
@@ -427,7 +433,7 @@ impl TurnBoundaryRequests {
                     // An unchanged list (re-adding a carried note, say)
                     // appended no row, so the mirror writes none either.
                     if changed {
-                        requests.persist_carry_row(&items);
+                        requests.persist_carry_row(&items)?;
                     }
                     if let Some(on_carry) = &carry_telemetry {
                         on_carry();
@@ -492,7 +498,7 @@ impl TurnBoundaryRequests {
                     // An unchanged list (re-adding a carried note, say)
                     // appended no row, so the mirror writes none either.
                     if changed {
-                        requests.persist_carry_row(&items);
+                        requests.persist_carry_row(&items)?;
                     }
                     if let Some(on_carry) = &carry_telemetry {
                         on_carry();

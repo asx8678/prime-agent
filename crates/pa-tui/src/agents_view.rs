@@ -713,7 +713,7 @@ async fn run_agents_view_surface(
     )?;
     // The first frame renders from the live roster the moment the surface mounts: the
     // saved-catalog fetch applies as an input when it lands instead of holding the frame.
-    renderer.draw(&mut mode);
+    renderer.draw(&mut mode)?;
     // The saved catalog feeds the Inactive section (cwd + sessionDir scope); the scan runs while
     // the view is already interactive, so a large catalog never delays the first frame. The re-arm
     // closure shares these clones (the mode never holds the client).
@@ -1076,7 +1076,7 @@ async fn run_agents_view_surface(
             redraw |= mode.refresh_incident_notices();
         }
         if redraw {
-            renderer.draw(&mut mode);
+            renderer.draw(&mut mode)?;
         }
     }
 

@@ -100,9 +100,17 @@ fn mutate_global_settings(
     let mut failure: Option<anyhow::Error> = None;
     storage
         .with_lock(pa_core::settings::SettingsScope::Global, &mut |current| {
-            let mut settings = current
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
+            // An unparseable document is refused, never replaced: writing `{}` back would
+            // destroy every other setting.
+            let mut settings =
+                match current.map(|content| serde_json::from_str::<serde_json::Value>(&content)) {
+                    None => serde_json::json!({}),
+                    Some(Ok(settings)) => settings,
+                    Some(Err(error)) => {
+                        failure = Some(anyhow!("settings.json is not valid JSON: {error}"));
+                        return None;
+                    }
+                };
             match mutate(&mut settings).and_then(|changed| {
                 changed
                     .then(|| serde_json::to_string_pretty(&settings).map_err(Into::into))
@@ -225,8 +233,10 @@ pub fn run_mcp_management_command(args: &[String]) -> Result<String> {
             if replaced && !force {
                 bail!("MCP server \"{name}\" already exists. Use --force to replace it.");
             }
-            drop_server_credentials(name)?;
+            // The settings write lands first: a refused write must not have already
+            // dropped the existing server's credentials.
             set_global_mcp_server(name, &config)?;
+            drop_server_credentials(name)?;
             Ok(format!(
                 "{} MCP server \"{name}\".",
                 if replaced { "Replaced" } else { "Added" }

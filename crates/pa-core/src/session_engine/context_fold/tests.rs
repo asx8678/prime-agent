@@ -639,6 +639,24 @@ async fn end_reports_the_hidden_span() {
 }
 
 #[tokio::test]
+async fn an_empty_fold_says_nothing_was_hidden() {
+    // The end cell's assistant message comes right after the begin group.
+    let messages = vec![
+        user("go"),
+        assistant(&["c1"]),
+        begin("c1"),
+        assistant(&["c2"]),
+    ];
+    let answer = ask("fold.end", json!({ "result": "done" }), messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        answer["text"],
+        json!("Fold closed: explore (no work between the begin and end cells, so nothing was hidden).\nResult:\ndone")
+    );
+}
+
+#[tokio::test]
 async fn end_reports_a_voided_fold() {
     let messages = vec![
         user("go"),

@@ -25,7 +25,11 @@ pub(crate) fn decode_paste_ctrl_sequences(text: &str) -> String {
             let mut codepoint = 0u32;
             let mut digits = false;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                codepoint = codepoint * 10 + u32::from(bytes[j] - b'0');
+                // A long pasted digit run saturates (no decodable codepoint is that large)
+                // instead of overflowing.
+                codepoint = codepoint
+                    .saturating_mul(10)
+                    .saturating_add(u32::from(bytes[j] - b'0'));
                 digits = true;
                 j += 1;
             }
@@ -176,6 +180,12 @@ mod tests {
         assert_eq!(decode_paste_ctrl_sequences("\x1b[74;5u"), "\n");
         assert_eq!(decode_paste_ctrl_sequences("\x1b[105;5u"), "\t");
         assert_eq!(decode_paste_ctrl_sequences("\x1b[73;5u"), "\t");
+    }
+
+    #[test]
+    fn a_long_digit_run_stays_literal_instead_of_overflowing() {
+        let pasted = "a\x1b[99999999999999999999;5ub";
+        assert_eq!(decode_paste_ctrl_sequences(pasted), pasted);
     }
 
     #[test]

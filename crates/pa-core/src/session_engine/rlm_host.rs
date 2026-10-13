@@ -1225,9 +1225,13 @@ mod tests {
         let wiring = wired(dir.path(), Some(host));
         let mirrored: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
         let mirror = Arc::clone(&mirrored);
-        wiring.rlm.tree_cost.set_row_sink(Arc::new(move |row| {
-            mirror.lock().unwrap().push(row);
-        }));
+        wiring
+            .rlm
+            .tree_cost
+            .set_row_sink(Arc::new(move |row| -> anyhow::Result<()> {
+                mirror.lock().unwrap().push(row);
+                Ok(())
+            }));
         let snapshot = call(
             &wiring,
             "rlm.set_cost_ceiling",

@@ -69,9 +69,15 @@ pub(crate) fn register_handlers(
                         tokens,
                         over_budget,
                     } => json!({
-                        "text": format!(
-                            "Fold closed: {description} ({messages} messages, ~{tokens} tokens hidden from later turns).\nResult:\n{result}"
-                        ),
+                        "text": if messages == 0 {
+                            format!(
+                                "Fold closed: {description} (no work between the begin and end cells, so nothing was hidden).\nResult:\n{result}"
+                            )
+                        } else {
+                            format!(
+                                "Fold closed: {description} ({messages} messages, ~{tokens} tokens hidden from later turns).\nResult:\n{result}"
+                            )
+                        },
                         "marker": {
                             "kind": "end", "description": description, "result": result,
                             "folded": true, "messages": messages, "tokens": tokens,

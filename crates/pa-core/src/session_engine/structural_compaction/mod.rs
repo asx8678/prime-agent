@@ -24,6 +24,8 @@ mod tests;
 pub(crate) struct Fold {
     state: state::State,
     events: Vec<events::Event>,
+    /// The live carry-forward list (the latest carry row on the whole branch).
+    carried: Vec<String>,
 }
 
 impl Fold {
@@ -31,11 +33,15 @@ impl Fold {
     /// compaction; `entries` are the active-branch rows from its kept boundary
     /// up to the new cut. A state this version saved is folded further;
     /// otherwise a summary another engine wrote is carried once as a labeled
-    /// excerpt.
+    /// excerpt. `carried` is the live carry list read from the whole branch: it
+    /// replaces whatever the saved state and the fold window say, because a pin
+    /// or drop outside the window (or under another engine's compaction, which
+    /// saves no state) is otherwise lost.
     pub(crate) fn new<'a>(
         previous_state: Option<&Value>,
         previous_summary: Option<&str>,
         entries: impl IntoIterator<Item = &'a FileEntry>,
+        carried: Vec<String>,
     ) -> Fold {
         // No earlier summary starts from an empty one: a fresh state.
         let state = previous_state
@@ -44,6 +50,7 @@ impl Fold {
         Fold {
             state,
             events: events::normalize(entries),
+            carried,
         }
     }
 
@@ -53,15 +60,17 @@ impl Fold {
     /// about an eighth of it in tokens, so a small window keeps room for the
     /// kept messages. The file-list block appended after it (itself capped
     /// by `FILE_LIST_MAX_ENTRIES` / `FILE_LIST_MAX_COMBINED_CHARS` in
-    /// `compaction_utils.rs`) is outside this bound.
+    /// `compaction_utils.rs`) is outside this bound. Fails only when the state cannot
+    /// serialize, so no compaction row ever saves a broken state.
     pub(crate) fn summarize(
         &self,
         request: Option<&str>,
         preserve: &[String],
         context_window: u64,
-    ) -> (String, Value) {
+    ) -> serde_json::Result<(String, Value)> {
         let mut state = self.state.clone();
         state.fold(&self.events);
+        state.carried.clone_from(&self.carried);
         // An unknown window (zero) leaves the default.
         let max_bytes = usize::try_from(context_window / 2)
             .ok()
@@ -69,9 +78,7 @@ impl Fold {
             .map_or(render::DEFAULT_MAX_BYTES, |half_window| {
                 half_window.min(render::DEFAULT_MAX_BYTES)
             });
-        (
-            render::render(&state, request, preserve, max_bytes),
-            state.to_value(),
-        )
+        let saved = state.to_value()?;
+        Ok((render::render(&state, request, preserve, max_bytes), saved))
     }
 }

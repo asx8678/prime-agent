@@ -30,6 +30,9 @@ pub struct SettingsError {
 pub struct SettingsManager {
     storage: Arc<dyn SettingsStorage>,
     global: Settings,
+    /// The global scope as last loaded or saved: a save writes only the fields that
+    /// changed since, so concurrent writers' fields survive.
+    global_saved: serde_json::Value,
     project: Settings,
     merged: Settings,
     runtime_overrides: Settings,
@@ -51,9 +54,11 @@ impl SettingsManager {
         let (project, _, project_load_error) =
             load_scope(storage.as_ref(), SettingsScope::Project, &mut errors);
         let merged = deep_merge(&global, &project);
+        let global_saved = serde_json::to_value(&global).unwrap_or_default();
         Self {
             storage,
             global,
+            global_saved,
             project,
             merged,
             runtime_overrides: Settings::default(),
@@ -143,6 +148,7 @@ impl SettingsManager {
             load_scope(self.storage.as_ref(), SettingsScope::Global, &mut errors);
         let (project, _, project_load_error) =
             load_scope(self.storage.as_ref(), SettingsScope::Project, &mut errors);
+        self.global_saved = serde_json::to_value(&global).unwrap_or_default();
         self.global = global;
         self.project = project;
         self.global_raw = global_raw;
@@ -1001,12 +1007,44 @@ impl SettingsManager {
     /// Write the global scope back (project scope is host-written, not
     /// user-set), then re-derive the effective settings.
     fn save_global(&mut self) -> Result<()> {
-        let content = serde_json::to_string_pretty(&self.global)?;
+        let next = serde_json::to_value(&self.global)?;
+        let saved = &self.global_saved;
+        let mut failure: Option<anyhow::Error> = None;
         self.storage
             .with_lock(SettingsScope::Global, &mut |current| {
-                let _ = current;
-                Some(content.clone())
+                // Merge onto the locked on-disk document: only this session's changes
+                // are written, and an unparseable document is refused, never replaced.
+                let mut document = match current.map(|content| serde_json::from_str(&content)) {
+                    None => serde_json::Map::new(),
+                    Some(Ok(serde_json::Value::Object(document))) => document,
+                    Some(Ok(_)) => {
+                        failure = Some(anyhow::anyhow!(
+                            "Global settings not saved: settings file is not a JSON object"
+                        ));
+                        return None;
+                    }
+                    Some(Err(error)) => {
+                        failure = Some(anyhow::anyhow!(
+                            "Global settings not saved: settings file failed to parse: {error}"
+                        ));
+                        return None;
+                    }
+                };
+                migrate(&mut document);
+                let mut document = serde_json::Value::Object(document);
+                apply_changes(&mut document, saved, &next);
+                match serde_json::to_string_pretty(&document) {
+                    Ok(content) => Some(content),
+                    Err(error) => {
+                        failure = Some(error.into());
+                        None
+                    }
+                }
             })?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        self.global_saved = next;
         self.merged = deep_merge(&self.global, &self.project);
         Ok(())
     }
@@ -1082,10 +1120,72 @@ fn load_scope(
     (from_value_lenient(&migrated), Some(migrated), None)
 }
 
+/// Apply the `saved` -> `next` changes onto `document`, recursing into objects, so
+/// keys this session never changed keep their on-disk values.
+fn apply_changes(
+    document: &mut serde_json::Value,
+    saved: &serde_json::Value,
+    next: &serde_json::Value,
+) {
+    let (Some(document_map), Some(saved_map), Some(next_map)) = (
+        document.as_object_mut(),
+        saved.as_object(),
+        next.as_object(),
+    ) else {
+        if saved != next {
+            *document = next.clone();
+        }
+        return;
+    };
+    let keys: std::collections::BTreeSet<&String> =
+        saved_map.keys().chain(next_map.keys()).collect();
+    for key in keys {
+        let saved_value = saved_map.get(key);
+        match next_map.get(key) {
+            None => {
+                if saved_value.is_some() {
+                    document_map.remove(key);
+                }
+            }
+            Some(next_value) => {
+                if saved_value == Some(next_value) {
+                    continue;
+                }
+                match (document_map.get_mut(key), saved_value) {
+                    (Some(document_value), Some(saved_value)) => {
+                        apply_changes(document_value, saved_value, next_value);
+                    }
+                    (Some(_) | None, None) | (None, Some(_)) => {
+                        document_map.insert(key.clone(), next_value.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::types::MarkdownSettings;
+
+    #[test]
+    fn concurrent_global_writers_keep_each_others_fields() {
+        let storage: Arc<dyn SettingsStorage> =
+            Arc::new(super::super::storage::InMemorySettingsStorage::default());
+        let mut first = SettingsManager::from_storage(Arc::clone(&storage));
+        let mut second = SettingsManager::from_storage(Arc::clone(&storage));
+        first.set_default_model("model-a".to_string()).unwrap();
+        second.set_theme("dark".to_string()).unwrap();
+        let fresh = SettingsManager::from_storage(storage);
+        assert_eq!(
+            (
+                fresh.get_default_model(),
+                fresh.global_settings().theme.as_deref()
+            ),
+            (Some("model-a"), Some("dark"))
+        );
+    }
 
     #[test]
     fn in_memory_loads_merges_and_saves() {

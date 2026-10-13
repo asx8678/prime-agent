@@ -186,6 +186,7 @@ pub(crate) fn prepare_attempt(
                 preparation.previous_state.as_ref(),
                 preparation.previous_summary.as_deref(),
                 entries[preparation.boundary_start..preparation.cut.first_kept_entry_index].iter(),
+                super::compact_carry::latest_carry_items(&entries),
             )
         });
     // TS `beginCompaction` after the preparation resolved: a skipped
@@ -269,11 +270,13 @@ pub(crate) async fn summarize_attempt(
     // from the log, and the live block receives it whole, exactly as it
     // commits.
     if let Some(fold) = attempt.structural.as_ref() {
-        let (mut summary, state) = fold.summarize(
-            options.custom_instructions,
-            &options.preserve,
-            options.model.context_window,
-        );
+        let (mut summary, state) = fold
+            .summarize(
+                options.custom_instructions,
+                &options.preserve,
+                options.model.context_window,
+            )
+            .map_err(|error| anyhow::anyhow!("deterministic compaction state: {error}"))?;
         summary.push_str(&file_ops_block(
             &attempt.details.read_files,
             &attempt.details.modified_files,

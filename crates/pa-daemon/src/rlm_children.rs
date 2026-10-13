@@ -59,6 +59,15 @@ impl ChildCloseReason {
 /// before prompting anyway; a stuck turn must not orphan the child's task.
 const TURN_DONE_WAIT_SECS: u64 = 60;
 
+/// How a spawned child's wait for its parent's turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentTurnWait {
+    /// The parent's turn settled; the child's task prompt follows it.
+    Settled,
+    /// The parent's turn never settled within the bound; the child starts anyway.
+    TimedOut,
+}
+
 /// Grace between the first idle observation and the settle decision.
 const WATCH_SETTLE_GRACE_MS: u64 = 250;
 const CREATE_TIMEOUT_MS: u64 = 120_000;
@@ -210,6 +219,11 @@ impl ChildRecord {
         }
         if let Some(error) = &self.error {
             snapshot["error"] = json!(error);
+        }
+        // A spawned child whose task prompt still waits for the parent's turn to settle: it
+        // reads "running" but has not started, so the snapshot says so instead of looking stuck.
+        if !self.prompt_admitted && self.settled_status.is_none() {
+            snapshot["waitingForParentTurn"] = json!(true);
         }
         snapshot
     }
@@ -866,14 +880,21 @@ impl SupervisorChildSessionsInner {
 
     /// Wait for the parent turn that spawned a task to complete (generation
     /// strictly greater than the one captured at spawn admission). Bounded:
-    /// a turn that never settles releases the child anyway.
-    pub async fn wait_turn_done(&self, generation: u64) {
+    /// a turn that never settles releases the child anyway. Returns
+    /// [`ParentTurnWait::TimedOut`] when the bound, not the turn, released it.
+    pub async fn wait_turn_done(&self, generation: u64) -> ParentTurnWait {
         let mut receiver = self.turn_done.subscribe();
-        let _ = tokio::time::timeout(
+        let settled = tokio::time::timeout(
             std::time::Duration::from_secs(TURN_DONE_WAIT_SECS),
             receiver.wait_for(|value| *value > generation),
         )
-        .await;
+        .await
+        .is_ok();
+        if settled {
+            ParentTurnWait::Settled
+        } else {
+            ParentTurnWait::TimedOut
+        }
     }
 
     /// Send one daemon command over the link; the link owns timeouts/reconnects.

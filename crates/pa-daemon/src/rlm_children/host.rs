@@ -63,7 +63,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     identity.rlm_max_depth
                 );
             }
-            let child_id = format!("sub-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+            // 64 random bits: 32 made a birthday collision plausible across a large spawn tree.
+            let child_id = format!("sub-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
             let name = request.name.clone().unwrap_or_else(|| {
                 create_default_rlm_subagent_session_name(&request.prompt, &child_id)
             });
@@ -236,7 +237,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
             // request reaches the provider first (see `wait_turn_done`).
             let turn_generation = *this.turn_done.subscribe().borrow();
             tokio::spawn(async move {
-                watcher_this.wait_turn_done(turn_generation).await;
+                if watcher_this.wait_turn_done(turn_generation).await
+                    == crate::rlm_children::ParentTurnWait::TimedOut
+                {
+                    eprintln!(
+                        "pa-daemon: RLM child {child_log_id}: the parent turn did not settle within {}s; starting the child anyway",
+                        crate::rlm_children::TURN_DONE_WAIT_SECS
+                    );
+                }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt
                 // never fires.

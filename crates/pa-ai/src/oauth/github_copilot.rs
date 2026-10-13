@@ -352,8 +352,12 @@ async fn poll_for_github_access_token(
     ui: &dyn OAuthLoginUi,
 ) -> Result<String, String> {
     let urls = urls_for(domain);
-    let deadline = std::time::Instant::now() + Duration::from_secs(device.expires_in);
-    let mut interval_ms = (device.interval * 1000).max(1000);
+    let now = std::time::Instant::now();
+    // Hostile wire values saturate instead of overflowing Instant or u64 arithmetic.
+    let deadline = now
+        .checked_add(Duration::from_secs(device.expires_in))
+        .unwrap_or_else(|| now + Duration::from_secs(u64::from(u32::MAX)));
+    let mut interval_ms = device.interval.saturating_mul(1000).max(1000);
     let mut interval_multiplier = INITIAL_POLL_INTERVAL_MULTIPLIER;
     let mut slow_down_responses = 0;
     while std::time::Instant::now() < deadline {
@@ -694,6 +698,33 @@ mod tests {
                 ),
             )
             .catch_all(ScriptedHttp::entry(200, "{}"))
+    }
+
+    #[tokio::test]
+    async fn a_hostile_device_code_lifetime_does_not_panic() {
+        let http = ScriptedHttp::new()
+            .queue(
+                "https://github.com/login/device/code",
+                vec![ScriptedHttp::entry(
+                    200,
+                    r#"{"device_code":"dev-1","user_code":"ABCD-1234","verification_uri":"https://github.com/login/device","interval":0,"expires_in":18446744073709551615}"#,
+                )],
+            )
+            .queue(
+                "https://github.com/login/oauth/access_token",
+                vec![ScriptedHttp::entry(200, r#"{"access_token":"gh-token"}"#)],
+            )
+            .fixed(
+                "https://api.github.com/copilot_internal/v2/token",
+                ScriptedHttp::entry(
+                    200,
+                    r#"{"token":"copilot-token","expires_at":4000000000}"#,
+                ),
+            )
+            .catch_all(ScriptedHttp::entry(200, "{}"));
+        let ui = ScriptedUi::new(ScriptedAnswer::value(""));
+        let credentials = login_github_copilot(&http, &ui).await.unwrap();
+        assert_eq!(credentials.access, "copilot-token");
     }
 
     #[tokio::test]

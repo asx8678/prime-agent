@@ -97,26 +97,78 @@ fn resolve_location(options: &GoogleVertexOptions) -> Result<String, String> {
 /// Divergence from the TS google-auth-library ADC: the token comes from an explicit
 /// `GOOGLE_OAUTH_ACCESS_TOKEN` env var or the gcloud CLI's credential source; failures surface as
 /// provider errors.
-fn resolve_adc_access_token() -> Result<String, String> {
+/// The longest `gcloud auth print-access-token` may run before the turn fails instead of
+/// waiting on it.
+const GCLOUD_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a `gcloud` access token is reused before `gcloud` runs again. Tokens live an hour;
+/// `gcloud` does not report the expiry, so the cache stays well inside it.
+const GCLOUD_TOKEN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The last `gcloud` token and when it was minted (shared by every Vertex turn in the process).
+static GCLOUD_TOKEN_CACHE: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// The ADC access token: `gcloud` runs as an async child (killed when dropped) so it never
+/// blocks a runtime thread, is bounded by [`GCLOUD_TOKEN_TIMEOUT`], and observes the abort.
+async fn resolve_adc_access_token(
+    signal: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<String, ProviderError> {
     if let Ok(token) = std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN") {
         if !token.trim().is_empty() {
             return Ok(token.trim().to_string());
         }
     }
-    let output = std::process::Command::new("gcloud")
-        .args(["auth", "print-access-token"])
-        .output()
-        .map_err(|error| format!("Failed to run gcloud for ADC access token: {error}"))?;
+    // A fresh cached token skips the subprocess (previously every turn ran `gcloud`).
+    if let Some((token, _)) = GCLOUD_TOKEN_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .filter(|(_, minted)| minted.elapsed() < GCLOUD_TOKEN_CACHE_TTL)
+    {
+        return Ok(token);
+    }
+    let run = tokio::time::timeout(
+        GCLOUD_TOKEN_TIMEOUT,
+        tokio::process::Command::new("gcloud")
+            .args(["auth", "print-access-token"])
+            .kill_on_drop(true)
+            .output(),
+    );
+    let output = match signal {
+        Some(signal) => tokio::select! {
+            () = signal.cancelled() => return Err(ProviderError::Aborted),
+            output = run => output,
+        },
+        None => run.await,
+    }
+    .map_err(|_| {
+        ProviderError::Message(format!(
+            "gcloud auth print-access-token timed out after {}s",
+            GCLOUD_TOKEN_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|error| {
+        ProviderError::Message(format!(
+            "Failed to run gcloud for ADC access token: {error}"
+        ))
+    })?;
     if !output.status.success() {
-        return Err(format!(
+        return Err(ProviderError::Message(format!(
             "gcloud auth print-access-token failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        )));
     }
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if token.is_empty() {
-        return Err("gcloud returned an empty access token".to_string());
+        return Err(ProviderError::Message(
+            "gcloud returned an empty access token".to_string(),
+        ));
     }
+    *GCLOUD_TOKEN_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((token.clone(), std::time::Instant::now()));
     Ok(token)
 }
 
@@ -332,7 +384,7 @@ async fn run_stream(
     if let Some(api_key) = api_key {
         headers.push(("x-goog-api-key".into(), api_key));
     } else {
-        let token = resolve_adc_access_token().map_err(ProviderError::Message)?;
+        let token = resolve_adc_access_token(options.base.signal.as_ref()).await?;
         headers.push(("Authorization".into(), format!("Bearer {token}")));
     }
 

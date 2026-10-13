@@ -31,14 +31,17 @@ pub fn capture_git_context(cwd: &Path) -> Option<GitContext> {
             .spawn()
             .ok()
     });
+    // Each probe is bounded: a hung git (network filesystem, credential helper) must not
+    // block session creation; a timed-out probe is just a missing field.
     let [commit, branch, remote] = children.map(|child| {
-        child?
-            .wait_with_output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|stdout| stdout.trim().to_string())
-            .filter(|value| !value.is_empty())
+        pa_types::platform::process::probe_output_with_deadline(
+            child?,
+            std::time::Duration::from_secs(5),
+        )
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
     });
     if commit.is_none() && branch.is_none() && remote.is_none() {
         return None;

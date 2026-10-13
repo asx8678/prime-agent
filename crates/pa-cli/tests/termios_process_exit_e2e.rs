@@ -14,7 +14,8 @@
 //! terminal-state differential): the Ctrl+S output stop is RUNTIME state, not
 //! termios (`tcsetattr` never clears it), so a stop armed on a cooked tty must
 //! not outlive the TUI. Reuses the differential's pty harness.
-#![cfg(unix)]
+// Linux-only: `ptsname_r` and the termios audit are glibc/Linux surfaces.
+#![cfg(target_os = "linux")]
 
 // This binary's routes use a subset of the shared module's surface,
 // so the rest is deliberately dead here.

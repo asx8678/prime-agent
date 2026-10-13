@@ -130,6 +130,9 @@ impl SessionUi {
             return;
         };
         let entries = crate::snapshot::transcript_to_entries(messages);
+        // The replaced chat invalidates the streaming row's index: a later streaming frame
+        // without its `message_start` must start a fresh row, never index the new chat.
+        self.streaming_index = None;
         view.clear_chat();
         for entry in entries {
             view.push_entry(entry);

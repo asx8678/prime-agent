@@ -204,7 +204,8 @@ fn hex_to_color(s: &str) -> Option<Color> {
         }
         return None;
     }
-    if hex.len() != 6 {
+    // ASCII hex digits only: the byte slices below then always cut on char boundaries.
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
@@ -803,6 +804,12 @@ pub fn load_theme_from_path(path: &std::path::Path, mode: ColorMode) -> Result<T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_multibyte_six_byte_hex_is_rejected_instead_of_panicking() {
+        assert_eq!(hex_to_color("#zあbc"), None);
+        assert_eq!(hex_to_color("#7c6faf"), Some(Color::Rgb(0x7c, 0x6f, 0xaf)));
+    }
 
     #[test]
     fn prime_theme_resolves() {

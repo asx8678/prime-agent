@@ -69,6 +69,11 @@ fn a_paste_never_reaches_the_editor_behind_an_overlay() {
     v.reload_box = Some("reloading".to_string());
     assert!(v.route_paste("never"));
     assert_eq!(editor_text(&v), "");
+    // The factory page owns the frame: the paste never lands in the editor behind it.
+    let mut v = view();
+    v.factory_view = Some(crate::factory_view::FactoryView::new(Vec::new(), 10));
+    assert!(v.route_paste("factory"));
+    assert_eq!(editor_text(&v), "");
     // The bare dock: the editor takes it.
     let mut v = view();
     assert!(!v.route_paste("direct"));

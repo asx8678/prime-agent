@@ -32,7 +32,9 @@ pub fn get_bin_dir() -> String {
 /// Prepends the agent bin dir to PATH and forces non-interactive settings so
 /// prompts, pagers, and editors fail fast instead of hanging on dead stdin.
 pub fn get_shell_env() -> std::collections::HashMap<String, String> {
-    let mut env: std::collections::HashMap<String, String> = std::env::vars()
+    // `vars_os`: `std::env::vars()` panics on any non-UTF-8 variable; those are skipped.
+    let mut env: std::collections::HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .filter(|(_, v)| !v.contains('\0'))
         .collect();
     let bin_dir = get_bin_dir();

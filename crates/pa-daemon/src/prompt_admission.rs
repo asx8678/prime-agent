@@ -92,6 +92,12 @@ impl PromptAdmissionTable {
         Ok(())
     }
 
+    /// Drop a registration whose command was refused before dispatch (a shutdown or
+    /// update-prepare gate), so a retry with the same id is admitted.
+    pub(crate) fn release(&self, active_session_id: &str, admission_id: &str) {
+        self.remove(&prompt_admission_key(active_session_id, admission_id));
+    }
+
     fn with<R>(&self, key: &str, f: impl FnOnce(&PromptAdmission) -> R) -> Option<R> {
         let admissions = self
             .admissions

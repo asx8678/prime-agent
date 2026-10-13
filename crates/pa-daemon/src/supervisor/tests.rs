@@ -2006,3 +2006,51 @@ proptest! {
         })?;
     }
 }
+
+#[tokio::test]
+async fn a_gate_refused_prompt_releases_its_admission_id() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let options = SupervisorOptions {
+        socket_path: dir.path().join("daemon.sock"),
+        agent_dir: dir.path().join("agent"),
+    };
+    let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+    supervisor.shutting_down.store(true, Ordering::SeqCst);
+    let (targeted_tx, _targeted_rx) = tokio::sync::mpsc::channel::<Arc<Value>>(16);
+    let attached = subscribers::ClientSubscriptions::new("c".to_string(), targeted_tx);
+    let effective_client_id = Arc::new(std::sync::Mutex::new("c".to_string()));
+    let roster_subscribed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connection = Arc::new(crate::input_pause_lease::ClientConnectionState::new());
+    let (stream_tx, _stream_rx) = tokio::sync::mpsc::channel(16);
+    let line = json!({
+        "type": "prompt",
+        "activeSessionId": "w-1",
+        "admissionId": "adm-1",
+        "message": "go",
+    })
+    .to_string();
+    // The retry carries the same idempotency key: it must meet the same gate, not a
+    // leaked "already in use" reservation.
+    for attempt in 0..2 {
+        let (lines, stop) = supervisor
+            .dispatch_client(
+                &line,
+                &effective_client_id,
+                &attached,
+                &roster_subscribed,
+                &connection,
+                "c",
+                &stream_tx,
+            )
+            .await;
+        assert!(!stop);
+        let Some(Outbound::Line(response)) = lines.first() else {
+            panic!("attempt {attempt}: expected one response line");
+        };
+        assert_eq!(
+            response["error"],
+            json!("Supervisor is shutting down"),
+            "attempt {attempt}"
+        );
+    }
+}

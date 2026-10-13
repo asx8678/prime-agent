@@ -60,6 +60,9 @@ pub(crate) struct H2Response {
     observer: crate::providers::bedrock::goaway::GoAwayObserver,
     signal: Option<CancellationToken>,
     connection: ConnectionErrorProfile,
+    /// The longest wait for the next body chunk (the shared HTTP path's idle window): a
+    /// gateway that sends headers and then stops fails as a timeout instead of hanging.
+    idle_timeout: std::time::Duration,
 }
 
 impl H2Response {
@@ -72,15 +75,23 @@ impl H2Response {
         {
             return Err(ProviderError::Aborted);
         }
+        let next =
+            tokio::time::timeout(self.idle_timeout, futures::StreamExt::next(&mut self.body));
         let chunk = match &self.signal {
             Some(signal) => {
-                let next = futures::StreamExt::next(&mut self.body);
                 tokio::select! {
                     () = signal.cancelled() => return Err(ProviderError::Aborted),
                     chunk = next => chunk,
                 }
             }
-            None => futures::StreamExt::next(&mut self.body).await,
+            None => next.await,
+        };
+        let Ok(chunk) = chunk else {
+            return Err(ProviderError::Connection(ProviderConnectionError {
+                kind: ConnectionErrorKind::Timeout,
+                profile: self.connection.clone(),
+                cause: format!("no response bytes for {}s", self.idle_timeout.as_secs_f64()),
+            }));
         };
         match chunk {
             Some(Ok(bytes)) => {
@@ -275,6 +286,7 @@ pub(crate) async fn send_h2(options: H2RequestOptions) -> Result<H2Response, Pro
             observer,
             signal,
             connection,
+            idle_timeout: crate::utils_inner::http::BODY_IDLE_TIMEOUT,
         })
     };
 
@@ -384,6 +396,8 @@ mod h2_wire_tests {
         RstStream,
         /// Respond 200 + partial bytes, then `GOAWAY(PROTOCOL_ERROR)`, then close.
         GoAway,
+        /// Respond 200 + partial bytes, then send nothing while holding the socket open.
+        Stall,
         /// Respond 200 + partial bytes, then close the socket (FIN).
         Close,
     }
@@ -441,6 +455,12 @@ mod h2_wire_tests {
                         .write_all(&frame(0x7, 0x0, 0, &payload))
                         .await
                         .unwrap();
+                }
+                MockAction::Stall => {
+                    // Held until the client gives up and closes.
+                    let mut rest = Vec::new();
+                    let _ = socket.read_to_end(&mut rest).await;
+                    return;
                 }
                 MockAction::Close => {}
             }
@@ -501,6 +521,31 @@ mod h2_wire_tests {
         assert_eq!(
             error,
             "Session closed with error code 1\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object."
+        );
+    }
+
+    /// A body that stops sending fails as a connection timeout after the idle window.
+    #[tokio::test]
+    async fn a_stalled_body_fails_as_a_timeout() {
+        let url = format!(
+            "http://{}/model/m/converse-stream",
+            spawn_h2_mock(MockAction::Stall).await
+        );
+        let mut response = send_h2(options(url)).await.unwrap();
+        response.idle_timeout = std::time::Duration::from_millis(200);
+        assert!(matches!(response.next_bytes().await, Ok(Some(_))));
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), response.next_bytes())
+            .await
+            .expect("the idle window bounds the stalled read");
+        assert!(
+            matches!(
+                error,
+                Err(ProviderError::Connection(ProviderConnectionError {
+                    kind: ConnectionErrorKind::Timeout,
+                    ..
+                }))
+            ),
+            "the stalled body's error"
         );
     }
 

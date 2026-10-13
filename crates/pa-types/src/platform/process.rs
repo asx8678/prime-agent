@@ -38,16 +38,45 @@ fn ps_process_start_id(pid: u32) -> Option<String> {
     if matches!(pid_exists(pid), Ok(false)) {
         return None;
     }
-    let output = std::process::Command::new("ps")
+    let child = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
         .env("LC_ALL", "C")
         .env("LC_TIME", "C")
         .env("LANG", "C")
         .env("TZ", "UTC")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
+    let output = probe_output_with_deadline(child, std::time::Duration::from_secs(5))?;
     let start_time = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!start_time.is_empty()).then(|| format!("ps:{start_time}"))
+}
+
+/// Wait for a short-lived probe child (`git`, `ps`) with a deadline: a child still running at
+/// the deadline is killed and reaped, and the caller gets `None` instead of blocking forever on a
+/// hung probe (a network filesystem, a credential prompt). Stdout is read after exit, so this is
+/// for probes whose output fits the pipe buffer.
+#[must_use]
+pub fn probe_output_with_deadline(
+    mut child: std::process::Child,
+    deadline: std::time::Duration,
+) -> Option<std::process::Output> {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// macOS: the `ps:<lstart>` identity (TS `getPsProcessStartId`) rendered
@@ -795,5 +824,30 @@ mod executable_path_tests {
             "the own pid must resolve to the running executable ({resolved:?} vs {current:?})"
         );
         assert_eq!(process_executable_path(0), None);
+    }
+}
+
+/// The probe deadline: a hung child is killed and reaped, a quick one returns its output.
+#[cfg(all(test, unix))]
+mod probe_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn a_hung_probe_is_killed_at_the_deadline() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(probe_output_with_deadline(child, std::time::Duration::from_millis(100)).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let child = std::process::Command::new("echo")
+            .arg("ok")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = probe_output_with_deadline(child, std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(output.stdout, b"ok\n");
     }
 }

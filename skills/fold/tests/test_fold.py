@@ -17,11 +17,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
 class FakeRepl:
+    """The kernel's cell context: by default the calling task is the cell body; a test can
+    pin another task as the owner to stand in for a detached task's stale context."""
+
     def __init__(self):
         self.finished = None
+        self.owner = None
 
     def current_cell_completion_context(self):
-        return None if self.finished is None else (self.finished, None)
+        if self.finished is None:
+            return None
+        return (self.finished, self.owner or asyncio.current_task())
 
 
 FAKE_REPL = FakeRepl()
@@ -55,6 +61,7 @@ class FoldTests(unittest.TestCase):
 
     def new_cell(self):
         FAKE_REPL.finished = asyncio.Event()
+        FAKE_REPL.owner = None
 
     def run_call(self, call, *replies):
         HOST_REPLIES.extend(replies)
@@ -92,6 +99,16 @@ class FoldTests(unittest.TestCase):
             self.run_call(fold.begin("explore", "find it"))
         with self.assertRaisesRegex(RuntimeError, "only work in a cell"):
             self.run_call(fold.end("done"))
+        self.assertEqual(HOST_CALLS, [])
+
+    def test_a_detached_task_with_a_stale_cell_context_is_refused(self):
+        async def cell():
+            FAKE_REPL.owner = asyncio.current_task()
+            detached = asyncio.create_task(fold.begin("explore", "find it"))
+            await detached
+
+        with self.assertRaisesRegex(RuntimeError, "only work in a cell"):
+            self.run_call(cell())
         self.assertEqual(HOST_CALLS, [])
 
     def test_goal_is_required(self):

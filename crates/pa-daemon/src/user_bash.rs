@@ -91,6 +91,16 @@ impl UserBash {
     }
 }
 
+/// A claimed user-bash slot, released on drop: a run task that panics or is cancelled still
+/// frees the slot instead of refusing every later `!` command until the worker restarts.
+struct SlotClaim(Arc<UserBash>);
+
+impl Drop for SlotClaim {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 impl Worker {
     /// Rust-native kernel bash activity commands. These inspect the Python
     /// handle registry, not the user-bash slot or a client-supplied PID.
@@ -203,6 +213,7 @@ impl Worker {
         let command = command.to_string();
         let agent_dir = self.config.agent_dir.clone();
         tokio::spawn(async move {
+            let slot = SlotClaim(Arc::clone(&user_bash));
             let cwd = {
                 let core = core.lock().unwrap();
                 core.cwd.clone()
@@ -238,7 +249,7 @@ impl Worker {
                     exclude_from_context,
                 );
             }
-            user_bash.release();
+            drop(slot);
             let mut event = json!({
                 "type": "bash_end",
                 "exitCode": end.exit_code,
@@ -531,11 +542,27 @@ async fn run_bash(run: RunBash<'_>) -> BashEnd {
         let stream = Arc::clone(&stream);
         async move {
             let mut buffer = [0u8; 8192];
+            // A character split across reads waits for its remaining bytes, so the
+            // per-chunk lossy decode never turns one character into two U+FFFD.
+            let mut pending: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
-                    Ok(read) => stream.lock().unwrap().push(&buffer[..read]),
+                    Ok(read) => {
+                        pending.extend_from_slice(&buffer[..read]);
+                        let complete = match std::str::from_utf8(&pending) {
+                            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                            Ok(_) | Err(_) => pending.len(),
+                        };
+                        if complete > 0 {
+                            stream.lock().unwrap().push(&pending[..complete]);
+                            pending.drain(..complete);
+                        }
+                    }
                 }
+            }
+            if !pending.is_empty() {
+                stream.lock().unwrap().push(&pending);
             }
         }
     };
@@ -779,11 +806,11 @@ fn truncate_tail(content: &str) -> (String, bool) {
 
 /// The tail `maxBytes` of one string, on char boundaries (TS `truncateStringToBytesFromEnd`).
 fn truncate_string_to_bytes_from_end(text: &str, max_bytes: usize) -> String {
-    let mut end = text.len().min(max_bytes);
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
     }
-    text[text.len() - end..].to_string()
+    text[start..].to_string()
 }
 
 /// Sequence and broadcast one `session_event` frame (the free-standing
@@ -916,6 +943,40 @@ mod tests {
             response.error.as_deref(),
             Some("execute_bash_and_wait requires a command")
         );
+    }
+
+    #[tokio::test]
+    async fn a_character_split_across_reads_survives() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let worker = created_worker(cwd.path()).await;
+        // One 8193-byte write: the 8 KiB read boundary falls inside the final `é`.
+        let command = "printf '%s\\303\\251' \"$(head -c 8191 /dev/zero | tr '\\0' x)\"";
+        let response = worker
+            .dispatch(
+                "execute_bash_and_wait",
+                &json!({ "activeSessionId": "bash-session", "command": command }),
+            )
+            .await;
+        assert!(response.success, "failed: {response:?}");
+        let data = response.data.expect("data");
+        assert_eq!(data["output"], json!(format!("{}é", "x".repeat(8191))));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_run_task_releases_the_slot() {
+        let user_bash = Arc::new(UserBash::new());
+        assert!(user_bash.claim());
+        let slot = SlotClaim(Arc::clone(&user_bash));
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            panic!("the run task died");
+        });
+        assert!(task.await.is_err());
+        assert!(
+            !user_bash.is_running(),
+            "the panicked run left the slot claimed"
+        );
+        assert!(user_bash.claim(), "a later run claims the slot");
     }
 
     #[test]
@@ -1202,5 +1263,13 @@ mod tests {
         assert!(truncated);
         assert!(kept.len() <= DEFAULT_MAX_BYTES);
         assert!(big.ends_with(&kept), "the tail wins");
+
+        // A multibyte cut point moves forward to the next char boundary.
+        assert_eq!(truncate_string_to_bytes_from_end("aé", 2), "é");
+        assert_eq!(truncate_string_to_bytes_from_end("aé", 1), "");
+        let wide = format!("x{}", "界".repeat(DEFAULT_MAX_BYTES / 3 + 10));
+        let (kept, truncated) = truncate_tail(&wide);
+        assert!(truncated);
+        assert!(wide.ends_with(&kept), "the tail wins");
     }
 }

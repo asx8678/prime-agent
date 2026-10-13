@@ -607,12 +607,16 @@ impl Worker {
                     // through its store (the engine's manager is
                     // non-persisted here).
                     let custom_core = Arc::clone(&core);
-                    concrete.set_custom_row_sink(std::sync::Arc::new(move |row| {
-                        let mut core = custom_core.lock().unwrap();
-                        if let Some(store) = core.store.as_mut() {
-                            let _ = store.persist_entry("custom_message", row);
-                        }
-                    }));
+                    // A failed write reaches the kernel call that changed the row.
+                    concrete.set_custom_row_sink(std::sync::Arc::new(
+                        move |row| -> anyhow::Result<()> {
+                            let mut core = custom_core.lock().unwrap();
+                            if let Some(store) = core.store.as_mut() {
+                                store.persist_entry("custom_message", row)?;
+                            }
+                            Ok(())
+                        },
+                    ));
                     // The warm-usage mirror (the same ownership rule): a
                     // successful cache refresh appends the TS `type:
                     // "usage"` row (`kind: "cache_warm"`) through the

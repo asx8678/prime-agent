@@ -157,15 +157,20 @@ fn is_intent_holder_alive(intent: &UpdateIntent) -> bool {
 }
 
 fn write_atomically(path: &Path, intent: &UpdateIntent) -> Result<()> {
-    let temporary = path.with_extension("tmp");
+    // A per-writer temp name with exclusive create: concurrent contenders never truncate or
+    // publish each other's half-written file.
+    let temporary = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&temporary)
             .with_context(|| format!("create {}", temporary.display()))?;
@@ -174,12 +179,51 @@ fn write_atomically(path: &Path, intent: &UpdateIntent) -> Result<()> {
     }
     #[cfg(not(unix))]
     std::fs::write(&temporary, serde_json::to_string_pretty(intent)?)?;
-    std::fs::rename(&temporary, path).with_context(|| format!("finalize {}", path.display()))
+    std::fs::rename(&temporary, path)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&temporary);
+        })
+        .with_context(|| format!("finalize {}", path.display()))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_intent_writers_never_share_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-intent.json");
+        let writers: Vec<_> = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let intent = UpdateIntent {
+                        update_id: UpdateId::from(format!("u{index}")),
+                        pid: index,
+                        process_start_id: None,
+                        heartbeat_at: "t".to_string(),
+                        rest: serde_json::Map::default(),
+                    };
+                    write_atomically(&path, &intent)
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer
+                .join()
+                .unwrap()
+                .expect("every writer publishes its own whole file");
+        }
+        let published: UpdateIntent =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(published.update_id.0.starts_with('u'));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temp file is left behind"
+        );
+    }
 
     #[test]
     fn acquire_then_join_then_stale_steal() {

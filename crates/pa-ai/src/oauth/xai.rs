@@ -86,7 +86,11 @@ pub async fn login_xai(
     let expires_in = positive_seconds(response.body.get("expires_in"))?;
     // expires_in is positive_seconds' filtered positive second count; u64 is Duration's unit.
     #[allow(clippy::cast_sign_loss)]
-    let deadline = std::time::Instant::now() + Duration::from_secs(expires_in as u64);
+    let now = std::time::Instant::now();
+    // A hostile lifetime past Instant's range saturates to a far deadline instead of panicking.
+    let deadline = now
+        .checked_add(Duration::from_secs(expires_in as u64))
+        .unwrap_or_else(|| now + Duration::from_secs(u64::from(u32::MAX)));
     // The wire's interval is a positive f64 second count; u64 ms is the poll's unit.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let mut interval_ms = response
@@ -704,6 +708,35 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error, LOGIN_CANCELLED);
+    }
+
+    #[tokio::test]
+    async fn a_hostile_device_code_lifetime_does_not_panic() {
+        let hostile = serde_json::json!({
+            "device_code": "dev-1",
+            "user_code": "CODE-1",
+            "verification_uri": "https://auth.x.ai/activate",
+            "interval": 0,
+            "expires_in": 1e300,
+        });
+        let http = ScriptedHttp::new()
+            .queue(
+                DEVICE_CODE_URL,
+                vec![ScriptedResponse {
+                    status: 200,
+                    body: hostile.to_string(),
+                }],
+            )
+            .queue(
+                TOKEN_URL,
+                vec![ScriptedHttp::entry(
+                    200,
+                    r#"{"access_token":"grok-access","refresh_token":"grok-refresh","expires_in":3600}"#,
+                )],
+            );
+        let ui = ScriptedUi::new();
+        let credentials = login_xai(&http, &ui).await.unwrap();
+        assert_eq!(credentials.access, "grok-access");
     }
 
     #[tokio::test]

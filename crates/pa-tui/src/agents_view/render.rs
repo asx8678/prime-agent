@@ -944,13 +944,15 @@ impl Renderer {
         }
     }
 
-    pub(super) fn draw(&mut self, mode: &mut AgentsViewMode) -> Option<(usize, usize)> {
+    /// Paint one frame; a terminal I/O failure (a size query or a write racing a
+    /// resize or a closed tty) is returned, never a panic on the draw path.
+    pub(super) fn draw(&mut self, mode: &mut AgentsViewMode) -> std::io::Result<()> {
         match self {
             Renderer::Terminal {
                 term,
                 show_hardware_cursor,
             } => {
-                let area = term.size().expect("terminal size");
+                let area = term.size()?;
                 let (lines, cursor) = mode.render_frame(area.width as usize, area.height as usize);
                 crate::hyperlinks::install_frame(&lines);
                 // ratatui's `set_cursor_position` shows unconditionally, so only the show case may
@@ -970,8 +972,7 @@ impl Renderer {
                             }
                         }
                     }
-                })
-                .expect("draw frame");
+                })?;
                 if !show {
                     if let Some((row, col)) = cursor {
                         if row < area.height as usize && col < area.width as usize {
@@ -985,7 +986,7 @@ impl Renderer {
                         }
                     }
                 }
-                None
+                Ok(())
             }
             Renderer::Headless {
                 width,
@@ -1001,7 +1002,7 @@ impl Renderer {
                 if frames.last().map(String::as_str) != Some(text.as_str()) {
                     frames.push(text);
                 }
-                None
+                Ok(())
             }
         }
     }

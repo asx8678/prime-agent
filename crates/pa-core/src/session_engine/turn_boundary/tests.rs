@@ -220,6 +220,26 @@ async fn carry_row_count(requests: &Arc<TurnBoundaryRequests>) -> usize {
 }
 
 #[tokio::test]
+async fn a_failed_durable_carry_write_is_reported_to_the_caller() {
+    let requests = Arc::new(TurnBoundaryRequests::new());
+    let handlers = registered(&requests);
+    let session = Arc::new(Mutex::new(session_with_history(false)));
+    bound_idle(&requests, session);
+    requests.set_carry_row_sink(Arc::new(|_row| -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("disk full"))
+    }));
+    let error =
+        handler(&handlers, "compact.carry")(payload(json!({ "add": ["keep the API stable"] })))
+            .await
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("could not be saved"),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("disk full"), "{error:#}");
+}
+
+#[tokio::test]
 async fn compact_carry_adds_reads_and_drops_notes() {
     let requests = Arc::new(TurnBoundaryRequests::new());
     let handlers = registered(&requests);
@@ -229,8 +249,9 @@ async fn compact_carry_adds_reads_and_drops_notes() {
     // to write.
     let mirrored = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mirror = Arc::clone(&mirrored);
-    requests.set_carry_row_sink(Arc::new(move |_row| {
+    requests.set_carry_row_sink(Arc::new(move |_row| -> anyhow::Result<()> {
         mirror.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }));
     // An empty payload reads the list.
     let response = handler(&handlers, "compact.carry")(payload(json!({})))

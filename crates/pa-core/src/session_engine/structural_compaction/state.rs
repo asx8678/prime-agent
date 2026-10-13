@@ -220,10 +220,10 @@ impl State {
         (state.version == STATE_VERSION).then_some(state)
     }
 
-    /// The form saved on a compaction row.
-    #[must_use]
-    pub(crate) fn to_value(&self) -> Value {
-        serde_json::to_value(self).unwrap_or(Value::Null)
+    /// The form saved on a compaction row. A serialization failure is an error, never a
+    /// silently saved `null` (which the next compaction would read as "no state").
+    pub(crate) fn to_value(&self) -> serde_json::Result<Value> {
+        serde_json::to_value(self)
     }
 
     /// Fold `events` in log order.
